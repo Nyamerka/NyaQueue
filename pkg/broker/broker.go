@@ -1,0 +1,261 @@
+package broker
+
+import (
+	"fmt"
+	"log"
+	"sync"
+	"time"
+)
+
+// Balancer selects a target partition (imported interface to avoid circular deps).
+type Balancer interface {
+	SelectPartition(topic string, key []byte, numPartitions int) int
+	OnMetrics(m Metrics)
+}
+
+// Scheduler determines message delivery order.
+type Scheduler interface {
+	Next(partition *Partition, consumerOffset uint64) (*Message, uint64, error)
+	Enqueue(msg *Message, walOffset int64)
+}
+
+type Broker struct {
+	mu       sync.RWMutex
+	config   Config
+	dataDir  string
+	topics   map[string]*Topic
+	balancer Balancer
+	// Per-topic schedulers, keyed by topic name.
+	schedulers map[string]Scheduler
+
+	metrics      *MetricsCollector
+	backpressure *BackpressureController
+	offsetStore  *OffsetStore
+
+	stopCh chan struct{}
+}
+
+func New(cfg Config, dataDir string, bal Balancer, offsetStore *OffsetStore) *Broker {
+	b := &Broker{
+		config:      cfg,
+		dataDir:     dataDir,
+		topics:      make(map[string]*Topic),
+		balancer:    bal,
+		schedulers:  make(map[string]Scheduler),
+		offsetStore: offsetStore,
+		stopCh:      make(chan struct{}),
+	}
+
+	b.metrics = NewMetricsCollector(b)
+	b.backpressure = NewBackpressureController(nil, 0.85, 3)
+
+	return b
+}
+
+// SetBalancer replaces the active balancer (e.g., switching from RR to DQN).
+func (b *Broker) SetBalancer(bal Balancer) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.balancer = bal
+}
+
+// SetScheduler sets the scheduler for a specific topic.
+func (b *Broker) SetScheduler(topic string, sched Scheduler) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.schedulers[topic] = sched
+}
+
+// SetBackpressure replaces the backpressure controller (e.g., connecting LoadPredictor).
+func (b *Broker) SetBackpressure(bp *BackpressureController) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.backpressure = bp
+}
+
+func (b *Broker) CreateTopic(name string, cfg TopicConfig) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if _, exists := b.topics[name]; exists {
+		return fmt.Errorf("topic %q already exists", name)
+	}
+
+	t, err := NewTopic(name, b.dataDir, cfg)
+	if err != nil {
+		return err
+	}
+	b.topics[name] = t
+	return nil
+}
+
+func (b *Broker) DeleteTopic(name string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	t, exists := b.topics[name]
+	if !exists {
+		return fmt.Errorf("topic %q not found", name)
+	}
+	delete(b.topics, name)
+	delete(b.schedulers, name)
+	return t.Close()
+}
+
+func (b *Broker) GetTopic(name string) (*Topic, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	t, exists := b.topics[name]
+	if !exists {
+		return nil, fmt.Errorf("topic %q not found", name)
+	}
+	return t, nil
+}
+
+func (b *Broker) ListTopics() []*Topic {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	topics := make([]*Topic, 0, len(b.topics))
+	for _, t := range b.topics {
+		topics = append(topics, t)
+	}
+	return topics
+}
+
+// Publish routes a message to the appropriate partition via the Balancer.
+func (b *Broker) Publish(topicName string, msg *Message) (partition int, offset uint64, err error) {
+	b.mu.RLock()
+	t, exists := b.topics[topicName]
+	bal := b.balancer
+	bp := b.backpressure
+	b.mu.RUnlock()
+
+	if !exists {
+		return 0, 0, fmt.Errorf("topic %q not found", topicName)
+	}
+
+	numParts := t.NumPartitions()
+	partIdx := bal.SelectPartition(topicName, msg.Key, numParts)
+
+	if bp != nil {
+		state := bp.Check(partIdx)
+		if state == BPClosed {
+			return 0, 0, ErrThrottled
+		}
+	}
+
+	p, err := t.Partition(partIdx)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	offset, err = p.Append(msg)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	b.metrics.RecordProduce(topicName, partIdx)
+
+	return partIdx, offset, nil
+}
+
+// Consume fetches the next message from a partition using the topic's scheduler.
+func (b *Broker) Consume(topicName, group string, partIdx int) (*Message, uint64, error) {
+	b.mu.RLock()
+	t, exists := b.topics[topicName]
+	sched := b.schedulers[topicName]
+	b.mu.RUnlock()
+
+	if !exists {
+		return nil, 0, fmt.Errorf("topic %q not found", topicName)
+	}
+
+	p, err := t.Partition(partIdx)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var consumerOffset uint64
+	if b.offsetStore != nil {
+		off, err := b.offsetStore.Load(group, topicName, partIdx)
+		if err != nil {
+			consumerOffset = 1 // start from the first valid WAL index
+		} else {
+			consumerOffset = uint64(off)
+		}
+	}
+
+	if sched == nil {
+		return nil, 0, fmt.Errorf("no scheduler configured for topic %q", topicName)
+	}
+
+	msg, nextOffset, err := sched.Next(p, consumerOffset)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	b.metrics.RecordConsume(topicName, partIdx)
+
+	return msg, nextOffset, nil
+}
+
+// Commit persists the consumer offset for a group/topic/partition.
+func (b *Broker) Commit(group, topicName string, partIdx int, offset int64) error {
+	if b.offsetStore == nil {
+		return nil
+	}
+	return b.offsetStore.Commit(group, topicName, partIdx, offset)
+}
+
+func (b *Broker) Metrics() Metrics {
+	return b.metrics.Snapshot()
+}
+
+func (b *Broker) Config() Config {
+	return b.config
+}
+
+func (b *Broker) Start() {
+	go b.metricsLoop()
+}
+
+func (b *Broker) metricsLoop() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			snap := b.metrics.Collect()
+
+			b.mu.RLock()
+			bal := b.balancer
+			b.mu.RUnlock()
+
+			bal.OnMetrics(snap)
+		case <-b.stopCh:
+			return
+		}
+	}
+}
+
+func (b *Broker) Stop() {
+	close(b.stopCh)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for _, t := range b.topics {
+		if err := t.Close(); err != nil {
+			log.Printf("error closing topic %s: %v", t.Name(), err)
+		}
+	}
+
+	if b.offsetStore != nil {
+		b.offsetStore.Close()
+	}
+}
+
+var ErrThrottled = fmt.Errorf("backpressure: partition overloaded, try again later")

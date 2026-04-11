@@ -1,0 +1,168 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/Nyamerka/NyaQueue/benchmarks"
+	"github.com/Nyamerka/NyaQueue/experiments"
+	"github.com/knadh/koanf/parsers/yaml"
+	"github.com/knadh/koanf/providers/env"
+	"github.com/knadh/koanf/providers/file"
+	"github.com/knadh/koanf/v2"
+)
+
+func main() {
+	k := koanf.New(".")
+
+	configPath := "config.yaml"
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		configPath = os.Args[1]
+	}
+
+	_ = k.Load(file.Provider(configPath), yaml.Parser())
+	_ = k.Load(env.Provider("NYAQUEUE_", ".", func(s string) string { return s }), nil)
+
+	modeStr := k.String("experiment.mode")
+	if modeStr == "" {
+		modeStr = "inprocess"
+	}
+	scenarioStr := k.String("experiment.scenarios")
+	if scenarioStr == "" {
+		scenarioStr = "all"
+	}
+	algorithmStr := k.String("experiment.algorithms")
+	if algorithmStr == "" {
+		algorithmStr = "all"
+	}
+	kafkaBrokersStr := k.String("experiment.kafka_brokers")
+	if kafkaBrokersStr == "" {
+		kafkaBrokersStr = "localhost:9092"
+	}
+	outputDir := k.String("experiment.output")
+	if outputDir == "" {
+		outputDir = "experiments/results"
+	}
+	durationStr := k.String("experiment.duration")
+	duration := 10 * time.Second
+	if durationStr != "" {
+		if d, err := time.ParseDuration(durationStr); err == nil {
+			duration = d
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		cancel()
+	}()
+
+	modes := parseModes(modeStr)
+	scenarios := parseScenarios(scenarioStr)
+	algorithms := parseAlgorithms(algorithmStr)
+
+	runner := &experiments.Runner{
+		Scenarios:    scenarios,
+		Algorithms:   algorithms,
+		Modes:        modes,
+		KafkaBrokers: strings.Split(kafkaBrokersStr, ","),
+		Duration:     duration,
+	}
+
+	log.Printf("Running %d scenarios x %d algorithms x %d modes",
+		len(scenarios), len(algorithms), len(modes))
+
+	results, err := runner.RunAll(ctx)
+	if err != nil {
+		log.Fatalf("run: %v", err)
+	}
+
+	if err := experiments.ExportCSV(results, outputDir); err != nil {
+		log.Printf("csv export: %v", err)
+	}
+	if err := experiments.ExportJSON(results, outputDir); err != nil {
+		log.Printf("json export: %v", err)
+	}
+
+	log.Printf("Done. %d results written to %s", len(results), outputDir)
+	printSummary(results)
+}
+
+func parseModes(s string) []experiments.Mode {
+	if s == "all" {
+		return []experiments.Mode{experiments.ModeInProcess, experiments.ModeGRPC, experiments.ModeKafka}
+	}
+	var modes []experiments.Mode
+	for _, m := range strings.Split(s, ",") {
+		switch strings.TrimSpace(m) {
+		case "inprocess":
+			modes = append(modes, experiments.ModeInProcess)
+		case "grpc":
+			modes = append(modes, experiments.ModeGRPC)
+		case "kafka":
+			modes = append(modes, experiments.ModeKafka)
+		}
+	}
+	return modes
+}
+
+func parseScenarios(s string) []benchmarks.Scenario {
+	if s == "all" {
+		return benchmarks.AllScenarios()
+	}
+	all := benchmarks.AllScenarios()
+	names := strings.Split(s, ",")
+	var out []benchmarks.Scenario
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		for _, sc := range all {
+			if sc.Name == name {
+				out = append(out, sc)
+			}
+		}
+	}
+	return out
+}
+
+func parseAlgorithms(s string) []experiments.AlgorithmConfig {
+	if s == "all" {
+		return experiments.AllAlgorithms()
+	}
+	all := experiments.AllAlgorithms()
+	names := strings.Split(s, ",")
+	var out []experiments.AlgorithmConfig
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		for _, alg := range all {
+			if alg.Name == name {
+				out = append(out, alg)
+			}
+		}
+	}
+	return out
+}
+
+func printSummary(results []experiments.ExperimentResult) {
+	fmt.Println()
+	fmt.Printf("%-20s %-15s %-10s %12s %10s %10s %10s %10s\n",
+		"SCENARIO", "ALGORITHM", "MODE", "THROUGHPUT", "P50(us)", "P95(us)", "P99(us)", "STDDEV")
+	fmt.Println(strings.Repeat("-", 107))
+
+	for _, r := range results {
+		fmt.Printf("%-20s %-15s %-10s %12.0f %10.1f %10.1f %10.1f %10.6f\n",
+			r.Scenario, r.Algorithm, r.Mode, r.Throughput,
+			float64(r.LatencyP50)/1000, float64(r.LatencyP95)/1000,
+			float64(r.LatencyP99)/1000, r.LoadStdDev,
+		)
+	}
+}

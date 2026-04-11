@@ -1,0 +1,114 @@
+syntax = "proto3";
+
+package nyaqueue;
+
+option go_package = "github.com/Nyamerka/NyaQueue/pkg/transport/gen";
+
+// --- Messages ---
+
+message ProduceRequest {
+  string topic     = 1;
+  bytes  key       = 2;
+  bytes  value     = 3;
+  uint32 priority  = 4; // 0-9, 0 = lowest
+}
+
+message ProduceResponse {
+  int32 partition = 1;
+  int64 offset    = 2;
+}
+
+message ConsumeRequest {
+  string topic     = 1;
+  string group     = 2;
+  int32  partition = 3;
+  int32  max_bytes = 4;
+}
+
+message MessageEnvelope {
+  int64  offset    = 1;
+  bytes  key       = 2;
+  bytes  value     = 3;
+  uint32 priority  = 4;
+  int64  timestamp = 5; // unix nanos
+}
+
+message ConsumeResponse {
+  repeated MessageEnvelope messages = 1;
+}
+
+message CommitRequest {
+  string topic     = 1;
+  string group     = 2;
+  int32  partition = 3;
+  int64  offset    = 4;
+}
+
+message CommitResponse {}
+
+// --- Admin ---
+
+message CreateTopicRequest {
+  string topic           = 1;
+  int32  num_partitions  = 2;
+  TopicScheduleConfig schedule_config = 3;
+}
+
+message CreateTopicResponse {}
+
+message DeleteTopicRequest {
+  string topic = 1;
+}
+
+message DeleteTopicResponse {}
+
+message ListTopicsRequest {}
+
+message TopicInfo {
+  string topic          = 1;
+  int32  num_partitions = 2;
+  ScheduleMode mode     = 3;
+}
+
+message ListTopicsResponse {
+  repeated TopicInfo topics = 1;
+}
+
+message TopicScheduleConfig {
+  ScheduleMode mode                 = 1;
+  int32        priority_levels      = 2;
+  int64        anti_starvation_ms   = 3;
+  double       dqn_throttle_on_load = 4;
+}
+
+enum ScheduleMode {
+  FIFO            = 0;
+  STRICT_PRIORITY = 1;
+  DQN_ADAPTIVE    = 2;
+}
+
+// --- Metrics ---
+
+message MetricsRequest {}
+
+message MetricsResponse {
+  double          throughput      = 1;
+  double          avg_latency     = 2;
+  repeated double partition_loads = 3;
+  double          success_rate    = 4;
+  repeated int64  queue_depth     = 5;
+}
+
+// --- Services ---
+
+service NyaQueue {
+  rpc Produce(ProduceRequest)       returns (ProduceResponse);
+  rpc Consume(ConsumeRequest)       returns (ConsumeResponse);
+  rpc Commit(CommitRequest)         returns (CommitResponse);
+
+  rpc CreateTopic(CreateTopicRequest)   returns (CreateTopicResponse);
+  rpc DeleteTopic(DeleteTopicRequest)   returns (DeleteTopicResponse);
+  rpc ListTopics(ListTopicsRequest)     returns (ListTopicsResponse);
+
+  rpc GetMetrics(MetricsRequest)        returns (MetricsResponse);
+}

@@ -1,0 +1,31 @@
+server:
+  addr: ":9090"
+  data_dir: "/data"
+
+broker:
+  segment_max_bytes: 20971520
+  segment_max_count: 100
+  retention_max_bytes: 1073741824
+  retention_max_age: "168h"
+  flush_interval_ms: 1000
+  compression_type: 0
+
+  max_connections: 1024
+  recv_buffer_bytes: 65536
+  send_buffer_bytes: 65536
+  max_message_bytes: 1048576
+  read_timeout_ms: 30000
+  write_timeout_ms: 30000
+  num_network_goroutines: 4
+
+  num_io_goroutines: 4
+  max_queued_requests: 500
+
+  batch_size: 100
+  batch_memory_bytes: 65536
+  linger_ms: 5
+
+  fetch_min_bytes: 1
+  fetch_max_wait_ms: 500
+  max_fetch_bytes: 1048576
+  consumer_session_timeout_ms: 30000

@@ -1,0 +1,42 @@
+# Binaries
+bin/
+/broker
+/loadgen
+/experiment
+*.exe
+
+# Test & benchmark artifacts
+*.test
+*.prof
+*.out
+coverage.txt
+coverage.html
+
+# Runtime data
+data/
+.run/
+
+# Benchmark & experiment results
+benchmarks/results/*.csv
+benchmarks/results/*.png
+benchmarks/results/*.json
+experiments/results/*.csv
+experiments/results/*.png
+experiments/results/*.json
+experiments/results/*.txt
+
+# Plan (internal, not for repo)
+PLAN.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+*.swp
+*.swo
+*.swn
+
+# Env
+.env
