@@ -4,6 +4,8 @@ import (
 	"math"
 
 	"gonum.org/v1/gonum/floats"
+	"gonum.org/v1/gonum/mat"
+	"gonum.org/v1/gonum/stat"
 )
 
 // SelectParameters runs L1-regularized coordinate descent (Lasso) to identify
@@ -14,70 +16,62 @@ func SelectParameters(configs [][]float64, throughputs []float64, alpha float64)
 		return nil, nil
 	}
 	d := len(configs[0])
+	fn := float64(n)
 
-	means := make([]float64, d)
-	stds := make([]float64, d)
+	flat := make([]float64, n*d)
+	for i, row := range configs {
+		copy(flat[i*d:], row)
+	}
+	X := mat.NewDense(n, d, flat)
+
+	colBuf := make([]float64, n)
 	for j := 0; j < d; j++ {
+		mat.Col(colBuf, j, X)
+		m := stat.Mean(colBuf, nil)
+		sd := stat.StdDev(colBuf, nil)
+		if sd < 1e-10 {
+			sd = 1
+		}
 		for i := 0; i < n; i++ {
-			means[j] += configs[i][j]
-		}
-		means[j] /= float64(n)
-
-		for i := 0; i < n; i++ {
-			diff := configs[i][j] - means[j]
-			stds[j] += diff * diff
-		}
-		stds[j] = math.Sqrt(stds[j] / float64(n))
-		if stds[j] < 1e-10 {
-			stds[j] = 1
+			X.Set(i, j, (X.At(i, j)-m)/sd)
 		}
 	}
 
-	X := make([][]float64, n)
-	for i := range X {
-		X[i] = make([]float64, d)
-		floats.SubTo(X[i], configs[i], means)
-		floats.Div(X[i], stds)
-	}
-
-	yMean := 0.0
-	for _, y := range throughputs {
-		yMean += y
-	}
-	yMean /= float64(n)
-
+	yMean := stat.Mean(throughputs, nil)
 	Y := make([]float64, n)
+	floats.SubTo(Y, throughputs, make([]float64, n))
 	for i := range Y {
 		Y[i] = throughputs[i] - yMean
+	}
+
+	cols := make([][]float64, d)
+	for j := 0; j < d; j++ {
+		cols[j] = make([]float64, n)
+		mat.Col(cols[j], j, X)
 	}
 
 	beta := make([]float64, d)
 	residual := make([]float64, n)
 	copy(residual, Y)
 
-	maxIter := 1000
-	tol := 1e-6
+	const maxIter = 1000
+	const tol = 1e-6
 
-	col := make([]float64, n)
 	for iter := 0; iter < maxIter; iter++ {
 		maxChange := 0.0
 
 		for j := 0; j < d; j++ {
-			for i := 0; i < n; i++ {
-				col[i] = X[i][j]
-			}
-
+			col := cols[j]
 			floats.AddScaled(residual, beta[j], col)
 
-			rho := floats.Dot(col, residual) / float64(n)
+			rho := floats.Dot(col, residual) / fn
 
 			oldBeta := beta[j]
 			beta[j] = softThreshold(rho, alpha)
 
 			floats.AddScaled(residual, -beta[j], col)
 
-			change := math.Abs(beta[j] - oldBeta)
-			if change > maxChange {
+			if change := math.Abs(beta[j] - oldBeta); change > maxChange {
 				maxChange = change
 			}
 		}

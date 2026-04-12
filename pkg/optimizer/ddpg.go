@@ -7,12 +7,71 @@ import (
 
 	"github.com/Nyamerka/NyaQueue/pkg/nn"
 	"gonum.org/v1/gonum/floats"
+	"gonum.org/v1/gonum/mat"
 )
 
 const (
-	ddpgHiddenSize = 256
-	ddpgTau        = 0.005 // soft update coefficient
+	ddpgHiddenSize    = 256
+	ddpgTau           = 0.005
+	ddpgFiniteDiffEps = 1e-3
 )
+
+type ddpgLayer struct {
+	W *mat.Dense
+	B []float64
+}
+
+func newDDPGLayer(out, in int) ddpgLayer {
+	scale := math.Sqrt(2.0 / float64(in))
+	data := make([]float64, out*in)
+	for i := range data {
+		data[i] = rand.NormFloat64() * scale
+	}
+	return ddpgLayer{
+		W: mat.NewDense(out, in, data),
+		B: make([]float64, out),
+	}
+}
+
+func (l ddpgLayer) clone() ddpgLayer {
+	r, c := l.W.Dims()
+	data := make([]float64, r*c)
+	copy(data, l.W.RawMatrix().Data)
+	bc := make([]float64, len(l.B))
+	copy(bc, l.B)
+	return ddpgLayer{
+		W: mat.NewDense(r, c, data),
+		B: bc,
+	}
+}
+
+func (l ddpgLayer) forward(input []float64) []float64 {
+	rows, cols := l.W.Dims()
+	s := input
+	if len(s) < cols {
+		padded := make([]float64, cols)
+		copy(padded, s)
+		s = padded
+	} else if len(s) > cols {
+		s = s[:cols]
+	}
+	sv := mat.NewVecDense(cols, s)
+	rv := mat.NewVecDense(rows, nil)
+	rv.MulVec(l.W, sv)
+	out := rv.RawVector().Data
+	floats.Add(out, l.B)
+	return out
+}
+
+func (l ddpgLayer) forwardReLU(input []float64) []float64 {
+	out := l.forward(input)
+	for i, v := range out {
+		if v < 0 {
+			out[i] = 0
+		}
+	}
+	return out
+}
 
 // DDPG implements Deep Deterministic Policy Gradient with manual backprop.
 // Actor: state -> action (tanh-scaled), Critic: (state, action) -> Q-value.
@@ -24,19 +83,15 @@ type DDPG struct {
 	lr         float64
 	gamma      float64
 
-	actorW1, actorW2, actorW3 [][]float64
-	actorB1, actorB2, actorB3 []float64
-
-	criticW1, criticW2, criticW3 [][]float64
-	criticB1, criticB2, criticB3 []float64
-
-	targetActorW1, targetActorW2, targetActorW3    [][]float64
-	targetActorB1, targetActorB2, targetActorB3    []float64
-	targetCriticW1, targetCriticW2, targetCriticW3 [][]float64
-	targetCriticB1, targetCriticB2, targetCriticB3 []float64
+	actor1, actor2, actor3                      ddpgLayer
+	critic1, critic2, critic3                   ddpgLayer
+	targetActor1, targetActor2, targetActor3    ddpgLayer
+	targetCritic1, targetCritic2, targetCritic3 ddpgLayer
 
 	replayBuffer *nn.ReplayBuffer
 	noise        *nn.OUNoise
+
+	criticBuf []float64
 }
 
 func NewDDPG(stateSize, actionSize int, lr float64) *DDPG {
@@ -47,23 +102,24 @@ func NewDDPG(stateSize, actionSize int, lr float64) *DDPG {
 		gamma:        0.99,
 		replayBuffer: nn.NewReplayBuffer(100000),
 		noise:        nn.NewOUNoise(actionSize, 0, 0.15, 0.2),
+		criticBuf:    make([]float64, stateSize+actionSize),
 	}
 
-	d.actorW1, d.actorB1 = initLayer(ddpgHiddenSize, stateSize)
-	d.actorW2, d.actorB2 = initLayer(ddpgHiddenSize, ddpgHiddenSize)
-	d.actorW3, d.actorB3 = initLayer(actionSize, ddpgHiddenSize)
+	d.actor1 = newDDPGLayer(ddpgHiddenSize, stateSize)
+	d.actor2 = newDDPGLayer(ddpgHiddenSize, ddpgHiddenSize)
+	d.actor3 = newDDPGLayer(actionSize, ddpgHiddenSize)
 
-	criticInput := stateSize + actionSize
-	d.criticW1, d.criticB1 = initLayer(ddpgHiddenSize, criticInput)
-	d.criticW2, d.criticB2 = initLayer(ddpgHiddenSize, ddpgHiddenSize)
-	d.criticW3, d.criticB3 = initLayer(1, ddpgHiddenSize)
+	criticIn := stateSize + actionSize
+	d.critic1 = newDDPGLayer(ddpgHiddenSize, criticIn)
+	d.critic2 = newDDPGLayer(ddpgHiddenSize, ddpgHiddenSize)
+	d.critic3 = newDDPGLayer(1, ddpgHiddenSize)
 
-	d.targetActorW1, d.targetActorB1 = cloneLayer(d.actorW1, d.actorB1)
-	d.targetActorW2, d.targetActorB2 = cloneLayer(d.actorW2, d.actorB2)
-	d.targetActorW3, d.targetActorB3 = cloneLayer(d.actorW3, d.actorB3)
-	d.targetCriticW1, d.targetCriticB1 = cloneLayer(d.criticW1, d.criticB1)
-	d.targetCriticW2, d.targetCriticB2 = cloneLayer(d.criticW2, d.criticB2)
-	d.targetCriticW3, d.targetCriticB3 = cloneLayer(d.criticW3, d.criticB3)
+	d.targetActor1 = d.actor1.clone()
+	d.targetActor2 = d.actor2.clone()
+	d.targetActor3 = d.actor3.clone()
+	d.targetCritic1 = d.critic1.clone()
+	d.targetCritic2 = d.critic2.clone()
+	d.targetCritic3 = d.critic3.clone()
 
 	return d
 }
@@ -72,28 +128,21 @@ func (d *DDPG) Act(state []float64) []float64 {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	action := d.actorForward(state, d.actorW1, d.actorB1, d.actorW2, d.actorB2, d.actorW3, d.actorB3)
+	action := d.actorFwd(state, d.actor1, d.actor2, d.actor3)
 	noise := d.noise.Sample()
-
 	for i := range action {
-		action[i] += noise[i]
-		action[i] = math.Max(-1, math.Min(1, action[i]))
+		action[i] = math.Max(-1, math.Min(1, action[i]+noise[i]))
 	}
-
 	return action
 }
 
-func (d *DDPG) Store(state []float64, action []float64, reward float64, nextState []float64, done bool) {
-	actionCopy := make([]float64, len(action))
-	copy(actionCopy, action)
-	t := nn.Transition{
-		State:     state,
-		Action:    actionCopy,
-		Reward:    reward,
-		NextState: nextState,
-		Done:      done,
-	}
-	d.replayBuffer.Push(t)
+func (d *DDPG) Store(state, action []float64, reward float64, nextState []float64, done bool) {
+	ac := make([]float64, len(action))
+	copy(ac, action)
+	d.replayBuffer.Push(nn.Transition{
+		State: state, Action: ac, Reward: reward,
+		NextState: nextState, Done: done,
+	})
 }
 
 func (d *DDPG) Train(batchSize int) {
@@ -109,76 +158,57 @@ func (d *DDPG) Train(batchSize int) {
 	for _, t := range batch {
 		action := t.Action
 		if len(action) < d.actionSize {
-			action = make([]float64, d.actionSize)
-			copy(action, t.Action)
+			padded := make([]float64, d.actionSize)
+			copy(padded, action)
+			action = padded
 		}
 
-		nextAction := d.actorForward(t.NextState,
-			d.targetActorW1, d.targetActorB1,
-			d.targetActorW2, d.targetActorB2,
-			d.targetActorW3, d.targetActorB3)
-		nextQ := d.criticForward(t.NextState, nextAction,
-			d.targetCriticW1, d.targetCriticB1,
-			d.targetCriticW2, d.targetCriticB2,
-			d.targetCriticW3, d.targetCriticB3)
+		nextAction := d.actorFwd(t.NextState, d.targetActor1, d.targetActor2, d.targetActor3)
+		nextQ := d.criticFwd(t.NextState, nextAction, d.targetCritic1, d.targetCritic2, d.targetCritic3)
 
 		targetQ := t.Reward
 		if !t.Done {
 			targetQ += d.gamma * nextQ
 		}
 
-		currentQ := d.criticForward(t.State, action,
-			d.criticW1, d.criticB1,
-			d.criticW2, d.criticB2,
-			d.criticW3, d.criticB3)
-		criticError := targetQ - currentQ
-		d.updateCritic(t.State, action, criticError)
-
+		currentQ := d.criticFwd(t.State, action, d.critic1, d.critic2, d.critic3)
+		d.updateCritic(t.State, action, targetQ-currentQ)
 		d.updateActor(t.State)
 	}
 
-	softUpdate(d.actorW1, d.targetActorW1, ddpgTau)
-	softUpdate(d.actorW2, d.targetActorW2, ddpgTau)
-	softUpdate(d.actorW3, d.targetActorW3, ddpgTau)
-	softUpdateBias(d.actorB1, d.targetActorB1, ddpgTau)
-	softUpdateBias(d.actorB2, d.targetActorB2, ddpgTau)
-	softUpdateBias(d.actorB3, d.targetActorB3, ddpgTau)
-
-	softUpdate(d.criticW1, d.targetCriticW1, ddpgTau)
-	softUpdate(d.criticW2, d.targetCriticW2, ddpgTau)
-	softUpdate(d.criticW3, d.targetCriticW3, ddpgTau)
-	softUpdateBias(d.criticB1, d.targetCriticB1, ddpgTau)
-	softUpdateBias(d.criticB2, d.targetCriticB2, ddpgTau)
-	softUpdateBias(d.criticB3, d.targetCriticB3, ddpgTau)
+	softUpdateLayer(d.actor1, d.targetActor1, ddpgTau)
+	softUpdateLayer(d.actor2, d.targetActor2, ddpgTau)
+	softUpdateLayer(d.actor3, d.targetActor3, ddpgTau)
+	softUpdateLayer(d.critic1, d.targetCritic1, ddpgTau)
+	softUpdateLayer(d.critic2, d.targetCritic2, ddpgTau)
+	softUpdateLayer(d.critic3, d.targetCritic3, ddpgTau)
 }
 
 func (d *DDPG) ResetNoise() {
 	d.noise.Reset()
 }
 
-func (d *DDPG) actorForward(state []float64,
-	w1 [][]float64, b1 []float64,
-	w2 [][]float64, b2 []float64,
-	w3 [][]float64, b3 []float64,
-) []float64 {
-	h1 := linearReLU(state, w1, b1)
-	h2 := linearReLU(h1, w2, b2)
-	out := linearForward(h2, w3, b3)
+func (d *DDPG) actorFwd(state []float64, l1, l2, l3 ddpgLayer) []float64 {
+	h1 := l1.forwardReLU(state)
+	h2 := l2.forwardReLU(h1)
+	out := l3.forward(h2)
 	for i := range out {
 		out[i] = math.Tanh(out[i])
 	}
 	return out
 }
 
-func (d *DDPG) criticForward(state, action []float64,
-	w1 [][]float64, b1 []float64,
-	w2 [][]float64, b2 []float64,
-	w3 [][]float64, b3 []float64,
-) float64 {
-	input := append(state, action...)
-	h1 := linearReLU(input, w1, b1)
-	h2 := linearReLU(h1, w2, b2)
-	out := linearForward(h2, w3, b3)
+func (d *DDPG) fillCriticBuf(state, action []float64) []float64 {
+	copy(d.criticBuf, state)
+	copy(d.criticBuf[d.stateSize:], action)
+	return d.criticBuf[:d.stateSize+len(action)]
+}
+
+func (d *DDPG) criticFwd(state, action []float64, l1, l2, l3 ddpgLayer) float64 {
+	input := d.fillCriticBuf(state, action)
+	h1 := l1.forwardReLU(input)
+	h2 := l2.forwardReLU(h1)
+	out := l3.forward(h2)
 	if len(out) > 0 {
 		return out[0]
 	}
@@ -186,146 +216,127 @@ func (d *DDPG) criticForward(state, action []float64,
 }
 
 func (d *DDPG) updateCritic(state, action []float64, tdError float64) {
-	input := append(state, action...)
-	h1 := linearReLU(input, d.criticW1, d.criticB1)
-	h2 := linearReLU(h1, d.criticW2, d.criticB2)
+	input := d.fillCriticBuf(state, action)
+	h1 := d.critic1.forwardReLU(input)
+	h2 := d.critic2.forwardReLU(h1)
 
-	for j := 0; j < len(h2) && j < len(d.criticW3[0]); j++ {
-		d.criticW3[0][j] += d.lr * tdError * h2[j]
-	}
-	d.criticB3[0] += d.lr * tdError
+	w3Row := d.critic3.W.RawRowView(0)
+	w3Snap := make([]float64, len(w3Row))
+	copy(w3Snap, w3Row)
+
+	floats.AddScaled(w3Row, d.lr*tdError, h2)
+	d.critic3.B[0] += d.lr * tdError
 
 	dH2 := make([]float64, len(h2))
 	for j := range dH2 {
-		if j < len(d.criticW3[0]) {
-			dH2[j] = tdError * d.criticW3[0][j]
+		if j < len(w3Snap) {
+			dH2[j] = tdError * w3Snap[j]
 		}
 		if h2[j] <= 0 {
 			dH2[j] = 0
 		}
 	}
-	updateLinear(h1, dH2, d.criticW2, d.criticB2, d.lr)
 
-	dH1 := make([]float64, len(h1))
+	w2Snap := cloneMatData(d.critic2.W)
+	ddpgUpdateLayer(h1, dH2, d.critic2, d.lr)
+
+	dH1 := matTransposeVecMul(w2Snap, dH2)
 	for j := range dH1 {
-		for k := range dH2 {
-			if j < len(d.criticW2[k]) {
-				dH1[j] += dH2[k] * d.criticW2[k][j]
-			}
-		}
-		if h1[j] <= 0 {
+		if j < len(h1) && h1[j] <= 0 {
 			dH1[j] = 0
 		}
 	}
-	updateLinear(input, dH1, d.criticW1, d.criticB1, d.lr)
+	ddpgUpdateLayer(input, dH1, d.critic1, d.lr)
 }
 
 func (d *DDPG) updateActor(state []float64) {
-	action := d.actorForward(state, d.actorW1, d.actorB1, d.actorW2, d.actorB2, d.actorW3, d.actorB3)
+	h1 := d.actor1.forwardReLU(state)
+	h2 := d.actor2.forwardReLU(h1)
+	preAct := d.actor3.forward(h2)
+	action := make([]float64, len(preAct))
+	for i := range preAct {
+		action[i] = math.Tanh(preAct[i])
+	}
 
-	eps := 0.001
+	qOrig := d.criticFwd(state, action, d.critic1, d.critic2, d.critic3)
+	dQdA := make([]float64, d.actionSize)
+	actionBuf := make([]float64, d.actionSize)
 	for i := range action {
-		actionPlus := make([]float64, len(action))
-		copy(actionPlus, action)
-		actionPlus[i] += eps
-
-		qPlus := d.criticForward(state, actionPlus,
-			d.criticW1, d.criticB1,
-			d.criticW2, d.criticB2,
-			d.criticW3, d.criticB3)
-		qOrig := d.criticForward(state, action,
-			d.criticW1, d.criticB1,
-			d.criticW2, d.criticB2,
-			d.criticW3, d.criticB3)
-
-		dQdA := (qPlus - qOrig) / eps
-
-		h1 := linearReLU(state, d.actorW1, d.actorB1)
-		h2 := linearReLU(h1, d.actorW2, d.actorB2)
-
-		tanhDeriv := 1 - action[i]*action[i]
-		grad := dQdA * tanhDeriv
-
-		for j := range h2 {
-			if j < len(d.actorW3[i]) {
-				d.actorW3[i][j] += d.lr * grad * h2[j]
-			}
-		}
-		d.actorB3[i] += d.lr * grad
+		copy(actionBuf, action)
+		actionBuf[i] += ddpgFiniteDiffEps
+		qPlus := d.criticFwd(state, actionBuf, d.critic1, d.critic2, d.critic3)
+		dQdA[i] = (qPlus - qOrig) / ddpgFiniteDiffEps
 	}
-}
 
-func initLayer(outSize, inSize int) ([][]float64, []float64) {
-	scale := math.Sqrt(2.0 / float64(inSize))
-	w := make([][]float64, outSize)
-	b := make([]float64, outSize)
-	for i := range w {
-		w[i] = make([]float64, inSize)
-		for j := range w[i] {
-			w[i][j] = rand.NormFloat64() * scale
+	dOut := make([]float64, d.actionSize)
+	for i := range dOut {
+		dOut[i] = dQdA[i] * (1 - action[i]*action[i])
+	}
+
+	w3Snap := cloneMatData(d.actor3.W)
+	ddpgUpdateLayer(h2, dOut, d.actor3, d.lr)
+
+	dH2 := matTransposeVecMul(w3Snap, dOut)
+	for j := range dH2 {
+		if j < len(h2) && h2[j] <= 0 {
+			dH2[j] = 0
 		}
 	}
-	return w, b
-}
 
-func cloneLayer(w [][]float64, b []float64) ([][]float64, []float64) {
-	wc := make([][]float64, len(w))
-	for i := range w {
-		wc[i] = make([]float64, len(w[i]))
-		copy(wc[i], w[i])
+	w2Snap := cloneMatData(d.actor2.W)
+	ddpgUpdateLayer(h1, dH2, d.actor2, d.lr)
+
+	dH1 := matTransposeVecMul(w2Snap, dH2)
+	for j := range dH1 {
+		if j < len(h1) && h1[j] <= 0 {
+			dH1[j] = 0
+		}
 	}
-	bc := make([]float64, len(b))
-	copy(bc, b)
-	return wc, bc
+
+	ddpgUpdateLayer(state, dH1, d.actor1, d.lr)
 }
 
-func linearForward(input []float64, w [][]float64, b []float64) []float64 {
-	out := make([]float64, len(w))
-	for i := range w {
+func ddpgUpdateLayer(input, grad []float64, l ddpgLayer, lr float64) {
+	rows, cols := l.W.Dims()
+	for i := 0; i < rows && i < len(grad); i++ {
+		row := l.W.RawRowView(i)
 		n := len(input)
-		if len(w[i]) < n {
-			n = len(w[i])
+		if n > cols {
+			n = cols
 		}
-		out[i] = b[i] + floats.Dot(w[i][:n], input[:n])
-	}
-	return out
-}
-
-func linearReLU(input []float64, w [][]float64, b []float64) []float64 {
-	out := linearForward(input, w, b)
-	for i := range out {
-		if out[i] < 0 {
-			out[i] = 0
-		}
-	}
-	return out
-}
-
-func updateLinear(input, grad []float64, w [][]float64, b []float64, lr float64) {
-	scaled := make([]float64, len(input))
-	for i := range grad {
-		if i >= len(w) {
-			break
-		}
-		n := len(input)
-		if len(w[i]) < n {
-			n = len(w[i])
-		}
-		step := lr * grad[i]
-		floats.ScaleTo(scaled[:n], step, input[:n])
-		floats.Add(w[i][:n], scaled[:n])
-		b[i] += step
+		floats.AddScaled(row[:n], lr*grad[i], input[:n])
+		l.B[i] += lr * grad[i]
 	}
 }
 
-func softUpdate(src, dst [][]float64, tau float64) {
-	for i := range src {
-		floats.Scale(1-tau, dst[i])
-		floats.AddScaled(dst[i], tau, src[i])
-	}
+func softUpdateLayer(src, dst ddpgLayer, tau float64) {
+	srcData := src.W.RawMatrix().Data
+	dstData := dst.W.RawMatrix().Data
+	floats.Scale(1-tau, dstData)
+	floats.AddScaled(dstData, tau, srcData)
+	floats.Scale(1-tau, dst.B)
+	floats.AddScaled(dst.B, tau, src.B)
 }
 
-func softUpdateBias(src, dst []float64, tau float64) {
-	floats.Scale(1-tau, dst)
-	floats.AddScaled(dst, tau, src)
+func cloneMatData(m *mat.Dense) *mat.Dense {
+	r, c := m.Dims()
+	data := make([]float64, r*c)
+	copy(data, m.RawMatrix().Data)
+	return mat.NewDense(r, c, data)
+}
+
+// matTransposeVecMul computes W^T * v using BLAS.
+func matTransposeVecMul(w *mat.Dense, v []float64) []float64 {
+	rows, cols := w.Dims()
+	n := len(v)
+	if n > rows {
+		n = rows
+	}
+	vv := mat.NewVecDense(rows, nil)
+	for i := 0; i < n; i++ {
+		vv.SetVec(i, v[i])
+	}
+	rv := mat.NewVecDense(cols, nil)
+	rv.MulVec(w.T(), vv)
+	return rv.RawVector().Data
 }

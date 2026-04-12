@@ -1,8 +1,7 @@
 package experiments
 
 import (
-	"math"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
@@ -101,7 +100,7 @@ func (c *MetricsCollector) Snapshot(scenario, algorithm, system, mode string) Ex
 		for i, l := range c.latencies {
 			sorted[i] = float64(l)
 		}
-		sort.Float64s(sorted)
+		slices.Sort(sorted)
 
 		result.LatencyP50 = time.Duration(percentile(sorted, 0.50))
 		result.LatencyP95 = time.Duration(percentile(sorted, 0.95))
@@ -130,12 +129,17 @@ func percentile(sorted []float64, p float64) float64 {
 	if len(sorted) == 0 {
 		return 0
 	}
-	idx := p * float64(len(sorted)-1)
-	lower := int(math.Floor(idx))
-	upper := int(math.Ceil(idx))
-	if lower == upper || upper >= len(sorted) {
-		return sorted[lower]
+
+	if p <= 0 {
+		return sorted[0]
 	}
-	frac := idx - float64(lower)
-	return sorted[lower]*(1-frac) + sorted[upper]*frac
+	if p >= 1 {
+		return sorted[len(sorted)-1]
+	}
+
+	pos := p * float64(len(sorted)-1)
+	i := int(pos)
+	frac := pos - float64(i)
+
+	return sorted[i]*(1-frac) + sorted[i+1]*frac
 }

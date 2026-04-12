@@ -5,6 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"gonum.org/v1/gonum/mat"
 )
 
 type DDPGSuite struct {
@@ -67,101 +68,90 @@ func (s *DDPGSuite) TestResetNoise() {
 	require.NotPanics(s.T(), func() { d.ResetNoise() })
 }
 
-func (s *DDPGSuite) TestInitLayer() {
-	w, b := initLayer(4, 3)
-	require.Len(s.T(), w, 4)
-	require.Len(s.T(), b, 4)
-	for _, row := range w {
-		require.Len(s.T(), row, 3)
-	}
+func (s *DDPGSuite) TestNewDDPGLayer() {
+	l := newDDPGLayer(4, 3)
+	r, c := l.W.Dims()
+	require.Equal(s.T(), 4, r)
+	require.Equal(s.T(), 3, c)
+	require.Len(s.T(), l.B, 4)
 }
 
-func (s *DDPGSuite) TestCloneLayer() {
-	w, b := initLayer(4, 3)
-	wc, bc := cloneLayer(w, b)
-	require.Equal(s.T(), w, wc)
-	require.Equal(s.T(), b, bc)
+func (s *DDPGSuite) TestLayerClone() {
+	l := newDDPGLayer(4, 3)
+	lc := l.clone()
 
-	w[0][0] = 999
-	require.NotEqual(s.T(), w[0][0], wc[0][0], "clone must be independent")
+	r, c := lc.W.Dims()
+	require.Equal(s.T(), 4, r)
+	require.Equal(s.T(), 3, c)
+
+	l.W.Set(0, 0, 999)
+	require.NotEqual(s.T(), 999.0, lc.W.At(0, 0), "clone must be independent")
 }
 
-func (s *DDPGSuite) TestLinearForward() {
-	tests := []struct {
-		name  string
-		input []float64
-		w     [][]float64
-		b     []float64
-		want  []float64
-	}{
-		{
-			"identity",
-			[]float64{1, 2, 3},
-			[][]float64{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}},
-			[]float64{0, 0, 0},
-			[]float64{1, 2, 3},
-		},
-		{
-			"with_bias",
-			[]float64{1, 1},
-			[][]float64{{1, 1}},
-			[]float64{5},
-			[]float64{7},
-		},
+func (s *DDPGSuite) TestLayerForward() {
+	l := ddpgLayer{
+		W: mat.NewDense(3, 3, []float64{
+			1, 0, 0,
+			0, 1, 0,
+			0, 0, 1,
+		}),
+		B: []float64{0, 0, 0},
 	}
-	for _, tc := range tests {
-		s.Run(tc.name, func() {
-			got := linearForward(tc.input, tc.w, tc.b)
-			require.InDeltaSlice(s.T(), tc.want, got, 1e-9)
-		})
+	got := l.forward([]float64{1, 2, 3})
+	require.InDeltaSlice(s.T(), []float64{1, 2, 3}, got, 1e-9)
+
+	lBias := ddpgLayer{
+		W: mat.NewDense(1, 2, []float64{1, 1}),
+		B: []float64{5},
 	}
+	got2 := lBias.forward([]float64{1, 1})
+	require.InDeltaSlice(s.T(), []float64{7}, got2, 1e-9)
 }
 
-func (s *DDPGSuite) TestLinearReLU() {
-	input := []float64{1, -1}
-	w := [][]float64{{1, 0}, {0, 1}, {-1, 0}}
-	b := []float64{0, 0, 0}
-
-	got := linearReLU(input, w, b)
-	require.Equal(s.T(), 3, len(got))
+func (s *DDPGSuite) TestLayerForwardReLU() {
+	l := ddpgLayer{
+		W: mat.NewDense(3, 2, []float64{1, 0, 0, 1, -1, 0}),
+		B: []float64{0, 0, 0},
+	}
+	got := l.forwardReLU([]float64{1, -1})
+	require.Len(s.T(), got, 3)
 	require.InDelta(s.T(), 1.0, got[0], 1e-9)
 	require.InDelta(s.T(), 0.0, got[1], 1e-9)
 	require.InDelta(s.T(), 0.0, got[2], 1e-9)
 }
 
-func (s *DDPGSuite) TestSoftUpdate() {
-	src := [][]float64{{1.0, 2.0}, {3.0, 4.0}}
-	dst := [][]float64{{0.0, 0.0}, {0.0, 0.0}}
-	softUpdate(src, dst, 0.5)
-	require.InDelta(s.T(), 0.5, dst[0][0], 1e-9)
-	require.InDelta(s.T(), 1.0, dst[0][1], 1e-9)
+func (s *DDPGSuite) TestSoftUpdateLayer() {
+	src := ddpgLayer{
+		W: mat.NewDense(2, 2, []float64{1, 2, 3, 4}),
+		B: []float64{10, 20},
+	}
+	dst := ddpgLayer{
+		W: mat.NewDense(2, 2, []float64{0, 0, 0, 0}),
+		B: []float64{0, 0},
+	}
+	softUpdateLayer(src, dst, 0.5)
+	require.InDelta(s.T(), 0.5, dst.W.At(0, 0), 1e-9)
+	require.InDelta(s.T(), 1.0, dst.W.At(0, 1), 1e-9)
+	require.InDelta(s.T(), 5.0, dst.B[0], 1e-9)
 }
 
-func (s *DDPGSuite) TestSoftUpdateBias() {
-	src := []float64{10.0, 20.0}
-	dst := []float64{0.0, 0.0}
-	softUpdateBias(src, dst, 0.1)
-	require.InDelta(s.T(), 1.0, dst[0], 1e-9)
-	require.InDelta(s.T(), 2.0, dst[1], 1e-9)
-}
-
-func (s *DDPGSuite) TestUpdateLinear() {
-	input := []float64{1.0, 0.5}
-	grad := []float64{1.0, -1.0}
-	w := [][]float64{{0.0, 0.0}, {0.0, 0.0}}
-	b := []float64{0.0, 0.0}
-	updateLinear(input, grad, w, b, 0.1)
-	require.InDelta(s.T(), 0.1, w[0][0], 1e-9)
-	require.InDelta(s.T(), 0.05, w[0][1], 1e-9)
-	require.InDelta(s.T(), -0.1, w[1][0], 1e-9)
-	require.InDelta(s.T(), 0.1, b[0], 1e-9)
-	require.InDelta(s.T(), -0.1, b[1], 1e-9)
+func (s *DDPGSuite) TestDDPGUpdateLayer() {
+	l := ddpgLayer{
+		W: mat.NewDense(2, 2, []float64{0, 0, 0, 0}),
+		B: []float64{0, 0},
+	}
+	ddpgUpdateLayer([]float64{1.0, 0.5}, []float64{1.0, -1.0}, l, 0.1)
+	require.InDelta(s.T(), 0.1, l.W.At(0, 0), 1e-9)
+	require.InDelta(s.T(), 0.05, l.W.At(0, 1), 1e-9)
+	require.InDelta(s.T(), -0.1, l.W.At(1, 0), 1e-9)
+	require.InDelta(s.T(), 0.1, l.B[0], 1e-9)
+	require.InDelta(s.T(), -0.1, l.B[1], 1e-9)
 }
 
 func (s *DDPGSuite) TestActorForwardOutputInRange() {
 	d := NewDDPG(5, 3, 0.001)
 	state := []float64{0.1, 0.2, 0.3, 0.4, 0.5}
-	out := d.actorForward(state, d.actorW1, d.actorB1, d.actorW2, d.actorB2, d.actorW3, d.actorB3)
+	out := d.actorFwd(state, d.actor1, d.actor2, d.actor3)
 	require.Len(s.T(), out, 3)
 	for _, v := range out {
 		require.GreaterOrEqual(s.T(), v, -1.0)
@@ -173,6 +163,45 @@ func (s *DDPGSuite) TestCriticForwardReturnsScalar() {
 	d := NewDDPG(5, 3, 0.001)
 	state := []float64{0.1, 0.2, 0.3, 0.4, 0.5}
 	action := []float64{0.1, 0.2, 0.3}
-	q := d.criticForward(state, action, d.criticW1, d.criticB1, d.criticW2, d.criticB2, d.criticW3, d.criticB3)
+	q := d.criticFwd(state, action, d.critic1, d.critic2, d.critic3)
 	require.IsType(s.T(), float64(0), q)
+}
+
+func (s *DDPGSuite) TestTrainUpdatesAllActorLayers() {
+	d := NewDDPG(5, 3, 0.01)
+	w1Before := cloneMatData(d.actor1.W)
+	w2Before := cloneMatData(d.actor2.W)
+	w3Before := cloneMatData(d.actor3.W)
+
+	for i := 0; i < 200; i++ {
+		d.Store(
+			[]float64{float64(i) * 0.01, 0.1, 0.2, 0.3, 0.4},
+			[]float64{0.1, -0.2, 0.3},
+			1.0,
+			[]float64{float64(i+1) * 0.01, 0.2, 0.3, 0.4, 0.5},
+			false,
+		)
+	}
+	d.Train(64)
+
+	w1Changed := !mat.Equal(w1Before, d.actor1.W)
+	w2Changed := !mat.Equal(w2Before, d.actor2.W)
+	w3Changed := !mat.Equal(w3Before, d.actor3.W)
+
+	require.True(s.T(), w3Changed, "actor W3 should change")
+	require.True(s.T(), w2Changed, "actor W2 should change (full backprop)")
+	require.True(s.T(), w1Changed, "actor W1 should change (full backprop)")
+}
+
+func (s *DDPGSuite) TestMatTransposeVecMul() {
+	w := mat.NewDense(2, 3, []float64{
+		1, 2, 3,
+		4, 5, 6,
+	})
+	v := []float64{1, 1}
+	got := matTransposeVecMul(w, v)
+	require.Len(s.T(), got, 3)
+	require.InDelta(s.T(), 5.0, got[0], 1e-9)
+	require.InDelta(s.T(), 7.0, got[1], 1e-9)
+	require.InDelta(s.T(), 9.0, got[2], 1e-9)
 }

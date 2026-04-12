@@ -174,14 +174,21 @@ func (d *DQNScheduler) buildState(pi *broker.PriorityIndex) []float64 {
 	dist := pi.LevelDistribution()
 
 	state := make([]float64, d.stateSize)
+	levels := len(dist)
 	totalDepth := 0
-	for i, cnt := range dist {
-		state[i] = float64(cnt)
-		totalDepth += cnt
-		state[10+i] = 0
+	for i := 0; i < levels && i < d.stateSize; i++ {
+		state[i] = float64(dist[i])
+		totalDepth += dist[i]
+		if waitIdx := levels + i; waitIdx < d.stateSize {
+			state[waitIdx] = 0
+		}
 	}
-	state[20] = float64(totalDepth)
-	state[21] = 0
+	if depthIdx := levels * 2; depthIdx < d.stateSize {
+		state[depthIdx] = float64(totalDepth)
+	}
+	if lagIdx := levels*2 + 1; lagIdx < d.stateSize {
+		state[lagIdx] = 0
+	}
 
 	return state
 }

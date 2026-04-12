@@ -3,7 +3,7 @@ package scheduler
 import "github.com/Nyamerka/NyaQueue/pkg/broker"
 
 const (
-	DefaultDQNSchedStateSize  = 22 // 10 level dist + 10 wait times + depth + lag
+	DefaultDQNSchedStateSize  = broker.MaxPriority*2 + 2 // level dist + wait times + depth + lag
 	DefaultDQNSchedHiddenSize = 64
 	DefaultDQNSchedActions    = broker.MaxPriority
 

@@ -1,8 +1,9 @@
 package preprocessing
 
 import (
+	"cmp"
 	"math/rand"
-	"sort"
+	"slices"
 )
 
 type ParamRange struct {
@@ -44,8 +45,8 @@ func latinHypercubeColumn(n int) []float64 {
 
 func GenerateConfigsSorted(paramRanges []ParamRange, n int) [][]float64 {
 	configs := GenerateConfigs(paramRanges, n)
-	sort.Slice(configs, func(i, j int) bool {
-		return configs[i][0] < configs[j][0]
+	slices.SortFunc(configs, func(a, b []float64) int {
+		return cmp.Compare(a[0], b[0])
 	})
 	return configs
 }

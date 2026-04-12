@@ -2,7 +2,7 @@ package preprocessing
 
 import (
 	"math"
-	"sort"
+	"slices"
 
 	"gonum.org/v1/gonum/mat"
 )
@@ -134,6 +134,6 @@ func gridSelect(projected *mat.Dense, n, numPC, k int) []int {
 		}
 	}
 
-	sort.Ints(selected)
+	slices.Sort(selected)
 	return selected
 }

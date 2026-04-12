@@ -19,10 +19,17 @@ func (s *LoadPredictorSuite) TestUpdateAndPredict() {
 
 	lp.Update([]float64{0.5, 0.3})
 	preds := lp.Predictions()
+	predByID := make(map[int]PartitionPrediction, len(preds))
+	for _, p := range preds {
+		predByID[p.PartitionID] = p
+	}
 
 	require.Len(s.T(), preds, 2)
-	require.Equal(s.T(), 0.5, preds[0].Current)
-	require.Len(s.T(), preds[0].Predicted, 3) // horizon=3
+	require.Contains(s.T(), predByID, 0)
+	require.Contains(s.T(), predByID, 1)
+	require.Equal(s.T(), 0.5, predByID[0].Current)
+	require.Equal(s.T(), 0.3, predByID[1].Current)
+	require.Len(s.T(), predByID[0].Predicted, 3)
 }
 
 func (s *LoadPredictorSuite) TestRingBuffer() {
