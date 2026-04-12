@@ -7,6 +7,7 @@ import (
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/Nyamerka/NyaQueue/pkg/nn"
 	"gonum.org/v1/gonum/floats"
+	"gonum.org/v1/gonum/mat"
 	"gonum.org/v1/gonum/stat"
 )
 
@@ -28,10 +29,10 @@ type DQNBalancer struct {
 	minReplay     int
 	weightInit    float64
 
-	w1 [][]float64 // [hiddenSize][stateSize]
-	b1 []float64   // [hiddenSize]
-	w2 [][]float64 // [numActions][hiddenSize]
-	b2 []float64   // [numActions]
+	w1 *mat.Dense // [hiddenSize x stateSize]
+	b1 []float64  // [hiddenSize]
+	w2 *mat.Dense // [numActions x hiddenSize]
+	b2 []float64  // [numActions]
 
 	replayBuffer *nn.ReplayBuffer
 	lastState    []float64
@@ -88,30 +89,25 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 }
 
 func (d *DQNBalancer) initWeights(stateSize, numActions int) {
-	d.w1 = make([][]float64, d.hiddenSize)
+	w1Data := make([]float64, d.hiddenSize*stateSize)
+	for i := range w1Data {
+		w1Data[i] = rand.NormFloat64() * d.weightInit
+	}
+	d.w1 = mat.NewDense(d.hiddenSize, stateSize, w1Data)
 	d.b1 = make([]float64, d.hiddenSize)
-	for i := range d.w1 {
-		d.w1[i] = make([]float64, stateSize)
-		for j := range d.w1[i] {
-			d.w1[i][j] = rand.NormFloat64() * d.weightInit
-		}
-	}
 
-	d.w2 = make([][]float64, numActions)
-	d.b2 = make([]float64, numActions)
-	for i := range d.w2 {
-		d.w2[i] = make([]float64, d.hiddenSize)
-		for j := range d.w2[i] {
-			d.w2[i][j] = rand.NormFloat64() * d.weightInit
-		}
+	w2Data := make([]float64, numActions*d.hiddenSize)
+	for i := range w2Data {
+		w2Data[i] = rand.NormFloat64() * d.weightInit
 	}
+	d.w2 = mat.NewDense(numActions, d.hiddenSize, w2Data)
+	d.b2 = make([]float64, numActions)
 }
 
 func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions int) int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// Watchdog: if throughput fell below threshold, fallback to RR.
 	if d.fallbackActive {
 		return d.fallbackRR.SelectPartition(topic, key, numPartitions)
 	}
@@ -125,7 +121,7 @@ func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions in
 		return action
 	}
 
-	qValues := d.forward(state)
+	qValues, _ := d.forward(state)
 	action := floats.MaxIdx(qValues[:numPartitions])
 
 	d.lastState = state
@@ -141,7 +137,6 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 		d.loads = m.PartitionLoads
 	}
 
-	// Watchdog: check if throughput fell below the fallback threshold.
 	if d.baseThroughput > 0 {
 		if m.Throughput < d.fallbackRatio*d.baseThroughput {
 			d.fallbackActive = true
@@ -166,21 +161,18 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 	}
 }
 
-// SetBaseThroughput stores the baseline (e.g., from Phase 1 with RR) for the watchdog.
 func (d *DQNBalancer) SetBaseThroughput(t float64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.baseThroughput = t
 }
 
-// SetPredictedLoads is called by LoadPredictor to feed predictions into the DQN state.
 func (d *DQNBalancer) SetPredictedLoads(predicted []float64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.predictedLoads = predicted
 }
 
-// IsFallbackActive reports whether the DQN has fallen back to RR.
 func (d *DQNBalancer) IsFallbackActive() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -197,35 +189,41 @@ func (d *DQNBalancer) buildState() []float64 {
 	for len(state) < d.numPartitions*2 {
 		state = append(state, 0)
 	}
-	state = append(state, 0, 0) // rate, avg_msg_size (fed via metrics)
+	state = append(state, 0, 0)
 	return state
 }
 
-// forward computes Q-values: hidden = ReLU(W1·state + b1), Q = W2·hidden + b2.
-// Uses gonum/floats.Dot for vectorised inner products.
-func (d *DQNBalancer) forward(state []float64) []float64 {
-	hidden := make([]float64, d.hiddenSize)
-	sLen := len(state)
-	for i := 0; i < d.hiddenSize; i++ {
-		wRow := d.w1[i]
-		n := len(wRow)
-		if sLen < n {
-			n = sLen
-		}
-		hidden[i] = floats.Dot(wRow[:n], state[:n]) + d.b1[i]
-		if hidden[i] < 0 {
-			hidden[i] = 0 // ReLU
+func (d *DQNBalancer) forward(state []float64) ([]float64, []float64) {
+	_, stateSize := d.w1.Dims()
+	s := state
+	if len(s) < stateSize {
+		padded := make([]float64, stateSize)
+		copy(padded, s)
+		s = padded
+	} else if len(s) > stateSize {
+		s = s[:stateSize]
+	}
+
+	sv := mat.NewVecDense(stateSize, s)
+	hv := mat.NewVecDense(d.hiddenSize, nil)
+	hv.MulVec(d.w1, sv)
+
+	hidden := hv.RawVector().Data
+	floats.Add(hidden, d.b1)
+	for i, v := range hidden {
+		if v < 0 {
+			hidden[i] = 0
 		}
 	}
 
-	qValues := make([]float64, d.numPartitions)
-	for i := 0; i < d.numPartitions && i < len(d.w2); i++ {
-		qValues[i] = floats.Dot(d.w2[i], hidden) + d.b2[i]
-	}
-	return qValues
+	qv := mat.NewVecDense(d.numPartitions, nil)
+	qv.MulVec(d.w2, hv)
+
+	q := qv.RawVector().Data
+	floats.Add(q, d.b2)
+	return q, hidden
 }
 
-// computeReward returns -stddev(partition_loads). Lower imbalance = higher reward.
 func (d *DQNBalancer) computeReward(m broker.Metrics) float64 {
 	if len(m.PartitionLoads) == 0 {
 		return 0
@@ -240,8 +238,8 @@ func (d *DQNBalancer) trainStep() {
 
 	batch := d.replayBuffer.Sample(d.batchSize)
 	for _, t := range batch {
-		qValues := d.forward(t.State)
-		nextQ := d.forward(t.NextState)
+		qValues, hidden := d.forward(t.State)
+		nextQ, _ := d.forward(t.NextState)
 		maxNextQ := floats.Max(nextQ)
 
 		action := 0
@@ -258,42 +256,34 @@ func (d *DQNBalancer) trainStep() {
 		}
 
 		tdError := target - qValues[action]
-		d.updateWeights(t.State, action, tdError)
+		d.updateWeights(t.State, action, tdError, hidden)
 	}
 }
 
-func (d *DQNBalancer) updateWeights(state []float64, action int, tdError float64) {
-	hidden := make([]float64, d.hiddenSize)
+func (d *DQNBalancer) updateWeights(state []float64, action int, tdError float64, hidden []float64) {
+	if action >= d.numPartitions {
+		return
+	}
+
+	w2Row := d.w2.RawRowView(action)
+	w2Snap := make([]float64, len(w2Row))
+	copy(w2Snap, w2Row)
+
+	floats.AddScaled(w2Row, d.lr*tdError, hidden)
+	d.b2[action] += d.lr * tdError
+
+	_, stateSize := d.w1.Dims()
 	sLen := len(state)
-	for i := 0; i < d.hiddenSize; i++ {
-		wRow := d.w1[i]
-		n := len(wRow)
-		if sLen < n {
-			n = sLen
-		}
-		hidden[i] = floats.Dot(wRow[:n], state[:n]) + d.b1[i]
-		if hidden[i] < 0 {
-			hidden[i] = 0
-		}
+	if sLen > stateSize {
+		sLen = stateSize
 	}
-
-	if action < len(d.w2) {
-		for j := 0; j < d.hiddenSize; j++ {
-			d.w2[action][j] += d.lr * tdError * hidden[j]
-		}
-		d.b2[action] += d.lr * tdError
-	}
-
 	for i := 0; i < d.hiddenSize; i++ {
 		if hidden[i] <= 0 {
 			continue
 		}
-		if action < len(d.w2) {
-			dHidden := tdError * d.w2[action][i]
-			for j := 0; j < len(state) && j < len(d.w1[i]); j++ {
-				d.w1[i][j] += d.lr * dHidden * state[j]
-			}
-			d.b1[i] += d.lr * dHidden
-		}
+		dH := tdError * w2Snap[i]
+		w1Row := d.w1.RawRowView(i)
+		floats.AddScaled(w1Row[:sLen], d.lr*dH, state[:sLen])
+		d.b1[i] += d.lr * dH
 	}
 }

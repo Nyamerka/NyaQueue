@@ -8,6 +8,7 @@ import (
 
 	"github.com/Nyamerka/NyaQueue/benchmarks"
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	"github.com/samber/oops"
 )
 
 // Runner orchestrates experiment runs across scenarios and algorithms.
@@ -77,7 +78,7 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	brk := h.Broker()
 	if brk != nil {
 		if err := brk.CreateTopic("bench", topicCfg); err != nil {
-			return ExperimentResult{}, fmt.Errorf("create topic: %w", err)
+			return ExperimentResult{}, oops.Wrapf(err, "create topic")
 		}
 		brk.SetScheduler("bench", alg.NewScheduler())
 	}
@@ -124,7 +125,7 @@ loop:
 
 func (r *Runner) runKafka(ctx context.Context, sc benchmarks.Scenario, dur time.Duration) (ExperimentResult, error) {
 	if len(r.KafkaBrokers) == 0 {
-		return ExperimentResult{}, fmt.Errorf("no kafka brokers configured")
+		return ExperimentResult{}, oops.Errorf("no kafka brokers configured")
 	}
 
 	h, err := NewHarness(ctx, HarnessConfig{

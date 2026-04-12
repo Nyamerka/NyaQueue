@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
+	pb "github.com/Nyamerka/NyaQueue/pkg/proto"
 	"github.com/Nyamerka/NyaQueue/pkg/transport"
-	pb "github.com/Nyamerka/NyaQueue/pkg/transport/gen"
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"

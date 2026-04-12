@@ -2,11 +2,11 @@ package kafkadriver
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"strconv"
 	"time"
 
+	"github.com/samber/oops"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -42,18 +42,18 @@ func New(brokers []string) *KafkaHarness {
 func (h *KafkaHarness) CreateTopic(ctx context.Context, name string, partitions int) error {
 	conn, err := kafka.DialContext(ctx, "tcp", h.brokers[0])
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return oops.Wrapf(err, "dial")
 	}
 	defer conn.Close()
 
 	controller, err := conn.Controller()
 	if err != nil {
-		return fmt.Errorf("controller: %w", err)
+		return oops.Wrapf(err, "controller")
 	}
 
 	controllerConn, err := kafka.Dial("tcp", net.JoinHostPort(controller.Host, strconv.Itoa(controller.Port)))
 	if err != nil {
-		return fmt.Errorf("dial controller: %w", err)
+		return oops.Wrapf(err, "dial controller")
 	}
 	defer controllerConn.Close()
 

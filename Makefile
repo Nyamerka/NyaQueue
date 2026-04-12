@@ -2,8 +2,7 @@
        experiment docker-build docker-up docker-down docker-experiment
 
 BINARY_DIR := bin
-PROTO_DIR  := proto
-GEN_DIR    := pkg/transport/gen
+PROTO_DIR  := pkg/proto
 
 build:
 	go build -o $(BINARY_DIR)/broker     ./cmd/broker
@@ -12,10 +11,11 @@ build:
 
 proto:
 	protoc \
-		--go_out=$(GEN_DIR) --go_opt=paths=source_relative \
-		--go-grpc_out=$(GEN_DIR) --go-grpc_opt=paths=source_relative \
+		--go_out=$(PROTO_DIR) --go_opt=paths=source_relative \
+		--go-grpc_out=$(PROTO_DIR) --go-grpc_opt=paths=source_relative \
 		-I $(PROTO_DIR) \
-		$(PROTO_DIR)/nyaqueue.proto
+		$(PROTO_DIR)/model.proto $(PROTO_DIR)/request.proto \
+		$(PROTO_DIR)/response.proto $(PROTO_DIR)/queue.proto
 
 clean:
 	rm -rf $(BINARY_DIR) data/

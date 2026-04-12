@@ -1,8 +1,11 @@
 package app
 
 import (
+	"time"
+
 	"github.com/Nyamerka/NyaQueue/pkg/balancer"
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	"github.com/Nyamerka/NyaQueue/pkg/optimizer"
 )
 
 // Option configures a BrokerApp before it starts.
@@ -22,6 +25,15 @@ func WithBalancerFactory(fn func() broker.Balancer) Option {
 	}
 }
 
+// WithDefaultBalancer uses RoundRobin.
+func WithDefaultBalancer() Option {
+	return func(a *BrokerApp) {
+		a.balancerFactory = func() broker.Balancer {
+			return balancer.NewRoundRobin()
+		}
+	}
+}
+
 // WithScheduler attaches a scheduler for a specific topic.
 func WithScheduler(topic string, s broker.Scheduler) Option {
 	return func(a *BrokerApp) {
@@ -36,11 +48,45 @@ func WithGRPC(addr string) Option {
 	}
 }
 
-// WithDefaultBalancer uses RoundRobin.
-func WithDefaultBalancer() Option {
+// WithLoadPredictor enables the LSTM-based load predictor that feeds
+// predicted partition loads into the DQN balancer and backpressure controller.
+func WithLoadPredictor(window, horizon int, interval time.Duration) Option {
 	return func(a *BrokerApp) {
-		a.balancerFactory = func() broker.Balancer {
-			return balancer.NewRoundRobin()
+		a.loadPredictorCfg = &loadPredictorConfig{
+			window:   window,
+			horizon:  horizon,
+			interval: interval,
 		}
+	}
+}
+
+// WithBackpressure enables predictive backpressure control.
+// threshold is the load level at which producers are throttled (default 0.85).
+// horizon is how many steps ahead to look in the prediction (default 3).
+func WithBackpressure(threshold float64, horizon int) Option {
+	return func(a *BrokerApp) {
+		a.backpressureCfg = &backpressureConfig{
+			threshold: threshold,
+			horizon:   horizon,
+		}
+	}
+}
+
+// WithOptimizer enables the DDPG auto-configuration loop that tunes
+// broker parameters online based on live metrics.
+func WithOptimizer(params []optimizer.TunableParam, interval time.Duration) Option {
+	return func(a *BrokerApp) {
+		a.optimizerCfg = &optimizerConfig{
+			params:   params,
+			interval: interval,
+		}
+	}
+}
+
+// WithMetricsInterval sets how often the broker collects metrics and
+// pushes them to the balancer/scheduler (default 100ms).
+func WithMetricsInterval(d time.Duration) Option {
+	return func(a *BrokerApp) {
+		a.metricsInterval = d
 	}
 }

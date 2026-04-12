@@ -16,17 +16,14 @@ const (
 )
 
 type Config struct {
-	// Storage (5)
 	SegmentMaxBytes   int           `koanf:"segment_max_bytes"`
 	SegmentMaxCount   int           `koanf:"segment_max_count"`
 	RetentionMaxBytes int64         `koanf:"retention_max_bytes"`
 	RetentionMaxAge   time.Duration `koanf:"retention_max_age"`
 	FlushIntervalMs   int           `koanf:"flush_interval_ms"`
 
-	// Compression (1)
 	CompressionType int `koanf:"compression_type"` // 0=none, 1=snappy, 2=gzip, 3=lz4
 
-	// Network (7)
 	MaxConnections       int `koanf:"max_connections"`
 	RecvBufferBytes      int `koanf:"recv_buffer_bytes"`
 	SendBufferBytes      int `koanf:"send_buffer_bytes"`
@@ -35,16 +32,13 @@ type Config struct {
 	WriteTimeoutMs       int `koanf:"write_timeout_ms"`
 	NumNetworkGoroutines int `koanf:"num_network_goroutines"`
 
-	// IO (2)
 	NumIOGoroutines   int `koanf:"num_io_goroutines"`
 	MaxQueuedRequests int `koanf:"max_queued_requests"`
 
-	// Producer batching (3)
 	BatchSize        int `koanf:"batch_size"`
 	BatchMemoryBytes int `koanf:"batch_memory_bytes"`
 	LingerMs         int `koanf:"linger_ms"`
 
-	// Consumer (4)
 	FetchMinBytes            int `koanf:"fetch_min_bytes"`
 	FetchMaxWaitMs           int `koanf:"fetch_max_wait_ms"`
 	MaxFetchBytes            int `koanf:"max_fetch_bytes"`
@@ -102,7 +96,6 @@ var configValidator = govy.New(
 		Rules(rules.GTE(1000)),
 )
 
-// Validate checks Config fields against defined constraints.
 func (c Config) Validate() error {
 	return configValidator.WithName("broker.Config").Validate(c)
 }
@@ -110,9 +103,9 @@ func (c Config) Validate() error {
 type TopicConfig struct {
 	ScheduleMode      ScheduleMode
 	NumPartitions     int
-	PriorityLevels    int           // 1-10, default 1 = FIFO
-	AntiStarvationTTL time.Duration // promote stale messages after this duration
-	DQNThrottleOnLoad float64       // DQN falls back to FIFO at this load level
+	PriorityLevels    int
+	AntiStarvationTTL time.Duration
+	DQNThrottleOnLoad float64
 }
 
 func DefaultConfig() Config {
@@ -159,7 +152,6 @@ func DefaultTopicConfig() TopicConfig {
 
 const NumTunableParams = 22
 
-// ParamRange describes bounds for one tunable parameter (used by DDPG optimizer).
 type ParamRange struct {
 	Name string
 	Min  float64

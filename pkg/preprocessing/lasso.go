@@ -6,10 +6,8 @@ import (
 	"gonum.org/v1/gonum/floats"
 )
 
-// SelectParameters runs Lasso regression (coordinate descent with L1) to identify
-// the most important parameters that affect throughput.
-//
-// Returns: indices of selected parameters and their importance weights.
+// SelectParameters runs L1-regularized coordinate descent (Lasso) to identify
+// parameters most correlated with throughput.
 func SelectParameters(configs [][]float64, throughputs []float64, alpha float64) (indices []int, weights []float64) {
 	n := len(configs)
 	if n == 0 {
@@ -17,7 +15,6 @@ func SelectParameters(configs [][]float64, throughputs []float64, alpha float64)
 	}
 	d := len(configs[0])
 
-	// Standardize features
 	means := make([]float64, d)
 	stds := make([]float64, d)
 	for j := 0; j < d; j++ {
@@ -54,7 +51,6 @@ func SelectParameters(configs [][]float64, throughputs []float64, alpha float64)
 		Y[i] = throughputs[i] - yMean
 	}
 
-	// Coordinate descent Lasso
 	beta := make([]float64, d)
 	residual := make([]float64, n)
 	copy(residual, Y)
@@ -91,7 +87,6 @@ func SelectParameters(configs [][]float64, throughputs []float64, alpha float64)
 		}
 	}
 
-	// Collect non-zero coefficients
 	for j := 0; j < d; j++ {
 		if math.Abs(beta[j]) > 1e-8 {
 			indices = append(indices, j)

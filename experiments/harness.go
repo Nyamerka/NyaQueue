@@ -2,12 +2,12 @@ package experiments
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/Nyamerka/NyaQueue/internal/app"
 	"github.com/Nyamerka/NyaQueue/internal/kafkadriver"
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/Nyamerka/NyaQueue/pkg/transport"
+	"github.com/samber/oops"
 )
 
 // Mode selects how the experiment communicates with the broker.
@@ -59,10 +59,10 @@ func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 			app.WithBalancerFactory(cfg.Algorithm.NewBalancer),
 		)
 		if err != nil {
-			return nil, fmt.Errorf("app new: %w", err)
+			return nil, oops.Wrapf(err, "app new")
 		}
 		if err := a.Start(); err != nil {
-			return nil, fmt.Errorf("app start: %w", err)
+			return nil, oops.Wrapf(err, "app start")
 		}
 		h.app = a
 
@@ -72,17 +72,17 @@ func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 			app.WithGRPC(":0"),
 		)
 		if err != nil {
-			return nil, fmt.Errorf("app new: %w", err)
+			return nil, oops.Wrapf(err, "app new")
 		}
 		if err := a.Start(); err != nil {
-			return nil, fmt.Errorf("app start: %w", err)
+			return nil, oops.Wrapf(err, "app start")
 		}
 		h.app = a
 
 		client, err := transport.NewClient(a.Addr())
 		if err != nil {
 			a.Stop()
-			return nil, fmt.Errorf("grpc client: %w", err)
+			return nil, oops.Wrapf(err, "grpc client")
 		}
 		h.grpc = client
 
@@ -90,7 +90,7 @@ func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 		h.kfk = kafkadriver.New(cfg.KafkaBrokers)
 
 	default:
-		return nil, fmt.Errorf("unknown mode: %d", cfg.Mode)
+		return nil, oops.Errorf("unknown mode: %d", cfg.Mode)
 	}
 
 	return h, nil
@@ -117,7 +117,7 @@ func (h *Harness) Publish(ctx context.Context, topic string, key, value []byte, 
 	case ModeKafka:
 		return h.kfk.Produce(ctx, topic, key, value)
 	}
-	return fmt.Errorf("unsupported mode")
+	return oops.Errorf("unsupported mode")
 }
 
 // Close stops all resources.

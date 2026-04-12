@@ -7,13 +7,7 @@ import (
 	"gonum.org/v1/gonum/mat"
 )
 
-// SelectRepresentative reduces N configs to K by picking those that best cover
-// the principal-component space.
-//
-// Algorithm:
-//  1. Center the data matrix (N x D)
-//  2. SVD -> project onto top principal components
-//  3. Grid the PC space and pick the config closest to each grid center
+// SelectRepresentative reduces N configs to K via PCA + grid-based selection.
 func SelectRepresentative(configs [][]float64, k int) [][]float64 {
 	n := len(configs)
 	if n <= k {
@@ -25,7 +19,6 @@ func SelectRepresentative(configs [][]float64, k int) [][]float64 {
 
 	d := len(configs[0])
 
-	// Build data matrix and center
 	data := mat.NewDense(n, d, nil)
 	means := make([]float64, d)
 	for j := 0; j < d; j++ {
@@ -40,7 +33,6 @@ func SelectRepresentative(configs [][]float64, k int) [][]float64 {
 		}
 	}
 
-	// SVD
 	var svd mat.SVD
 	if !svd.Factorize(data, mat.SVDThin) {
 		return configs[:k]
@@ -51,11 +43,9 @@ func SelectRepresentative(configs [][]float64, k int) [][]float64 {
 		numPC = d
 	}
 
-	// Project onto top principal components
 	var vt mat.Dense
 	svd.VTo(&vt)
 
-	// vt is (d x d) or (min(n,d) x d) — we need first numPC rows
 	pcBasis := mat.NewDense(numPC, d, nil)
 	for i := 0; i < numPC; i++ {
 		for j := 0; j < d; j++ {
@@ -66,7 +56,6 @@ func SelectRepresentative(configs [][]float64, k int) [][]float64 {
 	projected := mat.NewDense(n, numPC, nil)
 	projected.Mul(data, pcBasis.T())
 
-	// Grid-based selection: divide PC space into sqrt(k) x sqrt(k) cells
 	selected := gridSelect(projected, n, numPC, k)
 
 	result := make([][]float64, len(selected))
@@ -82,7 +71,6 @@ func gridSelect(projected *mat.Dense, n, numPC, k int) []int {
 		dist float64
 	}
 
-	// Find ranges of projected data
 	mins := make([]float64, numPC)
 	maxs := make([]float64, numPC)
 	for j := 0; j < numPC; j++ {
@@ -99,7 +87,6 @@ func gridSelect(projected *mat.Dense, n, numPC, k int) []int {
 		}
 	}
 
-	// Generate k target points spread evenly in the PC space
 	gridSize := int(math.Ceil(math.Sqrt(float64(k))))
 	targets := make([][]float64, 0, gridSize*gridSize)
 	for i := 0; i < gridSize; i++ {
@@ -115,7 +102,6 @@ func gridSelect(projected *mat.Dense, n, numPC, k int) []int {
 		}
 	}
 
-	// For each target, find nearest config
 	used := make(map[int]bool)
 	selected := make([]int, 0, k)
 

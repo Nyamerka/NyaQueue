@@ -12,8 +12,8 @@ type PartitionPrediction struct {
 	Predicted   []float64 // predictions K steps ahead
 }
 
-// LoadPredictor runs a background loop that publishes predictions via atomic.Value.
-// Initially uses a simple moving-average heuristic; will be replaced with LSTM (GoMLX).
+// LoadPredictor publishes partition load predictions via atomic.Value.
+// Uses moving-average as baseline; LSTM inference can replace predict().
 type LoadPredictor struct {
 	predictions atomic.Value // stores []PartitionPrediction
 	history     map[int]*RingBuffer
@@ -35,7 +35,6 @@ func NewLoadPredictor(window, horizon int, interval time.Duration) *LoadPredicto
 	return lp
 }
 
-// Predictions returns the latest predictions (lock-free read).
 func (lp *LoadPredictor) Predictions() []PartitionPrediction {
 	v := lp.predictions.Load()
 	if v == nil {
@@ -44,7 +43,6 @@ func (lp *LoadPredictor) Predictions() []PartitionPrediction {
 	return v.([]PartitionPrediction)
 }
 
-// Update feeds current partition loads into the predictor's history buffers.
 func (lp *LoadPredictor) Update(loads []float64) {
 	for i, load := range loads {
 		buf, ok := lp.history[i]
@@ -66,8 +64,6 @@ func (lp *LoadPredictor) predict() {
 			current = vals[len(vals)-1]
 		}
 
-		// Simple moving-average extrapolation as baseline;
-		// will be replaced by LSTM inference via GoMLX.
 		avg := movingAverage(vals)
 		predicted := make([]float64, lp.horizon)
 		for k := range predicted {
@@ -113,7 +109,6 @@ func movingAverage(vals []float64) float64 {
 	return sum / float64(len(vals))
 }
 
-// RingBuffer is a fixed-size circular buffer of float64 values.
 type RingBuffer struct {
 	mu   sync.Mutex
 	data []float64

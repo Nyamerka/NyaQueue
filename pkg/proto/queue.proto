@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package nyaqueue;
+
+option go_package = "github.com/Nyamerka/NyaQueue/pkg/proto";
+
+import "request.proto";
+import "response.proto";
+
+service NyaQueue {
+  rpc Produce(ProduceRequest)       returns (ProduceResponse);
+  rpc Consume(ConsumeRequest)       returns (ConsumeResponse);
+  rpc Commit(CommitRequest)         returns (CommitResponse);
+
+  rpc CreateTopic(CreateTopicRequest)   returns (CreateTopicResponse);
+  rpc DeleteTopic(DeleteTopicRequest)   returns (DeleteTopicResponse);
+  rpc ListTopics(ListTopicsRequest)     returns (ListTopicsResponse);
+
+  rpc GetMetrics(MetricsRequest)        returns (MetricsResponse);
+}

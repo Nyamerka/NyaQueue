@@ -64,7 +64,6 @@ func (p *PSA) OnMetrics(m broker.Metrics) {
 
 	p.loads = m.PartitionLoads
 
-	// Release bindings for empty partitions.
 	for i, depth := range m.QueueDepth {
 		if depth == 0 {
 			for k, part := range p.bindings {

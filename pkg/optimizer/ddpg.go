@@ -14,11 +14,8 @@ const (
 	ddpgTau        = 0.005 // soft update coefficient
 )
 
-// DDPG implements the Deep Deterministic Policy Gradient algorithm.
-// Actor: state -> action (parameter deltas, tanh-scaled)
-// Critic: (state, action) -> Q-value
-//
-// Will be migrated to GoMLX for autograd; currently uses manual backprop.
+// DDPG implements Deep Deterministic Policy Gradient with manual backprop.
+// Actor: state -> action (tanh-scaled), Critic: (state, action) -> Q-value.
 type DDPG struct {
 	mu sync.Mutex
 
@@ -27,15 +24,12 @@ type DDPG struct {
 	lr         float64
 	gamma      float64
 
-	// Actor network
 	actorW1, actorW2, actorW3 [][]float64
 	actorB1, actorB2, actorB3 []float64
 
-	// Critic network
 	criticW1, criticW2, criticW3 [][]float64
 	criticB1, criticB2, criticB3 []float64
 
-	// Target networks (soft-updated copies)
 	targetActorW1, targetActorW2, targetActorW3    [][]float64
 	targetActorB1, targetActorB2, targetActorB3    []float64
 	targetCriticW1, targetCriticW2, targetCriticW3 [][]float64
@@ -55,18 +49,15 @@ func NewDDPG(stateSize, actionSize int, lr float64) *DDPG {
 		noise:        nn.NewOUNoise(actionSize, 0, 0.15, 0.2),
 	}
 
-	// Actor: stateSize -> 256 -> 256 -> actionSize (tanh)
 	d.actorW1, d.actorB1 = initLayer(ddpgHiddenSize, stateSize)
 	d.actorW2, d.actorB2 = initLayer(ddpgHiddenSize, ddpgHiddenSize)
 	d.actorW3, d.actorB3 = initLayer(actionSize, ddpgHiddenSize)
 
-	// Critic: (stateSize + actionSize) -> 256 -> 256 -> 1
 	criticInput := stateSize + actionSize
 	d.criticW1, d.criticB1 = initLayer(ddpgHiddenSize, criticInput)
 	d.criticW2, d.criticB2 = initLayer(ddpgHiddenSize, ddpgHiddenSize)
 	d.criticW3, d.criticB3 = initLayer(1, ddpgHiddenSize)
 
-	// Clone to targets
 	d.targetActorW1, d.targetActorB1 = cloneLayer(d.actorW1, d.actorB1)
 	d.targetActorW2, d.targetActorB2 = cloneLayer(d.actorW2, d.actorB2)
 	d.targetActorW3, d.targetActorB3 = cloneLayer(d.actorW3, d.actorB3)
@@ -77,7 +68,6 @@ func NewDDPG(stateSize, actionSize int, lr float64) *DDPG {
 	return d
 }
 
-// Act returns action (parameter deltas) given the current state, with exploration noise.
 func (d *DDPG) Act(state []float64) []float64 {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -93,7 +83,6 @@ func (d *DDPG) Act(state []float64) []float64 {
 	return action
 }
 
-// Store saves a transition in the replay buffer.
 func (d *DDPG) Store(state []float64, action []float64, reward float64, nextState []float64, done bool) {
 	actionCopy := make([]float64, len(action))
 	copy(actionCopy, action)
@@ -107,7 +96,6 @@ func (d *DDPG) Store(state []float64, action []float64, reward float64, nextStat
 	d.replayBuffer.Push(t)
 }
 
-// Train performs one update step on a mini-batch from the replay buffer.
 func (d *DDPG) Train(batchSize int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -125,7 +113,6 @@ func (d *DDPG) Train(batchSize int) {
 			copy(action, t.Action)
 		}
 
-		// Target Q: critic(next_state, actor(next_state))
 		nextAction := d.actorForward(t.NextState,
 			d.targetActorW1, d.targetActorB1,
 			d.targetActorW2, d.targetActorB2,
@@ -140,7 +127,6 @@ func (d *DDPG) Train(batchSize int) {
 			targetQ += d.gamma * nextQ
 		}
 
-		// Update critic
 		currentQ := d.criticForward(t.State, action,
 			d.criticW1, d.criticB1,
 			d.criticW2, d.criticB2,
@@ -148,11 +134,9 @@ func (d *DDPG) Train(batchSize int) {
 		criticError := targetQ - currentQ
 		d.updateCritic(t.State, action, criticError)
 
-		// Update actor (policy gradient)
 		d.updateActor(t.State)
 	}
 
-	// Soft update targets
 	softUpdate(d.actorW1, d.targetActorW1, ddpgTau)
 	softUpdate(d.actorW2, d.targetActorW2, ddpgTau)
 	softUpdate(d.actorW3, d.targetActorW3, ddpgTau)
@@ -180,7 +164,6 @@ func (d *DDPG) actorForward(state []float64,
 	h1 := linearReLU(state, w1, b1)
 	h2 := linearReLU(h1, w2, b2)
 	out := linearForward(h2, w3, b3)
-	// tanh activation on output
 	for i := range out {
 		out[i] = math.Tanh(out[i])
 	}
@@ -207,13 +190,11 @@ func (d *DDPG) updateCritic(state, action []float64, tdError float64) {
 	h1 := linearReLU(input, d.criticW1, d.criticB1)
 	h2 := linearReLU(h1, d.criticW2, d.criticB2)
 
-	// Backprop through layer 3
 	for j := 0; j < len(h2) && j < len(d.criticW3[0]); j++ {
 		d.criticW3[0][j] += d.lr * tdError * h2[j]
 	}
 	d.criticB3[0] += d.lr * tdError
 
-	// Backprop through layer 2
 	dH2 := make([]float64, len(h2))
 	for j := range dH2 {
 		if j < len(d.criticW3[0]) {
@@ -225,7 +206,6 @@ func (d *DDPG) updateCritic(state, action []float64, tdError float64) {
 	}
 	updateLinear(h1, dH2, d.criticW2, d.criticB2, d.lr)
 
-	// Backprop through layer 1
 	dH1 := make([]float64, len(h1))
 	for j := range dH1 {
 		for k := range dH2 {
@@ -274,8 +254,6 @@ func (d *DDPG) updateActor(state []float64) {
 		d.actorB3[i] += d.lr * grad
 	}
 }
-
-// --- helpers ---
 
 func initLayer(outSize, inSize int) ([][]float64, []float64) {
 	scale := math.Sqrt(2.0 / float64(inSize))

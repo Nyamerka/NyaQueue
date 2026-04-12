@@ -1,31 +1,30 @@
 package broker
 
 import (
-	"fmt"
+	"errors"
 	"log"
 	"sync"
 	"time"
+
+	"github.com/samber/oops"
 )
 
-// Balancer selects a target partition (imported interface to avoid circular deps).
 type Balancer interface {
 	SelectPartition(topic string, key []byte, numPartitions int) int
 	OnMetrics(m Metrics)
 }
 
-// Scheduler determines message delivery order.
 type Scheduler interface {
 	Next(partition *Partition, consumerOffset uint64) (*Message, uint64, error)
 	Enqueue(msg *Message, walOffset int64)
 }
 
 type Broker struct {
-	mu       sync.RWMutex
-	config   Config
-	dataDir  string
-	topics   map[string]*Topic
-	balancer Balancer
-	// Per-topic schedulers, keyed by topic name.
+	mu         sync.RWMutex
+	config     Config
+	dataDir    string
+	topics     map[string]*Topic
+	balancer   Balancer
 	schedulers map[string]Scheduler
 
 	metrics      *MetricsCollector
@@ -52,21 +51,18 @@ func New(cfg Config, dataDir string, bal Balancer, offsetStore *OffsetStore) *Br
 	return b
 }
 
-// SetBalancer replaces the active balancer (e.g., switching from RR to DQN).
 func (b *Broker) SetBalancer(bal Balancer) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.balancer = bal
 }
 
-// SetScheduler sets the scheduler for a specific topic.
 func (b *Broker) SetScheduler(topic string, sched Scheduler) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.schedulers[topic] = sched
 }
 
-// SetBackpressure replaces the backpressure controller (e.g., connecting LoadPredictor).
 func (b *Broker) SetBackpressure(bp *BackpressureController) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -78,7 +74,7 @@ func (b *Broker) CreateTopic(name string, cfg TopicConfig) error {
 	defer b.mu.Unlock()
 
 	if _, exists := b.topics[name]; exists {
-		return fmt.Errorf("topic %q already exists", name)
+		return oops.Errorf("topic %q already exists", name)
 	}
 
 	t, err := NewTopic(name, b.dataDir, cfg)
@@ -95,7 +91,7 @@ func (b *Broker) DeleteTopic(name string) error {
 
 	t, exists := b.topics[name]
 	if !exists {
-		return fmt.Errorf("topic %q not found", name)
+		return oops.Errorf("topic %q not found", name)
 	}
 	delete(b.topics, name)
 	delete(b.schedulers, name)
@@ -108,7 +104,7 @@ func (b *Broker) GetTopic(name string) (*Topic, error) {
 
 	t, exists := b.topics[name]
 	if !exists {
-		return nil, fmt.Errorf("topic %q not found", name)
+		return nil, oops.Errorf("topic %q not found", name)
 	}
 	return t, nil
 }
@@ -124,7 +120,6 @@ func (b *Broker) ListTopics() []*Topic {
 	return topics
 }
 
-// Publish routes a message to the appropriate partition via the Balancer.
 func (b *Broker) Publish(topicName string, msg *Message) (partition int, offset uint64, err error) {
 	b.mu.RLock()
 	t, exists := b.topics[topicName]
@@ -133,7 +128,7 @@ func (b *Broker) Publish(topicName string, msg *Message) (partition int, offset 
 	b.mu.RUnlock()
 
 	if !exists {
-		return 0, 0, fmt.Errorf("topic %q not found", topicName)
+		return 0, 0, oops.Errorf("topic %q not found", topicName)
 	}
 
 	numParts := t.NumPartitions()
@@ -161,7 +156,6 @@ func (b *Broker) Publish(topicName string, msg *Message) (partition int, offset 
 	return partIdx, offset, nil
 }
 
-// Consume fetches the next message from a partition using the topic's scheduler.
 func (b *Broker) Consume(topicName, group string, partIdx int) (*Message, uint64, error) {
 	b.mu.RLock()
 	t, exists := b.topics[topicName]
@@ -169,7 +163,7 @@ func (b *Broker) Consume(topicName, group string, partIdx int) (*Message, uint64
 	b.mu.RUnlock()
 
 	if !exists {
-		return nil, 0, fmt.Errorf("topic %q not found", topicName)
+		return nil, 0, oops.Errorf("topic %q not found", topicName)
 	}
 
 	p, err := t.Partition(partIdx)
@@ -181,14 +175,14 @@ func (b *Broker) Consume(topicName, group string, partIdx int) (*Message, uint64
 	if b.offsetStore != nil {
 		off, err := b.offsetStore.Load(group, topicName, partIdx)
 		if err != nil {
-			consumerOffset = 1 // start from the first valid WAL index
+			consumerOffset = 1
 		} else {
 			consumerOffset = uint64(off)
 		}
 	}
 
 	if sched == nil {
-		return nil, 0, fmt.Errorf("no scheduler configured for topic %q", topicName)
+		return nil, 0, oops.Errorf("no scheduler configured for topic %q", topicName)
 	}
 
 	msg, nextOffset, err := sched.Next(p, consumerOffset)
@@ -201,7 +195,6 @@ func (b *Broker) Consume(topicName, group string, partIdx int) (*Message, uint64
 	return msg, nextOffset, nil
 }
 
-// Commit persists the consumer offset for a group/topic/partition.
 func (b *Broker) Commit(group, topicName string, partIdx int, offset int64) error {
 	if b.offsetStore == nil {
 		return nil
@@ -258,4 +251,4 @@ func (b *Broker) Stop() {
 	}
 }
 
-var ErrThrottled = fmt.Errorf("backpressure: partition overloaded, try again later")
+var ErrThrottled = errors.New("backpressure: partition overloaded, try again later")

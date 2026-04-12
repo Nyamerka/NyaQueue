@@ -2,12 +2,13 @@ package transport
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"time"
 
+	"github.com/samber/oops"
+
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
-	pb "github.com/Nyamerka/NyaQueue/pkg/transport/gen"
+	pb "github.com/Nyamerka/NyaQueue/pkg/proto"
 	"google.golang.org/grpc"
 )
 
@@ -29,7 +30,7 @@ func NewServer(b *broker.Broker) *Server {
 func (s *Server) Start(addr string) error {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", addr, err)
+		return oops.Wrapf(err, "listen %s", addr)
 	}
 	s.listener = lis
 
@@ -49,8 +50,6 @@ func (s *Server) Addr() string {
 	}
 	return ""
 }
-
-// --- gRPC method implementations ---
 
 func (s *Server) Produce(_ context.Context, req *pb.ProduceRequest) (*pb.ProduceResponse, error) {
 	msg := &broker.Message{

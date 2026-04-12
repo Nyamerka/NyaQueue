@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/samber/oops"
 	"github.com/tidwall/wal"
 )
 
@@ -23,13 +24,13 @@ func NewPartition(id int, topicName, dataDir string, mode ScheduleMode) (*Partit
 	dir := filepath.Join(dataDir, topicName, fmt.Sprintf("partition-%d", id))
 	log, err := wal.Open(dir, nil)
 	if err != nil {
-		return nil, fmt.Errorf("open WAL partition %d: %w", id, err)
+		return nil, oops.Wrapf(err, "open WAL partition %d", id)
 	}
 
 	lastIndex, err := log.LastIndex()
 	if err != nil {
 		log.Close()
-		return nil, fmt.Errorf("read last index partition %d: %w", id, err)
+		return nil, oops.Wrapf(err, "read last index partition %d", id)
 	}
 
 	p := &Partition{
@@ -59,7 +60,7 @@ func (p *Partition) Append(msg *Message) (uint64, error) {
 	err := p.log.Write(offset, data)
 	if err != nil {
 		p.mu.Unlock()
-		return 0, fmt.Errorf("WAL write: %w", err)
+		return 0, oops.Wrapf(err, "WAL write")
 	}
 	p.nextOffset++
 	pi := p.priorityIndex
@@ -78,7 +79,7 @@ func (p *Partition) Read(offset uint64) (*Message, error) {
 	p.mu.RUnlock()
 
 	if err != nil {
-		return nil, fmt.Errorf("WAL read offset %d: %w", offset, err)
+		return nil, oops.Wrapf(err, "WAL read offset %d", offset)
 	}
 	return UnmarshalMessage(data)
 }
@@ -120,7 +121,7 @@ func (p *Partition) Rebuild(startOffset uint64, isCommitted func(offset uint64) 
 		data, err := p.log.Read(off)
 		p.mu.RUnlock()
 		if err != nil {
-			return fmt.Errorf("rebuild read offset %d: %w", off, err)
+			return oops.Wrapf(err, "rebuild read offset %d", off)
 		}
 
 		if isCommitted(off) {
@@ -129,7 +130,7 @@ func (p *Partition) Rebuild(startOffset uint64, isCommitted func(offset uint64) 
 
 		hdr, err := UnmarshalHeader(data)
 		if err != nil {
-			return fmt.Errorf("rebuild unmarshal header offset %d: %w", off, err)
+			return oops.Wrapf(err, "rebuild unmarshal header offset %d", off)
 		}
 
 		p.priorityIndex.Add(int(hdr.Priority), int64(off), time.Unix(0, hdr.Timestamp))

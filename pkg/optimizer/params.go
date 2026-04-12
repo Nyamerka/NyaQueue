@@ -1,16 +1,12 @@
 package optimizer
 
-// TunableParam describes one broker parameter that DDPG can adjust.
 type TunableParam struct {
 	Name   string
 	Min    float64
 	Max    float64
-	Weight float64 // Lasso-derived importance weight (0 = excluded)
+	Weight float64 // Lasso-derived importance (0 = excluded from DDPG action space)
 }
 
-// DefaultTunableParams returns all 22 broker parameters with default Lasso weights.
-// After running the preprocessing/lasso pipeline, weights are updated:
-// zero-weight params are excluded from the DDPG action space.
 func DefaultTunableParams() []TunableParam {
 	return []TunableParam{
 		{"SegmentMaxBytes", 1 << 20, 64 << 20, 1.0},
@@ -38,7 +34,6 @@ func DefaultTunableParams() []TunableParam {
 	}
 }
 
-// ActiveParams filters out zero-weight parameters (post-Lasso).
 func ActiveParams(all []TunableParam) []TunableParam {
 	var active []TunableParam
 	for _, p := range all {
@@ -49,7 +44,6 @@ func ActiveParams(all []TunableParam) []TunableParam {
 	return active
 }
 
-// Normalize maps a raw parameter value to [0, 1] within its range.
 func Normalize(val, min, max float64) float64 {
 	if max <= min {
 		return 0
@@ -64,12 +58,10 @@ func Normalize(val, min, max float64) float64 {
 	return n
 }
 
-// Denormalize maps a [0, 1] value back to the parameter's range.
 func Denormalize(norm, min, max float64) float64 {
 	return min + norm*(max-min)
 }
 
-// ClipAction clips a delta so the resulting value stays within [min, max].
 func ClipAction(current, delta, min, max float64) float64 {
 	result := current + delta
 	if result < min {

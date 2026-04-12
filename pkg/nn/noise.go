@@ -3,9 +3,6 @@ package nn
 import "math/rand"
 
 // OUNoise implements Ornstein-Uhlenbeck process for DDPG exploration.
-//
-// dx = theta * (mu - x) * dt + sigma * dW
-// Produces temporally correlated noise, better than i.i.d. Gaussian for continuous control.
 type OUNoise struct {
 	mu    float64
 	theta float64

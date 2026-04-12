@@ -3,14 +3,13 @@ package broker
 type BackpressureState int
 
 const (
-	BPOpen   BackpressureState = iota // no throttling
-	BPWarn                            // rate limiting
-	BPClosed                          // reject (ErrThrottled)
+	BPOpen BackpressureState = iota
+	BPWarn
+	BPClosed
 )
 
-// BackpressureController reads predictions from LoadPredictor and decides
-// whether to throttle producers. Initially threshold-based; predictive mode
-// activates when a LoadPredictor is connected.
+// BackpressureController throttles producers based on LoadPredictor predictions.
+// Falls back to open-by-default when no predictor is connected.
 type BackpressureController struct {
 	predictor *LoadPredictor
 	threshold float64

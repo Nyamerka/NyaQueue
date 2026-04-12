@@ -1,8 +1,9 @@
 package broker
 
 import (
-	"fmt"
 	"sync"
+
+	"github.com/samber/oops"
 )
 
 type Topic struct {
@@ -27,7 +28,7 @@ func NewTopic(name, dataDir string, cfg TopicConfig) (*Topic, error) {
 		p, err := NewPartition(i, name, dataDir, cfg.ScheduleMode)
 		if err != nil {
 			t.Close()
-			return nil, fmt.Errorf("create partition %d for topic %q: %w", i, name, err)
+			return nil, oops.Wrapf(err, "create partition %d for topic %q", i, name)
 		}
 		t.partitions[i] = p
 	}
@@ -54,7 +55,7 @@ func (t *Topic) Partition(id int) (*Partition, error) {
 	defer t.mu.RUnlock()
 
 	if id < 0 || id >= len(t.partitions) {
-		return nil, fmt.Errorf("partition %d out of range [0, %d)", id, len(t.partitions))
+		return nil, oops.Errorf("partition %d out of range [0, %d)", id, len(t.partitions))
 	}
 	return t.partitions[id], nil
 }

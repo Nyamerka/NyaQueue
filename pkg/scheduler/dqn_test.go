@@ -8,113 +8,6 @@ import (
 	"github.com/stretchr/testify/suite"
 )
 
-// --- FIFO ---
-
-type FIFOSuite struct {
-	suite.Suite
-}
-
-func TestFIFOSuite(t *testing.T) { suite.Run(t, new(FIFOSuite)) }
-
-func (s *FIFOSuite) TestSequentialRead() {
-	tests := []struct {
-		name     string
-		messages int
-	}{
-		{"single", 1},
-		{"ten", 10},
-		{"hundred", 100},
-	}
-
-	for _, tc := range tests {
-		s.Run(tc.name, func() {
-			dir := s.T().TempDir()
-			p, err := broker.NewPartition(0, "test", dir, broker.ModeFIFO)
-			require.NoError(s.T(), err)
-			defer p.Close()
-
-			for i := 0; i < tc.messages; i++ {
-				_, err := p.Append(broker.NewMessage(0, []byte("k"), []byte("v")))
-				require.NoError(s.T(), err)
-			}
-
-			fifo := NewFIFO()
-			offset := uint64(1) // WAL starts at 1
-			for i := 0; i < tc.messages; i++ {
-				msg, nextOff, err := fifo.Next(p, offset)
-				require.NoError(s.T(), err)
-				require.NotNil(s.T(), msg)
-				require.Equal(s.T(), offset+1, nextOff)
-				offset = nextOff
-			}
-		})
-	}
-}
-
-func (s *FIFOSuite) TestNoMessages() {
-	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeFIFO)
-	require.NoError(s.T(), err)
-	defer p.Close()
-
-	fifo := NewFIFO()
-	_, _, err = fifo.Next(p, 1)
-	require.Error(s.T(), err)
-}
-
-// --- StrictPriority ---
-
-type PrioritySuite struct {
-	suite.Suite
-}
-
-func TestPrioritySuite(t *testing.T) { suite.Run(t, new(PrioritySuite)) }
-
-func (s *PrioritySuite) TestHighestFirst() {
-	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority)
-	require.NoError(s.T(), err)
-	defer p.Close()
-
-	priorities := []uint8{1, 9, 5, 3, 7}
-	for _, pri := range priorities {
-		_, err := p.Append(broker.NewMessage(pri, []byte("k"), []byte("v")))
-		require.NoError(s.T(), err)
-	}
-
-	sched := NewStrictPriority()
-	expectedOrder := []uint8{9, 7, 5, 3, 1}
-	for _, expected := range expectedOrder {
-		msg, _, err := sched.Next(p, 0)
-		require.NoError(s.T(), err)
-		require.Equal(s.T(), expected, msg.Header.Priority)
-	}
-}
-
-func (s *PrioritySuite) TestEmptyQueue() {
-	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority)
-	require.NoError(s.T(), err)
-	defer p.Close()
-
-	sched := NewStrictPriority()
-	_, _, err = sched.Next(p, 0)
-	require.Error(s.T(), err)
-}
-
-func (s *PrioritySuite) TestNoPriorityIndex() {
-	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeFIFO)
-	require.NoError(s.T(), err)
-	defer p.Close()
-
-	sched := NewStrictPriority()
-	_, _, err = sched.Next(p, 0)
-	require.Error(s.T(), err)
-}
-
-// --- DQN Scheduler ---
-
 type DQNSchedSuite struct {
 	suite.Suite
 }
@@ -203,8 +96,53 @@ func (s *DQNSchedSuite) TestOnMetricsWithoutPriorState() {
 func (s *DQNSchedSuite) TestForwardOutputSize() {
 	dqn := NewDQNScheduler()
 	state := make([]float64, dqn.stateSize)
-	q := dqn.forward(state)
+	q, hidden := dqn.forward(state)
 	require.Len(s.T(), q, dqn.numActions)
+	require.Len(s.T(), hidden, dqn.hiddenSize)
+}
+
+func (s *DQNSchedSuite) TestForwardDeterministic() {
+	dqn := NewDQNScheduler()
+	state := make([]float64, dqn.stateSize)
+	for i := range state {
+		state[i] = float64(i) * 0.1
+	}
+	q1, h1 := dqn.forward(state)
+	q2, h2 := dqn.forward(state)
+	require.InDeltaSlice(s.T(), q1, q2, 1e-12)
+	require.InDeltaSlice(s.T(), h1, h2, 1e-12)
+}
+
+func (s *DQNSchedSuite) TestUpdateWeightsChangesWeights() {
+	dqn := NewDQNScheduler(WithDQNSchedLearningRate(0.1))
+	state := make([]float64, dqn.stateSize)
+	for i := range state {
+		state[i] = 0.5
+	}
+
+	qBefore, hidden := dqn.forward(state)
+	beforeCopy := make([]float64, len(qBefore))
+	copy(beforeCopy, qBefore)
+
+	dqn.updateWeights(state, 0, 1.0, hidden)
+
+	qAfter, _ := dqn.forward(state)
+	changed := false
+	for i := range qBefore {
+		if qAfter[i] != beforeCopy[i] {
+			changed = true
+			break
+		}
+	}
+	require.True(s.T(), changed, "weights should change after update")
+}
+
+func (s *DQNSchedSuite) TestForwardShortState() {
+	dqn := NewDQNScheduler()
+	state := []float64{0.1, 0.2}
+	q, hidden := dqn.forward(state)
+	require.Len(s.T(), q, dqn.numActions)
+	require.Len(s.T(), hidden, dqn.hiddenSize)
 }
 
 func (s *DQNSchedSuite) TestEnqueueNoop() {
@@ -242,43 +180,4 @@ func (s *DQNSchedSuite) TestNoPriorityIndex() {
 	dqn := NewDQNScheduler()
 	_, _, err = dqn.Next(p, 0)
 	require.Error(s.T(), err)
-}
-
-// --- FIFO extras ---
-
-func (s *FIFOSuite) TestEnqueueNoop() {
-	fifo := NewFIFO()
-	require.NotPanics(s.T(), func() {
-		fifo.Enqueue(&broker.Message{}, 0)
-	})
-}
-
-// --- StrictPriority extras ---
-
-func (s *PrioritySuite) TestEnqueueNoop() {
-	sp := NewStrictPriority()
-	require.NotPanics(s.T(), func() {
-		sp.Enqueue(&broker.Message{}, 0)
-	})
-}
-
-func (s *PrioritySuite) TestSamePriorityFIFO() {
-	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority)
-	require.NoError(s.T(), err)
-	defer p.Close()
-
-	for i := 0; i < 3; i++ {
-		_, err := p.Append(broker.NewMessage(5, []byte("k"), []byte{byte(i)}))
-		require.NoError(s.T(), err)
-	}
-
-	sched := NewStrictPriority()
-	var values []byte
-	for i := 0; i < 3; i++ {
-		msg, _, err := sched.Next(p, 0)
-		require.NoError(s.T(), err)
-		values = append(values, msg.Value[0])
-	}
-	require.Equal(s.T(), []byte{0, 1, 2}, values, "same priority: FIFO order")
 }

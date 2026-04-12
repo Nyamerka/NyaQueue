@@ -24,7 +24,6 @@ type MetricsCollector struct {
 	lastSnap     Metrics
 	lastCollect  time.Time
 
-	// Per-partition atomic counters for lock-free hot path.
 	partProduces []atomic.Int64
 	partConsumes []atomic.Int64
 }
@@ -36,13 +35,13 @@ func NewMetricsCollector(b *Broker) *MetricsCollector {
 	}
 }
 
-func (mc *MetricsCollector) RecordProduce(topic string, partition int) {
+func (mc *MetricsCollector) RecordProduce(_ string, partition int) {
 	atomic.AddInt64(&mc.produceCount, 1)
 	mc.ensurePartCounters(partition + 1)
 	mc.partProduces[partition].Add(1)
 }
 
-func (mc *MetricsCollector) RecordConsume(topic string, partition int) {
+func (mc *MetricsCollector) RecordConsume(_ string, partition int) {
 	atomic.AddInt64(&mc.consumeCount, 1)
 	mc.ensurePartCounters(partition + 1)
 	mc.partConsumes[partition].Add(1)
@@ -58,7 +57,6 @@ func (mc *MetricsCollector) ensurePartCounters(minLen int) {
 	}
 }
 
-// Collect gathers current metrics from all topics and partitions.
 func (mc *MetricsCollector) Collect() Metrics {
 	mc.mu.Lock()
 	now := time.Now()
@@ -74,11 +72,9 @@ func (mc *MetricsCollector) Collect() Metrics {
 
 	throughput := float64(produced+consumed) / elapsed
 
-	// Reset counters
 	atomic.StoreInt64(&mc.produceCount, 0)
 	atomic.StoreInt64(&mc.consumeCount, 0)
 
-	// Gather partition-level data
 	mc.broker.mu.RLock()
 	topics := make([]*Topic, 0, len(mc.broker.topics))
 	for _, t := range mc.broker.topics {

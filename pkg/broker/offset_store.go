@@ -6,6 +6,8 @@ import (
 	"math"
 	"path/filepath"
 
+	"github.com/samber/oops"
+
 	bbolt "go.etcd.io/bbolt"
 )
 
@@ -19,7 +21,7 @@ func NewOffsetStore(dataDir string) (*OffsetStore, error) {
 	path := filepath.Join(dataDir, "offsets.db")
 	db, err := bbolt.Open(path, 0600, nil)
 	if err != nil {
-		return nil, fmt.Errorf("open offset store: %w", err)
+		return nil, oops.Wrapf(err, "open offset store")
 	}
 
 	err = db.Update(func(tx *bbolt.Tx) error {
@@ -57,7 +59,7 @@ func (s *OffsetStore) Load(group, topic string, partition int) (int64, error) {
 		key := s.bucketKey(topic, partition, group)
 		val := b.Get(key)
 		if val == nil {
-			return fmt.Errorf("offset not found for %s/%s/%d", group, topic, partition)
+			return oops.Errorf("offset not found for %s/%s/%d", group, topic, partition)
 		}
 		offset = int64(binary.BigEndian.Uint64(val))
 		return nil

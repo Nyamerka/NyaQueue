@@ -6,8 +6,8 @@ import (
 
 	"github.com/Nyamerka/NyaQueue/pkg/balancer"
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	pb "github.com/Nyamerka/NyaQueue/pkg/proto"
 	"github.com/Nyamerka/NyaQueue/pkg/scheduler"
-	pb "github.com/Nyamerka/NyaQueue/pkg/transport/gen"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )

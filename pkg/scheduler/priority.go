@@ -1,9 +1,8 @@
 package scheduler
 
 import (
-	"fmt"
-
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	"github.com/samber/oops"
 )
 
 // StrictPriority delivers highest-priority messages first via PriorityIndex.
@@ -15,12 +14,12 @@ func NewStrictPriority() *StrictPriority { return &StrictPriority{} }
 func (s *StrictPriority) Next(partition *broker.Partition, _ uint64) (*broker.Message, uint64, error) {
 	pi := partition.PriorityIndex()
 	if pi == nil {
-		return nil, 0, fmt.Errorf("partition %d has no PriorityIndex", partition.ID())
+		return nil, 0, oops.Errorf("partition %d has no PriorityIndex", partition.ID())
 	}
 
 	entry, ok := pi.PopHighest()
 	if !ok {
-		return nil, 0, fmt.Errorf("no pending messages")
+		return nil, 0, oops.Errorf("no pending messages")
 	}
 
 	msg, err := partition.Read(uint64(entry.WalOffset))
@@ -31,6 +30,4 @@ func (s *StrictPriority) Next(partition *broker.Partition, _ uint64) (*broker.Me
 	return msg, uint64(entry.WalOffset), nil
 }
 
-func (s *StrictPriority) Enqueue(_ *broker.Message, _ int64) {
-	// PriorityIndex is populated by Partition.Append directly.
-}
+func (s *StrictPriority) Enqueue(_ *broker.Message, _ int64) {}

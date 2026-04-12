@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package nyaqueue;
+
+option go_package = "github.com/Nyamerka/NyaQueue/pkg/proto";
+
+import "model.proto";
+
+message ProduceResponse {
+  int32 partition = 1;
+  int64 offset    = 2;
+}
+
+message ConsumeResponse {
+  repeated MessageEnvelope messages = 1;
+}
+
+message CommitResponse {}
+
+message CreateTopicResponse {}
+
+message DeleteTopicResponse {}
+
+message ListTopicsResponse {
+  repeated TopicInfo topics = 1;
+}
+
+message MetricsResponse {
+  double          throughput      = 1;
+  double          avg_latency     = 2;
+  repeated double partition_loads = 3;
+  double          success_rate    = 4;
+  repeated int64  queue_depth     = 5;
+}

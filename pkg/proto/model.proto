@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package nyaqueue;
+
+option go_package = "github.com/Nyamerka/NyaQueue/pkg/proto";
+
+enum ScheduleMode {
+  FIFO            = 0;
+  STRICT_PRIORITY = 1;
+  DQN_ADAPTIVE    = 2;
+}
+
+message MessageEnvelope {
+  int64  offset    = 1;
+  bytes  key       = 2;
+  bytes  value     = 3;
+  uint32 priority  = 4;
+  int64  timestamp = 5;
+}
+
+message TopicInfo {
+  string topic          = 1;
+  int32  num_partitions = 2;
+  ScheduleMode mode     = 3;
+}
+
+message TopicScheduleConfig {
+  ScheduleMode mode                 = 1;
+  int32        priority_levels      = 2;
+  int64        anti_starvation_ms   = 3;
+  double       dqn_throttle_on_load = 4;
+}

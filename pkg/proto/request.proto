@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package nyaqueue;
+
+option go_package = "github.com/Nyamerka/NyaQueue/pkg/proto";
+
+import "model.proto";
+
+message ProduceRequest {
+  string topic     = 1;
+  bytes  key       = 2;
+  bytes  value     = 3;
+  uint32 priority  = 4;
+}
+
+message ConsumeRequest {
+  string topic     = 1;
+  string group     = 2;
+  int32  partition = 3;
+  int32  max_bytes = 4;
+}
+
+message CommitRequest {
+  string topic     = 1;
+  string group     = 2;
+  int32  partition = 3;
+  int64  offset    = 4;
+}
+
+message CreateTopicRequest {
+  string topic           = 1;
+  int32  num_partitions  = 2;
+  TopicScheduleConfig schedule_config = 3;
+}
+
+message DeleteTopicRequest {
+  string topic = 1;
+}
+
+message ListTopicsRequest {}
+
+message MetricsRequest {}

@@ -8,8 +8,7 @@ import (
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 )
 
-// Optimizer runs the DDPG training loop: metrics -> state -> action -> apply -> reward.
-// Operates on the active (Lasso-selected) parameters of the broker config.
+// Optimizer runs the DDPG training loop on Lasso-selected broker parameters.
 type Optimizer struct {
 	mu sync.Mutex
 
@@ -31,7 +30,7 @@ func NewOptimizer(b *broker.Broker, params []TunableParam, interval time.Duratio
 
 	currentVals := make([]float64, len(active))
 	for i := range currentVals {
-		currentVals[i] = 0.5 // start at midpoint of each range
+		currentVals[i] = 0.5
 	}
 
 	return &Optimizer{
@@ -76,12 +75,11 @@ func (o *Optimizer) step() {
 	state := o.buildState(&metrics)
 	action := o.ddpg.Act(state)
 
-	// Apply action: delta to each parameter
 	for i, a := range action {
 		if i >= len(o.params) {
 			break
 		}
-		scale := (o.params[i].Max - o.params[i].Min) * 0.05 // 5% of range per step
+		scale := (o.params[i].Max - o.params[i].Min) * 0.05
 		delta := a * scale
 		rawVal := Denormalize(o.currentVals[i], o.params[i].Min, o.params[i].Max)
 		newVal := ClipAction(rawVal, delta, o.params[i].Min, o.params[i].Max)

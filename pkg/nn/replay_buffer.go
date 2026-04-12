@@ -13,8 +13,6 @@ type Transition struct {
 	Done      bool
 }
 
-// ReplayBuffer is a fixed-capacity ring buffer with uniform random sampling.
-// Shared by DQN and DDPG agents.
 type ReplayBuffer struct {
 	mu       sync.Mutex
 	buf      []Transition
