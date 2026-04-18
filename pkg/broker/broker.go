@@ -32,6 +32,8 @@ type Broker struct {
 	balancer   Balancer
 	schedulers map[string]Scheduler
 
+	schedulerFactory func(TopicConfig) Scheduler
+
 	metrics      *MetricsCollector
 	backpressure *BackpressureController
 	offsetStore  *OffsetStore
@@ -68,6 +70,12 @@ func (b *Broker) SetScheduler(topic string, sched Scheduler) {
 	b.schedulers[topic] = sched
 }
 
+func (b *Broker) SetSchedulerFactory(fn func(TopicConfig) Scheduler) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.schedulerFactory = fn
+}
+
 func (b *Broker) SetBackpressure(bp *BackpressureController) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -87,6 +95,11 @@ func (b *Broker) CreateTopic(name string, cfg TopicConfig) error {
 		return err
 	}
 	b.topics[name] = t
+
+	if b.schedulerFactory != nil {
+		b.schedulers[name] = b.schedulerFactory(cfg)
+	}
+
 	return nil
 }
 

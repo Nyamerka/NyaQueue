@@ -8,6 +8,7 @@ import (
 	"github.com/Nyamerka/NyaQueue/pkg/balancer"
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/Nyamerka/NyaQueue/pkg/optimizer"
+	"github.com/Nyamerka/NyaQueue/pkg/scheduler"
 	"github.com/Nyamerka/NyaQueue/pkg/transport"
 )
 
@@ -72,6 +73,17 @@ func New(cfg broker.Config, dataDir string, opts ...Option) (*BrokerApp, error) 
 
 	bal := a.balancerFactory()
 	a.broker = broker.New(cfg, dataDir, bal, offsetStore)
+
+	a.broker.SetSchedulerFactory(func(tc broker.TopicConfig) broker.Scheduler {
+		switch tc.ScheduleMode {
+		case broker.ModeStrictPriority:
+			return scheduler.NewStrictPriority()
+		case broker.ModeDQNAdaptive:
+			return scheduler.NewDQNScheduler()
+		default:
+			return scheduler.NewFIFO()
+		}
+	})
 
 	for topic, sched := range a.schedulers {
 		a.broker.SetScheduler(topic, sched)
