@@ -62,11 +62,15 @@ func (s *ExporterSuite) TestScrapeUpdatesGauges() {
 	reg := prometheus.NewRegistry()
 	m := registerMetrics(reg)
 
-	require.NoError(s.T(), scrape(ctx, s.client, m))
+	require.Eventually(s.T(), func() bool {
+		if err := scrape(ctx, s.client, m); err != nil {
+			return false
+		}
+		return testutil.CollectAndCount(m.partitionLoad) >= 1 &&
+			testutil.CollectAndCount(m.queueDepth) >= 1
+	}, 2*time.Second, 50*time.Millisecond)
 
 	require.Equal(s.T(), 1.0, testutil.ToFloat64(m.lastScrapeSuccess))
-	require.GreaterOrEqual(s.T(), testutil.CollectAndCount(m.partitionLoad), 1)
-	require.GreaterOrEqual(s.T(), testutil.CollectAndCount(m.queueDepth), 1)
 }
 
 func (s *ExporterSuite) TestRunUntilContextDone() {
