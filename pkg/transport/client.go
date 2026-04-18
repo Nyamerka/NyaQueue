@@ -81,12 +81,12 @@ func (c *Client) CreateTopic(ctx context.Context, topic string, numPartitions in
 			Mode: mode,
 		},
 	})
-	return err
+	return mapClientError(err)
 }
 
 func (c *Client) DeleteTopic(ctx context.Context, topic string) error {
 	_, err := c.client.DeleteTopic(ctx, &pb.DeleteTopicRequest{Topic: topic})
-	return err
+	return mapClientError(err)
 }
 
 func (c *Client) ListTopics(ctx context.Context) ([]*pb.TopicInfo, error) {

@@ -32,7 +32,7 @@ func main() {
 	}
 
 	cfg := DefaultConfig()
-	if err := k.UnmarshalWithConf("producer", &cfg, koanf.UnmarshalConf{Tag: "koanf"}); err != nil {
+	if err := k.UnmarshalWithConf("broker_exporter", &cfg, koanf.UnmarshalConf{Tag: "koanf"}); err != nil {
 		log.Fatalf("config unmarshal: %v", err)
 	}
 	if err := cfg.Validate(); err != nil {
@@ -48,17 +48,17 @@ func main() {
 		log.Fatalf("metrics serve: %v", err)
 	}
 
-	client, err := transport.NewClient(cfg.Addr)
+	client, err := transport.NewClient(cfg.BrokerAddr)
 	if err != nil {
-		log.Fatalf("connect %s: %v", cfg.Addr, err)
+		log.Fatalf("connect %s: %v", cfg.BrokerAddr, err)
 	}
 	defer client.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("producer: addr=%s topic=%s scenario=%s workers=%d metrics=%s",
-		cfg.Addr, cfg.Topic, cfg.Scenario, cfg.Producers, metricsSrv.Addr())
+	log.Printf("broker-exporter: broker=%s metrics=%s interval=%s",
+		cfg.BrokerAddr, metricsSrv.Addr(), cfg.ScrapeInterval)
 
 	if err := Run(ctx, cfg, client, m); err != nil {
 		log.Fatalf("run: %v", err)

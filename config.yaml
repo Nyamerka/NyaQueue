@@ -30,13 +30,27 @@ broker:
   max_fetch_bytes: 1048576         # 1MB
   consumer_session_timeout_ms: 30000
 
-loadgen:
-  target: "nyaqueue"
+producer:
   addr: "localhost:9090"
-  scenario: "uniform"
   topic: "bench"
+  scenario: "uniform"
   producers: 4
-  duration: "30s"
+  partitions: 4
+  duration: "0s"                   # 0 = run forever
+  metrics_addr: ":8081"
+
+consumer:
+  addr: "localhost:9090"
+  topic: "bench"
+  group: "bench-group"
+  partitions: []                   # empty = consume all partitions
+  workers: 4
+  metrics_addr: ":8082"
+
+broker_exporter:
+  broker_addr: "localhost:9090"
+  metrics_addr: ":8083"
+  scrape_interval: "1s"
 
 experiment:
   mode: "inprocess"
@@ -45,15 +59,3 @@ experiment:
   kafka_brokers: "localhost:9092"
   output: "experiments/results"
   duration: "10s"
-
-producer:
-  addr: "localhost:9090"
-  topic: "test"
-  messages: 100
-  priority: 0
-
-consumer:
-  addr: "localhost:9090"
-  topic: "test"
-  group: "default"
-  partition: 0

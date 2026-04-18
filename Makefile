@@ -1,13 +1,25 @@
-.PHONY: build proto clean test bench lint \
-       experiment docker-build docker-up docker-down docker-experiment
+.PHONY: build broker producer consumer broker-exporter experiment proto clean test bench lint \
+        compose-up compose-down compose-build compose-experiment compose-kafka
 
 BINARY_DIR := bin
 PROTO_DIR  := pkg/proto
 
-build:
-	go build -o $(BINARY_DIR)/broker     ./cmd/broker
-	go build -o $(BINARY_DIR)/loadgen    ./cmd/loadgen
-	go build -o $(BINARY_DIR)/experiment ./cmd/experiment
+build: broker producer consumer broker-exporter experiment
+
+broker:
+	go build -o $(BINARY_DIR)/broker          ./cmd/broker
+
+producer:
+	go build -o $(BINARY_DIR)/producer        ./cmd/producer
+
+consumer:
+	go build -o $(BINARY_DIR)/consumer        ./cmd/consumer
+
+broker-exporter:
+	go build -o $(BINARY_DIR)/broker-exporter ./cmd/broker-exporter
+
+experiment:
+	go build -o $(BINARY_DIR)/experiment      ./cmd/experiment
 
 proto:
 	protoc \
@@ -21,7 +33,7 @@ clean:
 	rm -rf $(BINARY_DIR) data/
 
 test:
-	go test ./... -v -count=1
+	go test ./... -count=1
 
 bench:
 	go test ./benchmarks/ -bench=. -benchmem -count=3
@@ -29,17 +41,20 @@ bench:
 lint:
 	golangci-lint run ./...
 
-experiment:
+run-experiment:
 	go run ./cmd/experiment --mode=inprocess --scenarios=all --algorithms=all --duration=10s
 
-docker-build:
+compose-build:
 	docker compose -f deploy/docker-compose.yml build
 
-docker-up:
-	docker compose -f deploy/docker-compose.yml up -d nyaqueue kafka
+compose-up:
+	docker compose -f deploy/docker-compose.yml up -d
 
-docker-down:
+compose-down:
 	docker compose -f deploy/docker-compose.yml down -v
 
-docker-experiment:
-	docker compose -f deploy/docker-compose.yml run --rm experiment
+compose-kafka:
+	docker compose -f deploy/docker-compose.yml --profile kafka up -d
+
+compose-experiment:
+	docker compose -f deploy/docker-compose.yml --profile experiment run --rm experiment

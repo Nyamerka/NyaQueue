@@ -2,72 +2,72 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
-	"os"
-	"strings"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/Nyamerka/NyaQueue/pkg/transport"
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+
+	"github.com/Nyamerka/NyaQueue/pkg/metrics"
+	"github.com/Nyamerka/NyaQueue/pkg/transport"
 )
 
 func main() {
+	configPath := flag.String("config", "config.yaml", "path to config file")
+	flag.Parse()
+
 	k := koanf.New(".")
-
-	configPath := "config.yaml"
-	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
-		configPath = os.Args[1]
+	if err := k.Load(file.Provider(*configPath), yaml.Parser()); err != nil {
+		log.Printf("config file not found (%s), using defaults", *configPath)
+	}
+	if err := k.Load(env.Provider("NYAQUEUE_", ".", func(s string) string { return s }), nil); err != nil {
+		log.Printf("env load: %v", err)
 	}
 
-	_ = k.Load(file.Provider(configPath), yaml.Parser())
-	_ = k.Load(env.Provider("NYAQUEUE_", ".", func(s string) string { return s }), nil)
+	cfg := DefaultConfig()
+	if err := k.UnmarshalWithConf("consumer", &cfg, koanf.UnmarshalConf{Tag: "koanf"}); err != nil {
+		log.Fatalf("config unmarshal: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("config validation: %v", err)
+	}
 
-	addr := k.String("consumer.addr")
-	if addr == "" {
-		addr = "localhost:9090"
-	}
-	topic := k.String("consumer.topic")
-	if topic == "" {
-		topic = "test"
-	}
-	group := k.String("consumer.group")
-	if group == "" {
-		group = "default"
-	}
-	partition := k.Int("consumer.partition")
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	m := registerMetrics(reg)
 
-	client, err := transport.NewClient(addr)
+	metricsSrv, err := metrics.Serve(cfg.MetricsAddr, reg)
 	if err != nil {
-		log.Fatalf("connect: %v", err)
+		log.Fatalf("metrics serve: %v", err)
+	}
+
+	client, err := transport.NewClient(cfg.Addr)
+	if err != nil {
+		log.Fatalf("connect %s: %v", cfg.Addr, err)
 	}
 	defer client.Close()
 
-	ctx := context.Background()
-	total := 0
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	for {
-		msgs, err := client.Consume(ctx, topic, group, int32(partition), 1<<20)
-		if err != nil {
-			log.Printf("consume: %v (retrying in 1s)", err)
-			time.Sleep(time.Second)
-			continue
-		}
+	log.Printf("consumer: addr=%s topic=%s group=%s workers=%d metrics=%s",
+		cfg.Addr, cfg.Topic, cfg.Group, cfg.Workers, metricsSrv.Addr())
 
-		for _, m := range msgs {
-			total++
-			log.Printf("[%d] offset=%d priority=%d key=%s value=%s",
-				total, m.Offset, m.Priority, string(m.Key), string(m.Value))
-
-			if err := client.Commit(ctx, topic, group, int32(partition), m.Offset+1); err != nil {
-				log.Printf("commit offset %d: %v", m.Offset+1, err)
-			}
-		}
-
-		if len(msgs) == 0 {
-			time.Sleep(100 * time.Millisecond)
-		}
+	if err := Run(ctx, cfg, client, m); err != nil {
+		log.Fatalf("run: %v", err)
 	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("metrics shutdown: %v", err)
+	}
+	log.Println("bye")
 }

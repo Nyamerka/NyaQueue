@@ -88,15 +88,26 @@ func MixedPriority() Scenario {
 	}
 }
 
+type Scenarios []Scenario
+
 // AllScenarios returns the full set of benchmark scenarios.
-func AllScenarios() []Scenario {
-	return []Scenario{
+func AllScenarios() Scenarios {
+	return Scenarios{
 		Uniform(),
 		Skewed(),
 		Bursty(),
 		GrowingLoad(),
 		MixedPriority(),
 	}
+}
+
+func (ss Scenarios) FindByName(name string) (bool, Scenario) {
+	for i := range ss {
+		if ss[i].Name == name {
+			return true, ss[i]
+		}
+	}
+	return false, Scenario{}
 }
 
 // GenerateMessage creates a random message payload of the given size.

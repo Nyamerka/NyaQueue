@@ -37,20 +37,21 @@ func NewMetricsCollector(b *Broker) *MetricsCollector {
 
 func (mc *MetricsCollector) RecordProduce(_ string, partition int) {
 	atomic.AddInt64(&mc.produceCount, 1)
-	mc.ensurePartCounters(partition + 1)
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	mc.ensurePartCountersLocked(partition + 1)
 	mc.partProduces[partition].Add(1)
 }
 
 func (mc *MetricsCollector) RecordConsume(_ string, partition int) {
 	atomic.AddInt64(&mc.consumeCount, 1)
-	mc.ensurePartCounters(partition + 1)
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	mc.ensurePartCountersLocked(partition + 1)
 	mc.partConsumes[partition].Add(1)
 }
 
-func (mc *MetricsCollector) ensurePartCounters(minLen int) {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
+func (mc *MetricsCollector) ensurePartCountersLocked(minLen int) {
 	for len(mc.partProduces) < minLen {
 		mc.partProduces = append(mc.partProduces, atomic.Int64{})
 		mc.partConsumes = append(mc.partConsumes, atomic.Int64{})

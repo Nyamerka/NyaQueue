@@ -1,7 +1,9 @@
 # Binaries
 bin/
 /broker
-/loadgen
+/broker-exporter
+/producer
+/consumer
 /experiment
 *.exe
 

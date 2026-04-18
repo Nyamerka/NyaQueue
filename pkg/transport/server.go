@@ -123,17 +123,15 @@ func (s *Server) CreateTopic(_ context.Context, req *pb.CreateTopicRequest) (*pb
 		}
 	}
 
-	err := s.broker.CreateTopic(req.Topic, cfg)
-	if err != nil {
-		return nil, err
+	if err := s.broker.CreateTopic(req.Topic, cfg); err != nil {
+		return nil, mapBrokerError(err)
 	}
 	return &pb.CreateTopicResponse{}, nil
 }
 
 func (s *Server) DeleteTopic(_ context.Context, req *pb.DeleteTopicRequest) (*pb.DeleteTopicResponse, error) {
-	err := s.broker.DeleteTopic(req.Topic)
-	if err != nil {
-		return nil, err
+	if err := s.broker.DeleteTopic(req.Topic); err != nil {
+		return nil, mapBrokerError(err)
 	}
 	return &pb.DeleteTopicResponse{}, nil
 }

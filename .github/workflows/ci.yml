@@ -10,7 +10,6 @@ jobs:
   test:
     name: Build & Test
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -24,3 +23,105 @@ jobs:
 
       - name: Test
         run: go test ./... -count=1 -race -timeout 120s
+
+  smoke:
+    name: Docker stack smoke
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images
+        run: docker compose -f deploy/docker-compose.yml build
+
+      - name: Bring stack up
+        run: docker compose -f deploy/docker-compose.yml up -d
+
+      - name: Wait for /healthz on services
+        run: |
+          set -e
+          wait_health() {
+            local name=$1 port=$2
+            for i in $(seq 1 60); do
+              if curl -fsS "http://localhost:${port}/healthz" >/dev/null; then
+                echo "${name} (:${port}) healthy after ${i} attempts"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "${name} (:${port}) failed to become healthy" >&2
+            return 1
+          }
+          wait_health producer        8081
+          wait_health consumer        8082
+          wait_health broker-exporter 8083
+
+      - name: Verify metrics endpoints expose expected series
+        run: |
+          set -e
+          assert_metric() {
+            local url=$1 metric=$2
+            if ! curl -fsS "$url" | grep -q "$metric"; then
+              echo "missing metric ${metric} on ${url}" >&2
+              curl -fsS "$url" | head -50 >&2
+              return 1
+            fi
+            echo "ok: ${metric} on ${url}"
+          }
+          assert_metric http://localhost:8081/metrics nyaqueue_producer_messages_published_total
+          assert_metric http://localhost:8082/metrics nyaqueue_consumer_e2e_latency_seconds
+          assert_metric http://localhost:8083/metrics nyaqueue_broker_partition_load
+
+      - name: Verify broker-exporter is scraping the broker
+        run: |
+          set -e
+          for i in $(seq 1 30); do
+            value=$(curl -fsS http://localhost:8083/metrics \
+              | awk '/^nyaqueue_broker_exporter_last_scrape_success / {print $2}')
+            if [ "$value" = "1" ]; then
+              echo "broker-exporter scrape succeeded"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "broker-exporter never reported a successful scrape" >&2
+          exit 1
+
+      - name: Verify Prometheus targets are all UP
+        run: |
+          set -e
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:9091/-/ready >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          sleep 10
+          down=$(curl -fsS http://localhost:9091/api/v1/targets \
+            | jq -r '.data.activeTargets[] | select(.health != "up") | "\(.scrapeUrl) \(.health) \(.lastError)"')
+          if [ -n "$down" ]; then
+            echo "Prometheus targets not UP:" >&2
+            echo "$down" >&2
+            exit 1
+          fi
+          echo "all Prometheus targets UP"
+
+      - name: Verify Grafana provisioning
+        run: |
+          set -e
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3000/api/health >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS -u admin:admin http://localhost:3000/api/datasources/name/Prometheus | jq -e '.type == "prometheus"'
+          curl -fsS -u admin:admin http://localhost:3000/api/search?query=Queue%20Quality | jq -e 'length > 0'
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose.yml logs --no-color
+
+      - name: Tear stack down
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml down -v

@@ -1,65 +1,60 @@
 # NyaQueue
 
-Distributed message queue with ML-powered optimization, written in pure Go.
+Go-брокер сообщений с ML-оптимизированной балансировкой и автоконфигурацией.
+Хранение через `tidwall/wal`, оффсеты в `bbolt`, транспорт gRPC.
 
-## Features
+## Запуск
 
-- **Topic/Partition model** — messages stored in WAL-backed partitions (`tidwall/wal`)
-- **Priority scheduling** — per-topic FIFO with DQN-adaptive priority and anti-starvation
-- **Pluggable balancers** — Round Robin, Weighted Round Robin, PSA, DQN
-- **Pluggable schedulers** — FIFO, Strict Priority, DQN-adaptive
-- **Predictive backpressure** — LSTM predicts overload, throttles producers proactively
-- **Auto-configuration** — DDPG online optimizer tunes broker parameters
-- **Persistent offsets** — consumer group offsets stored in `bbolt`
-- **gRPC transport** — Produce, Consume, Admin APIs
-
-## Quick Start
+Локально через Docker (поднимает брокер, producer, consumer, broker-exporter,
+Prometheus и Grafana):
 
 ```bash
-# Run via Docker
-docker compose -f deploy/docker-compose.yml up -d nyaqueue
+make compose-up
+```
 
-# Build and run locally
+Затем открыть Grafana: <http://localhost:3000> (anonymous viewer, дашборд
+"Queue Quality" в папке NyaQueue). Prometheus: <http://localhost:9091>.
+
+Остановить:
+
+```bash
+make compose-down
+```
+
+Локальные бинари (без Docker):
+
+```bash
 make build
-./bin/broker
+./bin/broker          -config config.yaml
+./bin/broker-exporter -config config.yaml
+./bin/producer        -config config.yaml
+./bin/consumer        -config config.yaml
 ```
 
-## Stack
+## Эксперименты
 
-| Layer | Implementation |
-|-------|---------------|
-| Storage | [`tidwall/wal`](https://github.com/tidwall/wal) — WAL segments per partition |
-| Metadata | [`bbolt`](https://github.com/etcd-io/bbolt) — consumer group offsets |
-| Math / ML | [`gonum`](https://gonum.org) + [`pehringer/simd`](https://github.com/pehringer/simd) |
-| Config | [`koanf`](https://github.com/knadh/koanf) — YAML + env |
-| Transport | `grpc` + `protobuf` |
-
-## Configuration
-
-Configuration is loaded from `config.yaml` and can be overridden via environment variables.
-
-```yaml
-broker:
-  partitions: 4
-  balancer: dqn        # rr | wrr | psa | dqn
-  scheduler: dqn       # fifo | priority | dqn
-  backpressure:
-    enabled: true
-    threshold: 0.85
-  optimizer:
-    enabled: true
-    interval: 5s
-```
-
-## Development
+Прогон бенчмарков для ВКР, результат в `experiments/results/`:
 
 ```bash
-make test        # run all tests
-make bench       # run benchmarks
-make lint        # golangci-lint
-make experiment  # run in-process experiment across all algorithms
+make run-experiment
 ```
 
-## License
+Сравнение с Apache Kafka (поднимает Kafka в отдельном профиле):
+
+```bash
+make compose-kafka
+make compose-experiment
+```
+
+## Разработка
+
+```bash
+make test
+make bench
+make lint
+make proto
+```
+
+## Лицензия
 
 MIT

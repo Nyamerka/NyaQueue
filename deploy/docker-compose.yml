@@ -1,6 +1,5 @@
 services:
-  # --- NyaQueue broker ---
-  nyaqueue:
+  broker:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -10,23 +9,81 @@ services:
     volumes:
       - nyaqueue-data:/data
 
-  # --- NyaQueue load generator ---
-  nyaqueue-loadgen:
+  broker-exporter:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-      target: loadgen
-    command:
-      - "--target=nyaqueue"
-      - "--addr=nyaqueue:9090"
-      - "--scenario=uniform"
-      - "--duration=60s"
-      - "--topic=bench"
+      target: broker-exporter
+    environment:
+      NYAQUEUE_BROKER_EXPORTER_BROKER_ADDR: "broker:9090"
+    ports:
+      - "8083:8083"
     depends_on:
-      - nyaqueue
+      - broker
 
-  # --- Kafka (KRaft mode, no Zookeeper) ---
+  producer:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: producer
+    environment:
+      NYAQUEUE_PRODUCER_ADDR: "broker:9090"
+      NYAQUEUE_PRODUCER_TOPIC: "bench"
+      NYAQUEUE_PRODUCER_SCENARIO: "uniform"
+      NYAQUEUE_PRODUCER_PRODUCERS: "4"
+    ports:
+      - "8081:8081"
+    depends_on:
+      - broker
+
+  consumer:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: consumer
+    environment:
+      NYAQUEUE_CONSUMER_ADDR: "broker:9090"
+      NYAQUEUE_CONSUMER_TOPIC: "bench"
+      NYAQUEUE_CONSUMER_GROUP: "bench-group"
+      NYAQUEUE_CONSUMER_WORKERS: "4"
+    ports:
+      - "8082:8082"
+    depends_on:
+      - broker
+      - producer
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=24h"
+    depends_on:
+      - broker-exporter
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
   kafka:
+    profiles: ["kafka"]
     image: bitnami/kafka:3.8
     ports:
       - "9092:9092"
@@ -42,23 +99,8 @@ services:
     volumes:
       - kafka-data:/bitnami/kafka
 
-  # --- Kafka load generator ---
-  kafka-loadgen:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      target: loadgen
-    command:
-      - "--target=kafka"
-      - "--addr=kafka:9092"
-      - "--scenario=uniform"
-      - "--duration=60s"
-      - "--topic=bench"
-    depends_on:
-      - kafka
-
-  # --- Full comparison experiment ---
   experiment:
+    profiles: ["experiment"]
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -78,3 +120,5 @@ services:
 volumes:
   nyaqueue-data:
   kafka-data:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,199 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "datasource", "uid": "grafana"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "row",
+      "title": "End-to-end latency",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 100
+    },
+    {
+      "type": "timeseries",
+      "title": "e2e latency (p50/p95/p99)",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 1},
+      "id": 1,
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(nyaqueue_consumer_e2e_latency_seconds_bucket[1m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(nyaqueue_consumer_e2e_latency_seconds_bucket[1m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(nyaqueue_consumer_e2e_latency_seconds_bucket[1m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "type": "heatmap",
+      "title": "e2e latency heatmap",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 1},
+      "id": 2,
+      "options": {"calculate": false, "yAxis": {"unit": "s"}},
+      "targets": [
+        {
+          "expr": "sum by (le) (rate(nyaqueue_consumer_e2e_latency_seconds_bucket[1m]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Throughput",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 9},
+      "id": 101
+    },
+    {
+      "type": "timeseries",
+      "title": "Publish vs consume rate",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 10},
+      "id": 3,
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "targets": [
+        {
+          "expr": "sum(rate(nyaqueue_producer_messages_published_total[30s]))",
+          "legendFormat": "published/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(nyaqueue_consumer_messages_consumed_total[30s]))",
+          "legendFormat": "consumed/s",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Broker reported throughput",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 10},
+      "id": 4,
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "targets": [
+        {
+          "expr": "nyaqueue_broker_throughput_messages_per_sec",
+          "legendFormat": "broker total",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Partition balance",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 18},
+      "id": 102
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-partition load",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 19},
+      "id": 5,
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}, "overrides": []},
+      "targets": [
+        {
+          "expr": "nyaqueue_broker_partition_load",
+          "legendFormat": "p{{partition}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Load imbalance (stddev across partitions)",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 19},
+      "id": 6,
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "targets": [
+        {
+          "expr": "nyaqueue_broker_partition_load_stddev",
+          "legendFormat": "σρ",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Pressure",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 27},
+      "id": 103
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue depth per partition",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+      "id": 7,
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "targets": [
+        {
+          "expr": "nyaqueue_broker_queue_depth",
+          "legendFormat": "p{{partition}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Throttled and consume errors",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
+      "id": 8,
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "targets": [
+        {
+          "expr": "sum(rate(nyaqueue_producer_throttled_total[30s]))",
+          "legendFormat": "throttled/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (code) (rate(nyaqueue_consumer_consume_errors_total[30s]))",
+          "legendFormat": "consume {{code}}",
+          "refId": "B"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["nyaqueue"],
+  "templating": {"list": []},
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Queue Quality",
+  "uid": "nyaqueue-queue-quality",
+  "version": 1,
+  "weekStart": ""
+}

@@ -9,6 +9,11 @@ import (
 	"github.com/samber/oops"
 )
 
+var (
+	ErrTopicAlreadyExists = errors.New("topic already exists")
+	ErrTopicNotFound      = errors.New("topic not found")
+)
+
 type Balancer interface {
 	SelectPartition(topic string, key []byte, numPartitions int) int
 	OnMetrics(m Metrics)
@@ -74,7 +79,7 @@ func (b *Broker) CreateTopic(name string, cfg TopicConfig) error {
 	defer b.mu.Unlock()
 
 	if _, exists := b.topics[name]; exists {
-		return oops.Errorf("topic %q already exists", name)
+		return oops.Wrapf(ErrTopicAlreadyExists, "create topic %q", name)
 	}
 
 	t, err := NewTopic(name, b.dataDir, cfg)
@@ -91,7 +96,7 @@ func (b *Broker) DeleteTopic(name string) error {
 
 	t, exists := b.topics[name]
 	if !exists {
-		return oops.Errorf("topic %q not found", name)
+		return oops.Wrapf(ErrTopicNotFound, "delete topic %q", name)
 	}
 	delete(b.topics, name)
 	delete(b.schedulers, name)
