@@ -1,0 +1,4 @@
+broker_exporter:
+  broker_addr: "broker:9090"
+  metrics_addr: ":8083"
+  scrape_interval: "1s"

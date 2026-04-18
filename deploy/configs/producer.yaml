@@ -1,0 +1,8 @@
+producer:
+  addr: "broker:9090"
+  topic: "bench"
+  scenario: "uniform"
+  producers: 4
+  partitions: 4
+  duration: "0s"
+  metrics_addr: ":8081"

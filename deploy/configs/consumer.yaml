@@ -1,0 +1,7 @@
+consumer:
+  addr: "broker:9090"
+  topic: "bench"
+  group: "bench-group"
+  partitions: []
+  workers: 4
+  metrics_addr: ":8082"

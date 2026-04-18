@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/knadh/koanf/parsers/yaml"
-	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,9 +25,6 @@ func main() {
 	k := koanf.New(".")
 	if err := k.Load(file.Provider(*configPath), yaml.Parser()); err != nil {
 		log.Printf("config file not found (%s), using defaults", *configPath)
-	}
-	if err := k.Load(env.Provider("NYAQUEUE_", ".", func(s string) string { return s }), nil); err != nil {
-		log.Printf("env load: %v", err)
 	}
 
 	cfg := DefaultConfig()
