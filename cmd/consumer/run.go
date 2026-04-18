@@ -26,6 +26,7 @@ const (
 )
 
 type consumerMetrics struct {
+	up            prometheus.Gauge
 	consumed      *prometheus.CounterVec
 	errors        *prometheus.CounterVec
 	e2eLatency    *prometheus.HistogramVec
@@ -36,7 +37,12 @@ type consumerMetrics struct {
 func registerMetrics(reg prometheus.Registerer) *consumerMetrics {
 	f := promauto.With(reg)
 	latencyBuckets := prometheus.ExponentialBuckets(0.0001, 2, 18)
-	return &consumerMetrics{
+	m := &consumerMetrics{
+		up: f.NewGauge(prometheus.GaugeOpts{
+			Namespace: "nyaqueue_consumer",
+			Name:      "up",
+			Help:      "1 when consumer workers are running.",
+		}),
 		consumed: f.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "nyaqueue_consumer",
 			Name:      "messages_consumed_total",
@@ -65,6 +71,7 @@ func registerMetrics(reg prometheus.Registerer) *consumerMetrics {
 			Help:      "Number of messages with malformed timestamp prefix.",
 		}, []string{"topic"}),
 	}
+	return m
 }
 
 func Run(ctx context.Context, cfg Config, client *transport.Client, m *consumerMetrics) error {
@@ -78,6 +85,8 @@ func Run(ctx context.Context, cfg Config, client *transport.Client, m *consumerM
 
 	pool := pond.NewPool(cfg.Workers)
 	defer pool.StopAndWait()
+	m.up.Set(1)
+	defer m.up.Set(0)
 
 	for _, p := range partitions {
 		partition := p

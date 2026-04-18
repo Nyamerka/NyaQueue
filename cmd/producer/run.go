@@ -25,6 +25,7 @@ import (
 const timestampPrefixBytes = 8
 
 type producerMetrics struct {
+	up        prometheus.Gauge
 	published *prometheus.CounterVec
 	errors    *prometheus.CounterVec
 	latency   *prometheus.HistogramVec
@@ -34,6 +35,11 @@ type producerMetrics struct {
 func registerMetrics(reg prometheus.Registerer) *producerMetrics {
 	f := promauto.With(reg)
 	return &producerMetrics{
+		up: f.NewGauge(prometheus.GaugeOpts{
+			Namespace: "nyaqueue_producer",
+			Name:      "up",
+			Help:      "1 when producer workers are running.",
+		}),
 		published: f.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "nyaqueue_producer",
 			Name:      "messages_published_total",
@@ -77,6 +83,8 @@ func Run(ctx context.Context, cfg Config, client *transport.Client, m *producerM
 
 	pool := pond.NewPool(cfg.Producers)
 	defer pool.StopAndWait()
+	m.up.Set(1)
+	defer m.up.Set(0)
 
 	var seq uint64
 	for i := 0; i < cfg.Producers; i++ {

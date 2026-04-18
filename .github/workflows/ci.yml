@@ -59,18 +59,27 @@ jobs:
       - name: Verify metrics endpoints expose expected series
         run: |
           set -e
-          assert_metric() {
+          # wait_metric polls until a metric line appears (max 60s)
+          wait_metric() {
             local url=$1 metric=$2
-            if ! curl -fsS "$url" | grep -q "$metric"; then
-              echo "missing metric ${metric} on ${url}" >&2
-              curl -fsS "$url" | head -50 >&2
-              return 1
-            fi
-            echo "ok: ${metric} on ${url}"
+            for i in $(seq 1 30); do
+              if curl -fsS "$url" | grep -q "$metric"; then
+                echo "ok: ${metric} on ${url}"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "missing metric ${metric} on ${url}" >&2
+            curl -fsS "$url" | head -50 >&2
+            return 1
           }
-          assert_metric http://localhost:8081/metrics nyaqueue_producer_messages_published_total
-          assert_metric http://localhost:8082/metrics nyaqueue_consumer_e2e_latency_seconds
-          assert_metric http://localhost:8083/metrics nyaqueue_broker_partition_load
+          # producer_up and consumer_up are plain Gauge — always visible once workers start
+          wait_metric http://localhost:8081/metrics nyaqueue_producer_up
+          wait_metric http://localhost:8082/metrics nyaqueue_consumer_up
+          # broker metrics via exporter
+          wait_metric http://localhost:8083/metrics nyaqueue_broker_partition_load
+          # e2e latency needs at least one consumed message — give it extra time via same retry
+          wait_metric http://localhost:8082/metrics nyaqueue_consumer_e2e_latency_seconds
 
       - name: Verify broker-exporter is scraping the broker
         run: |
