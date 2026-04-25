@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/Nyamerka/NyaQueue/benchmarks"
@@ -57,6 +58,9 @@ func (r *Runner) RunAll(ctx context.Context) ([]ExperimentResult, error) {
 
 func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg AlgorithmConfig, mode Mode, dur time.Duration) (ExperimentResult, error) {
 	dataDir := fmt.Sprintf("/tmp/nyaqueue-exp-%s-%s-%s", sc.Name, alg.Name, mode)
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return ExperimentResult{}, oops.Wrapf(err, "create data dir")
+	}
 
 	h, err := NewHarness(ctx, HarnessConfig{
 		Mode:         mode,

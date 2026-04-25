@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -13,42 +14,32 @@ import (
 	"github.com/Nyamerka/NyaQueue/benchmarks"
 	"github.com/Nyamerka/NyaQueue/experiments"
 	"github.com/knadh/koanf/parsers/yaml"
+	"github.com/knadh/koanf/providers/basicflag"
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
 )
 
 func main() {
+	fs := flag.NewFlagSet("experiment", flag.ContinueOnError)
+	fs.String("experiment.mode", "inprocess", "comma-separated modes: inprocess,grpc,kafka")
+	fs.String("experiment.scenarios", "all", "comma-separated scenarios or 'all'")
+	fs.String("experiment.algorithms", "all", "comma-separated algorithms or 'all'")
+	fs.String("experiment.kafka_brokers", "localhost:9092", "kafka broker addresses")
+	fs.String("experiment.output", "experiments/results", "output directory for results")
+	fs.String("experiment.duration", "", "per-scenario duration (e.g. 30s)")
+	_ = fs.Parse(os.Args[1:])
+
 	k := koanf.New(".")
-
-	configPath := "config.yaml"
-	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
-		configPath = os.Args[1]
-	}
-
-	_ = k.Load(file.Provider(configPath), yaml.Parser())
+	_ = k.Load(file.Provider("config.yaml"), yaml.Parser())
 	_ = k.Load(env.Provider("NYAQUEUE_", ".", func(s string) string { return s }), nil)
+	_ = k.Load(basicflag.Provider(fs, "."), nil)
 
 	modeStr := k.String("experiment.mode")
-	if modeStr == "" {
-		modeStr = "inprocess"
-	}
 	scenarioStr := k.String("experiment.scenarios")
-	if scenarioStr == "" {
-		scenarioStr = "all"
-	}
 	algorithmStr := k.String("experiment.algorithms")
-	if algorithmStr == "" {
-		algorithmStr = "all"
-	}
 	kafkaBrokersStr := k.String("experiment.kafka_brokers")
-	if kafkaBrokersStr == "" {
-		kafkaBrokersStr = "localhost:9092"
-	}
 	outputDir := k.String("experiment.output")
-	if outputDir == "" {
-		outputDir = "experiments/results"
-	}
 	durationStr := k.String("experiment.duration")
 	duration := 10 * time.Second
 	if durationStr != "" {
