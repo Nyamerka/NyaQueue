@@ -1,6 +1,8 @@
 package broker
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -130,6 +132,87 @@ func (s *BrokerSuite) TestConsumeNoScheduler() {
 
 	_, _, err := b.Consume("t", "grp", 0)
 	require.Error(s.T(), err)
+}
+
+func (s *BrokerSuite) TestDeleteTopicCleansWAL() {
+	dir := s.T().TempDir()
+	store, err := NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+
+	b := New(DefaultConfig(), dir, noopBalancer{}, store)
+	defer b.Stop()
+
+	cfg := DefaultTopicConfig()
+	cfg.NumPartitions = 2
+	require.NoError(s.T(), b.CreateTopic("wal-clean", cfg))
+	b.SetScheduler("wal-clean", fifoScheduler{})
+
+	msg := NewMessage(0, []byte("k"), []byte("v"))
+	_, _, err = b.Publish("wal-clean", msg)
+	require.NoError(s.T(), err)
+
+	walDir := filepath.Join(dir, "wal-clean")
+	_, err = os.Stat(walDir)
+	require.NoError(s.T(), err, "WAL directory should exist before delete")
+
+	require.NoError(s.T(), b.DeleteTopic("wal-clean"))
+
+	_, err = os.Stat(walDir)
+	require.True(s.T(), os.IsNotExist(err), "WAL directory should be removed after delete")
+}
+
+func (s *BrokerSuite) TestDeleteTopicCleansOffsets() {
+	dir := s.T().TempDir()
+	store, err := NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+
+	b := New(DefaultConfig(), dir, noopBalancer{}, store)
+	defer b.Stop()
+
+	cfg := DefaultTopicConfig()
+	cfg.NumPartitions = 1
+	require.NoError(s.T(), b.CreateTopic("off-clean", cfg))
+	b.SetScheduler("off-clean", fifoScheduler{})
+
+	msg := NewMessage(0, []byte("k"), []byte("v"))
+	_, _, err = b.Publish("off-clean", msg)
+	require.NoError(s.T(), err)
+
+	require.NoError(s.T(), b.Commit("grp", "off-clean", 0, 42))
+	got, err := store.Load("grp", "off-clean", 0)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), int64(42), got)
+
+	require.NoError(s.T(), b.DeleteTopic("off-clean"))
+
+	_, err = store.Load("grp", "off-clean", 0)
+	require.Error(s.T(), err, "offset should be gone after topic delete")
+}
+
+func (s *BrokerSuite) TestDeleteAndRecreateTopic() {
+	b, cleanup := s.newBroker()
+	defer cleanup()
+
+	cfg := DefaultTopicConfig()
+	cfg.NumPartitions = 1
+	require.NoError(s.T(), b.CreateTopic("recreate", cfg))
+	b.SetScheduler("recreate", fifoScheduler{})
+
+	msg := NewMessage(0, []byte("k"), []byte("old"))
+	_, _, err := b.Publish("recreate", msg)
+	require.NoError(s.T(), err)
+
+	require.NoError(s.T(), b.DeleteTopic("recreate"))
+	require.NoError(s.T(), b.CreateTopic("recreate", cfg))
+	b.SetScheduler("recreate", fifoScheduler{})
+
+	msg2 := NewMessage(0, []byte("k"), []byte("new"))
+	_, _, err = b.Publish("recreate", msg2)
+	require.NoError(s.T(), err)
+
+	got, _, err := b.Consume("recreate", "grp", 0)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), []byte("new"), got.Value, "should see only the new message, not stale data")
 }
 
 // fifoScheduler is a minimal in-package scheduler for testing.

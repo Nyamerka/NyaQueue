@@ -197,6 +197,75 @@ func (s *TransportSuite) TestProduceBatch() {
 	}
 }
 
+func (s *TransportSuite) TestConsumeReturnsCorrectOffset() {
+	ctx := context.Background()
+	s.createTopicWithScheduler("offset-test", 1, pb.ScheduleMode_FIFO)
+
+	_, _, err := s.client.Produce(ctx, "offset-test", []byte("k1"), []byte("v1"), 0)
+	require.NoError(s.T(), err)
+	_, _, err = s.client.Produce(ctx, "offset-test", []byte("k2"), []byte("v2"), 0)
+	require.NoError(s.T(), err)
+
+	msgs, err := s.client.Consume(ctx, "offset-test", "g1", 0, 65536)
+	require.NoError(s.T(), err)
+	require.Len(s.T(), msgs, 1)
+	require.Equal(s.T(), int64(1), msgs[0].Offset, "first message should have WAL offset 1")
+	require.Equal(s.T(), []byte("v1"), msgs[0].Value)
+}
+
+func (s *TransportSuite) TestConsumeSequentialNoSkip() {
+	ctx := context.Background()
+	s.createTopicWithScheduler("seq-test", 1, pb.ScheduleMode_FIFO)
+
+	for i := 0; i < 5; i++ {
+		_, _, err := s.client.Produce(ctx, "seq-test", []byte("k"), []byte{byte(i)}, 0)
+		require.NoError(s.T(), err)
+	}
+
+	for i := 0; i < 5; i++ {
+		msgs, err := s.client.Consume(ctx, "seq-test", "g1", 0, 65536)
+		require.NoError(s.T(), err)
+		require.Len(s.T(), msgs, 1)
+
+		require.Equal(s.T(), int64(i+1), msgs[0].Offset,
+			"message %d should have offset %d", i, i+1)
+
+		err = s.client.Commit(ctx, "seq-test", "g1", 0, msgs[0].Offset+1)
+		require.NoError(s.T(), err)
+	}
+
+	msgs, err := s.client.Consume(ctx, "seq-test", "g1", 0, 65536)
+	require.NoError(s.T(), err)
+	require.Empty(s.T(), msgs, "all messages consumed, should be empty")
+}
+
+func (s *TransportSuite) TestDeleteTopicCleansData() {
+	ctx := context.Background()
+	s.createTopicWithScheduler("del-clean", 1, pb.ScheduleMode_FIFO)
+
+	_, _, err := s.client.Produce(ctx, "del-clean", []byte("k"), []byte("old"), 0)
+	require.NoError(s.T(), err)
+
+	err = s.client.Commit(ctx, "del-clean", "g1", 0, 2)
+	require.NoError(s.T(), err)
+
+	err = s.client.DeleteTopic(ctx, "del-clean")
+	require.NoError(s.T(), err)
+
+	s.createTopicWithScheduler("del-clean", 1, pb.ScheduleMode_FIFO)
+
+	_, _, err = s.client.Produce(ctx, "del-clean", []byte("k"), []byte("new"), 0)
+	require.NoError(s.T(), err)
+
+	msgs, err := s.client.Consume(ctx, "del-clean", "g1", 0, 65536)
+	require.NoError(s.T(), err)
+	require.Len(s.T(), msgs, 1)
+	require.Equal(s.T(), []byte("new"), msgs[0].Value,
+		"after delete+recreate, should only see new messages")
+	require.Equal(s.T(), int64(1), msgs[0].Offset,
+		"offset should reset to 1 after delete+recreate")
+}
+
 func (s *TransportSuite) TestBufferedProducer() {
 	ctx := context.Background()
 	s.createTopicWithScheduler("buf-test", 1, pb.ScheduleMode_FIFO)

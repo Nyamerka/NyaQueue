@@ -134,3 +134,53 @@ jobs:
       - name: Tear stack down
         if: always()
         run: docker compose -f deploy/docker-compose.yml down -v
+
+  experiment:
+    name: Experiment smoke
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images
+        run: docker compose -f deploy/docker-compose.yml --profile kafka --profile experiment build
+
+      - name: Start broker and Kafka
+        run: docker compose -f deploy/docker-compose.yml --profile kafka up -d broker kafka
+
+      - name: Wait for broker
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose -f deploy/docker-compose.yml exec broker wget -qO- http://localhost:9090/healthz >/dev/null 2>&1; then
+              echo "broker ready"; break
+            fi
+            sleep 2
+          done
+
+      - name: Wait for Kafka
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose -f deploy/docker-compose.yml exec kafka kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1; then
+              echo "kafka ready"; break
+            fi
+            sleep 2
+          done
+
+      - name: Run experiments (5s per scenario)
+        run: |
+          docker compose -f deploy/docker-compose.yml --profile kafka --profile experiment run --rm experiment \
+            --experiment.mode=inprocess,grpc,kafka \
+            --experiment.scenarios=all \
+            --experiment.algorithms=all \
+            --experiment.kafka_brokers=kafka:9092 \
+            --experiment.broker_addr=broker:9090 \
+            --experiment.duration=5s \
+            --experiment.output=/results
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose.yml --profile kafka --profile experiment logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml --profile kafka --profile experiment down -v

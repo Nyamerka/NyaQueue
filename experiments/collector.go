@@ -160,7 +160,6 @@ type ExperimentResult struct {
 
 func (c *MetricsCollector) Snapshot(scenario, algorithm, system, mode string) ExperimentResult {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	duration := c.endTime.Sub(c.startTime)
 	if duration <= 0 {
@@ -199,28 +198,28 @@ func (c *MetricsCollector) Snapshot(scenario, algorithm, system, mode string) Ex
 		result.LoadStdDev = stat.Mean(c.loadStddevs, nil)
 	}
 
-	// Per-priority snapshot (mu is held; prioritySampler uses its own lock).
 	c.mu.Unlock()
+
 	for i := range result.LatencyByPriority {
 		result.LatencyByPriority[i] = c.byPriority[i].snapshot()
 	}
-	c.mu.Lock()
 
 	return result
 }
 
 func percentile(sorted []float64, p float64) float64 {
-	if len(sorted) == 0 {
+	n := len(sorted)
+	if n == 0 {
 		return 0
 	}
-	if p <= 0 {
+	if n == 1 || p <= 0 {
 		return sorted[0]
 	}
 	if p >= 1 {
-		return sorted[len(sorted)-1]
+		return sorted[n-1]
 	}
 
-	pos := p * float64(len(sorted)-1)
+	pos := p * float64(n-1)
 	i := int(pos)
 	frac := pos - float64(i)
 	return sorted[i]*(1-frac) + sorted[i+1]*frac

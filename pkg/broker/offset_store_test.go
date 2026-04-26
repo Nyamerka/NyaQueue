@@ -107,6 +107,47 @@ func (s *OffsetStoreSuite) TestDumpMode() {
 	require.Equal(s.T(), int64(200), got)
 }
 
+func (s *OffsetStoreSuite) TestDeleteTopic() {
+	store, err := NewOffsetStore(s.T().TempDir())
+	require.NoError(s.T(), err)
+	defer store.Close()
+
+	require.NoError(s.T(), store.Commit("g1", "t1", 0, 10))
+	require.NoError(s.T(), store.Commit("g1", "t1", 1, 20))
+	require.NoError(s.T(), store.Commit("g2", "t1", 0, 30))
+	require.NoError(s.T(), store.Commit("g1", "t2", 0, 99))
+
+	store.DeleteTopic("t1")
+
+	_, err = store.Load("g1", "t1", 0)
+	require.Error(s.T(), err, "t1 offsets should be gone")
+	_, err = store.Load("g1", "t1", 1)
+	require.Error(s.T(), err)
+	_, err = store.Load("g2", "t1", 0)
+	require.Error(s.T(), err)
+
+	got, err := store.Load("g1", "t2", 0)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), int64(99), got, "t2 offsets should be untouched")
+}
+
+func (s *OffsetStoreSuite) TestDeleteTopicPersistence() {
+	dir := s.T().TempDir()
+	store, err := NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+
+	require.NoError(s.T(), store.Commit("g1", "t1", 0, 42))
+	store.DeleteTopic("t1")
+	store.Close()
+
+	store2, err := NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+	defer store2.Close()
+
+	_, err = store2.Load("g1", "t1", 0)
+	require.Error(s.T(), err, "deleted topic offsets should not survive restart")
+}
+
 func (s *OffsetStoreSuite) TestCacheWarmup() {
 	dir := s.T().TempDir()
 
