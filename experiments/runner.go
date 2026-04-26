@@ -318,7 +318,7 @@ func runConsumer(ctx context.Context, h *Harness, partition int, c *MetricsColle
 			c.RecordConsumeError()
 			continue
 		}
-		c.RecordConsume(latency)
+		c.RecordConsumeWithPriority(msg.Priority, latency)
 	}
 }
 

@@ -204,8 +204,9 @@ func (h *Harness) PublishBatch(ctx context.Context, topic string, items []BatchI
 }
 
 type ConsumedMessage struct {
-	Value  []byte
-	Offset int64
+	Value    []byte
+	Offset   int64
+	Priority uint8 // 0 = highest, 9 = lowest; 0 when not available (Kafka)
 }
 
 func (h *Harness) Consume(ctx context.Context, topic, group string, partition int) (*ConsumedMessage, error) {
@@ -222,7 +223,11 @@ func (h *Harness) Consume(ctx context.Context, topic, group string, partition in
 		if err := brk.Commit(group, topic, partition, int64(nextOffset)); err != nil {
 			return nil, oops.Wrapf(err, "commit")
 		}
-		return &ConsumedMessage{Value: msg.Value, Offset: int64(nextOffset - 1)}, nil
+		return &ConsumedMessage{
+			Value:    msg.Value,
+			Offset:   int64(nextOffset - 1),
+			Priority: msg.Header.Priority,
+		}, nil
 
 	case ModeGRPC:
 		msgs, err := h.grpc.Consume(ctx, topic, group, int32(partition), grpcMaxFetchBytes)
@@ -239,7 +244,11 @@ func (h *Harness) Consume(ctx context.Context, topic, group string, partition in
 		if err := h.grpc.Commit(ctx, topic, group, int32(partition), env.Offset+1); err != nil {
 			return nil, oops.Wrapf(err, "grpc commit")
 		}
-		return &ConsumedMessage{Value: env.Value, Offset: env.Offset}, nil
+		return &ConsumedMessage{
+			Value:    env.Value,
+			Offset:   env.Offset,
+			Priority: uint8(env.Priority),
+		}, nil
 
 	case ModeKafka:
 		msgs, err := h.kfk.Consume(ctx, topic, group, partition, grpcMaxFetchBytes)
@@ -249,9 +258,10 @@ func (h *Harness) Consume(ctx context.Context, topic, group string, partition in
 		if len(msgs) == 0 {
 			return nil, ErrNoMessage
 		}
+		// Kafka doesn't carry priority natively — priority is 0 (unknown).
 		return &ConsumedMessage{Value: msgs[0].Value, Offset: msgs[0].Offset}, nil
 	}
-	
+
 	return nil, oops.Errorf("unsupported mode")
 }
 

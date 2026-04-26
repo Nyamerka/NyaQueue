@@ -30,12 +30,17 @@ func ExportCSV(results []ExperimentResult, dir string) error {
 		"throughput_msg_sec", "latency_p50_us", "latency_p95_us", "latency_p99_us",
 		"load_stddev", "produced", "consumed",
 		"publish_errors", "consume_errors", "duration_sec",
+		"high_prio_p50_us", "high_prio_p99_us",
+		"low_prio_p50_us", "low_prio_p99_us",
 	}
 	if err := w.Write(header); err != nil {
 		return err
 	}
 
 	for _, r := range results {
+		highP50, highP99 := prioGroupStats(r.LatencyByPriority[:], 0, 3)
+		lowP50, lowP99 := prioGroupStats(r.LatencyByPriority[:], 7, 10)
+
 		row := []string{
 			r.Scenario,
 			r.Algorithm,
@@ -51,6 +56,10 @@ func ExportCSV(results []ExperimentResult, dir string) error {
 			fmt.Sprintf("%d", r.PublishErrors),
 			fmt.Sprintf("%d", r.ConsumeErrors),
 			fmt.Sprintf("%.3f", r.Duration.Seconds()),
+			fmt.Sprintf("%.2f", highP50),
+			fmt.Sprintf("%.2f", highP99),
+			fmt.Sprintf("%.2f", lowP50),
+			fmt.Sprintf("%.2f", lowP99),
 		}
 		if err := w.Write(row); err != nil {
 			return err
@@ -58,6 +67,23 @@ func ExportCSV(results []ExperimentResult, dir string) error {
 	}
 
 	return nil
+}
+
+func prioGroupStats(stats []PriorityStats, from, to int) (p50us, p99us float64) {
+	var sumP50, sumP99 float64
+	count := 0
+	for i := from; i < to && i < len(stats); i++ {
+		if stats[i].Count == 0 {
+			continue
+		}
+		sumP50 += float64(stats[i].P50) / float64(time.Microsecond)
+		sumP99 += float64(stats[i].P99) / float64(time.Microsecond)
+		count++
+	}
+	if count == 0 {
+		return 0, 0
+	}
+	return sumP50 / float64(count), sumP99 / float64(count)
 }
 
 // ExportJSON writes results as a structured JSON file.
