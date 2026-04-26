@@ -75,7 +75,8 @@ func (h *KafkaHarness) ProduceBatch(ctx context.Context, topic string, msgs []ka
 			Addr:         kafka.TCP(h.brokers...),
 			Topic:        topic,
 			Balancer:     &kafka.RoundRobin{},
-			BatchTimeout: 1 * time.Millisecond,
+			BatchTimeout: 10 * time.Millisecond,
+			BatchSize:    100,
 			RequiredAcks: kafka.RequireOne,
 		}
 		h.writers[topic] = w
@@ -94,7 +95,7 @@ func (h *KafkaHarness) Consume(ctx context.Context, topic, group string, partiti
 			GroupID:   group,
 			Partition: partition,
 			MaxBytes:  maxBytes,
-			MaxWait:   100 * time.Millisecond,
+			MaxWait:   10 * time.Millisecond,
 		})
 		h.readers[rk] = r
 	}

@@ -199,15 +199,24 @@ func runScenario(
 	return collector.Snapshot(sc.Name, algName, system, mode.String())
 }
 
+const produceBatchSize = 16
+
 func runProducer(ctx context.Context, h *Harness, sc benchmarks.Scenario, msgSize int, c *MetricsCollector) {
-	var interval time.Duration
-	if sc.RatePerSec > 0 && sc.Producers > 0 {
-		perProducer := sc.RatePerSec / sc.Producers
-		if perProducer < 1 {
-			perProducer = 1
-		}
-		interval = time.Second / time.Duration(perProducer)
+	if sc.RatePerSec > 0 {
+		runRateLimitedProducer(ctx, h, sc, msgSize, c)
+	} else {
+		runUnlimitedProducer(ctx, h, sc, msgSize, c)
 	}
+}
+
+// runRateLimitedProducer sends one message at a time with a sleep between
+// sends. Batching adds no benefit here since the rate limiter serialises sends.
+func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenario, msgSize int, c *MetricsCollector) {
+	perProducer := sc.RatePerSec / sc.Producers
+	if perProducer < 1 {
+		perProducer = 1
+	}
+	interval := time.Second / time.Duration(perProducer)
 
 	keyBuf := make([]byte, 8)
 	for {
@@ -224,16 +233,59 @@ func runProducer(ctx context.Context, h *Harness, sc benchmarks.Scenario, msgSiz
 				return
 			}
 			c.RecordPublishError()
-			continue
+		} else {
+			c.RecordProduce()
 		}
-		c.RecordProduce()
 
-		if interval > 0 {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(interval):
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
+		}
+	}
+}
+
+// runUnlimitedProducer batches messages for maximum throughput. Each goroutine
+// accumulates produceBatchSize messages and flushes them in a single call,
+// reducing WAL and RPC overhead per message.
+func runUnlimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenario, msgSize int, c *MetricsCollector) {
+	batch := make([]BatchItem, 0, produceBatchSize)
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		n, err := h.PublishBatch(ctx, expTopic, batch)
+		for i := 0; i < n; i++ {
+			c.RecordProduce()
+		}
+		if err != nil && n < len(batch) {
+			for range batch[n:] {
+				c.RecordPublishError()
 			}
+		}
+		batch = batch[:0]
+	}
+
+	keyBuf := make([]byte, 8)
+	for {
+		if ctx.Err() != nil {
+			flush()
+			return
+		}
+
+		key := make([]byte, 8)
+		binary.BigEndian.PutUint64(keyBuf, rand.Uint64())
+		copy(key, keyBuf)
+
+		batch = append(batch, BatchItem{
+			Key:      key,
+			Value:    encodeValue(msgSize),
+			Priority: sc.SamplePriority(),
+		})
+
+		if len(batch) >= produceBatchSize {
+			flush()
 		}
 	}
 }

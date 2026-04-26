@@ -114,8 +114,6 @@ func (c *Client) GetMetrics(ctx context.Context) (*pb.MetricsResponse, error) {
 	return c.client.GetMetrics(ctx, &pb.MetricsRequest{})
 }
 
-// ---------- BufferedProducer ----------
-
 // BufferedProducer accumulates messages and sends them in batches via a single
 // Produce RPC, amortising the per-RPC cost across many messages.
 type BufferedProducer struct {
@@ -127,11 +125,11 @@ type BufferedProducer struct {
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
 
-	mu     sync.Mutex
-	buf    []*pb.ProduceMessage
-	timer  *time.Timer
+	mu       sync.Mutex
+	buf      []*pb.ProduceMessage
+	timer    *time.Timer
 	asyncErr error
-	closed bool
+	closed   bool
 }
 
 // NewBufferedProducer creates a producer that flushes when either batchSize
@@ -148,7 +146,6 @@ func NewBufferedProducer(c *Client, topic string, batchSize int, linger time.Dur
 		buf:       make([]*pb.ProduceMessage, 0, batchSize),
 	}
 }
-
 
 func (p *BufferedProducer) Send(ctx context.Context, key, value []byte, priority uint32) error {
 	p.mu.Lock()

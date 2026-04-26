@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 
+	kafka "github.com/segmentio/kafka-go"
+
 	"github.com/Nyamerka/NyaQueue/internal/app"
 	"github.com/Nyamerka/NyaQueue/internal/kafkadriver"
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	pb "github.com/Nyamerka/NyaQueue/pkg/proto"
 	"github.com/Nyamerka/NyaQueue/pkg/transport"
 	"github.com/samber/oops"
 )
@@ -137,6 +140,67 @@ func (h *Harness) Publish(ctx context.Context, topic string, key, value []byte, 
 		return h.kfk.Produce(ctx, topic, key, value)
 	}
 	return oops.Errorf("unsupported mode")
+}
+
+type BatchItem struct {
+	Key      []byte
+	Value    []byte
+	Priority uint8
+}
+
+func (h *Harness) PublishBatch(ctx context.Context, topic string, items []BatchItem) (int, error) {
+	if len(items) == 0 {
+		return 0, nil
+	}
+	switch h.mode {
+	case ModeInProcess:
+		msgs := make([]*broker.Message, len(items))
+		for i, it := range items {
+			msgs[i] = broker.NewMessage(it.Priority, it.Key, it.Value)
+		}
+
+		var (
+			results = h.app.Broker().PublishBatch(topic, msgs)
+			ok = 0
+			firstErr error
+		)
+		
+		for _, r := range results {
+			if r.Err == nil {
+				ok++
+			} else if firstErr == nil {
+				firstErr = r.Err
+			}
+		}
+		return ok, firstErr
+
+	case ModeGRPC:
+		pbmsgs := make([]*pb.ProduceMessage, len(items))
+		for i, it := range items {
+			pbmsgs[i] = &pb.ProduceMessage{
+				Key:      it.Key,
+				Value:    it.Value,
+				Priority: uint32(it.Priority),
+			}
+		}
+		results, err := h.grpc.ProduceBatch(ctx, topic, pbmsgs)
+		if err != nil {
+			return 0, err
+		}
+		return len(results), nil
+
+	case ModeKafka:
+		kmsgs := make([]kafka.Message, len(items))
+		for i, it := range items {
+			kmsgs[i] = kafka.Message{Key: it.Key, Value: it.Value}
+		}
+		if err := h.kfk.ProduceBatch(ctx, topic, kmsgs); err != nil {
+			return 0, err
+		}
+		return len(items), nil
+	}
+
+	return 0, oops.Errorf("unsupported mode")
 }
 
 type ConsumedMessage struct {

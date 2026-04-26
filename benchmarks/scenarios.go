@@ -20,7 +20,8 @@ type Scenario struct {
 	Priorities  [10]float64   // probability distribution over priority levels
 }
 
-// Uniform generates steady, evenly distributed load.
+// Uniform generates steady, evenly distributed load at a rate both NyaQueue
+// and Kafka can sustain — suitable for apples-to-apples latency comparison.
 func Uniform() Scenario {
 	return Scenario{
 		Name:       "uniform",
@@ -28,7 +29,7 @@ func Uniform() Scenario {
 		Producers:  4,
 		Consumers:  4,
 		MsgSize:    256,
-		RatePerSec: 5000,
+		RatePerSec: 1200,
 		Priorities: uniformPriorities(),
 	}
 }
@@ -41,7 +42,7 @@ func Skewed() Scenario {
 		Producers:  4,
 		Consumers:  4,
 		MsgSize:    256,
-		RatePerSec: 5000,
+		RatePerSec: 1200,
 		SkewRatio:  0.8,
 		Priorities: uniformPriorities(),
 	}
@@ -55,7 +56,7 @@ func Bursty() Scenario {
 		Producers:   4,
 		Consumers:   4,
 		MsgSize:     256,
-		RatePerSec:  3000,
+		RatePerSec:  1200,
 		BurstEvery:  10 * time.Second,
 		BurstFactor: 5,
 		Priorities:  uniformPriorities(),
@@ -70,7 +71,7 @@ func GrowingLoad() Scenario {
 		Producers:  4,
 		Consumers:  4,
 		MsgSize:    256,
-		RatePerSec: 1000, // starting rate; grows linearly
+		RatePerSec: 600,
 		Priorities: uniformPriorities(),
 	}
 }
@@ -83,7 +84,20 @@ func MixedPriority() Scenario {
 		Producers:  4,
 		Consumers:  4,
 		MsgSize:    256,
-		RatePerSec: 5000,
+		RatePerSec: 1200,
+		Priorities: [10]float64{0.30, 0.25, 0.15, 0.10, 0.08, 0.05, 0.03, 0.02, 0.01, 0.01},
+	}
+}
+
+// Overload sends at maximum throughput with no rate limiting.
+func Overload() Scenario {
+	return Scenario{
+		Name:       "overload",
+		Duration:   30 * time.Second,
+		Producers:  4,
+		Consumers:  4,
+		MsgSize:    256,
+		RatePerSec: 0, // unlimited
 		Priorities: [10]float64{0.30, 0.25, 0.15, 0.10, 0.08, 0.05, 0.03, 0.02, 0.01, 0.01},
 	}
 }
@@ -98,6 +112,7 @@ func AllScenarios() Scenarios {
 		Bursty(),
 		GrowingLoad(),
 		MixedPriority(),
+		Overload(),
 	}
 }
 

@@ -70,8 +70,19 @@ func main() {
 		Duration:     duration,
 	}
 
-	log.Printf("Running %d scenarios x %d algorithms x %d modes",
-		len(scenarios), len(algorithms), len(modes))
+	hasKafka := false
+	for _, m := range modes {
+		if m == experiments.ModeKafka {
+			hasKafka = true
+			break
+		}
+	}
+	kafkaNote := ""
+	if hasKafka {
+		kafkaNote = " + Kafka baseline"
+	}
+	log.Printf("Running %d scenarios × %d NyaQueue algorithms%s",
+		len(scenarios), len(algorithms), kafkaNote)
 
 	results, err := runner.RunAll(ctx)
 	if err != nil {
