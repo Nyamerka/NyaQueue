@@ -8,6 +8,8 @@ services:
       - "9090:9090"
     volumes:
       - nyaqueue-data:/data
+    cpus: "2.0"
+    mem_limit: "1.5g"
 
   broker-exporter:
     build:
@@ -18,6 +20,8 @@ services:
       - "8083:8083"
     depends_on:
       - broker
+    cpus: "0.25"
+    mem_limit: "256m"
 
   producer:
     build:
@@ -28,6 +32,8 @@ services:
       - "8081:8081"
     depends_on:
       - broker
+    cpus: "0.5"
+    mem_limit: "256m"
 
   consumer:
     build:
@@ -39,6 +45,8 @@ services:
     depends_on:
       - broker
       - producer
+    cpus: "0.5"
+    mem_limit: "256m"
 
   prometheus:
     image: prom/prometheus:v2.55.1
@@ -53,6 +61,8 @@ services:
       - "--storage.tsdb.retention.time=24h"
     depends_on:
       - broker-exporter
+    cpus: "0.25"
+    mem_limit: "512m"
 
   grafana:
     image: grafana/grafana:11.3.0
@@ -69,6 +79,8 @@ services:
       - grafana-data:/var/lib/grafana
     depends_on:
       - prometheus
+    cpus: "0.25"
+    mem_limit: "256m"
 
   kafka:
     profiles: ["kafka"]
@@ -89,6 +101,8 @@ services:
       KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
     volumes:
       - kafka-data:/bitnami/kafka
+    cpus: "1.5"
+    mem_limit: "1.5g"
 
   experiment:
     profiles: ["experiment"]

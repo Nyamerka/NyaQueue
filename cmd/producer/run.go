@@ -107,11 +107,18 @@ func runWorker(
 	workerID int,
 	seq *uint64,
 ) {
+	var interval time.Duration
+	if sc.RatePerSec > 0 && cfg.Producers > 0 {
+		perWorker := sc.RatePerSec / cfg.Producers
+		if perWorker < 1 {
+			perWorker = 1
+		}
+		interval = time.Second / time.Duration(perWorker)
+	}
+
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		default:
 		}
 
 		var (
@@ -133,11 +140,18 @@ func runWorker(
 			if code == codes.ResourceExhausted {
 				m.throttled.WithLabelValues(cfg.Topic).Inc()
 			}
-			continue
+		} else {
+			m.published.WithLabelValues(cfg.Topic, strconv.Itoa(int(priority))).Inc()
+			m.latency.WithLabelValues(cfg.Topic).Observe(elapsed.Seconds())
 		}
 
-		m.published.WithLabelValues(cfg.Topic, strconv.Itoa(int(priority))).Inc()
-		m.latency.WithLabelValues(cfg.Topic).Observe(elapsed.Seconds())
+		if interval > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(interval):
+			}
+		}
 	}
 }
 
