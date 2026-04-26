@@ -28,7 +28,8 @@ func ExportCSV(results []ExperimentResult, dir string) error {
 	header := []string{
 		"scenario", "algorithm", "system", "mode",
 		"throughput_msg_sec", "latency_p50_us", "latency_p95_us", "latency_p99_us",
-		"load_stddev", "produced", "consumed", "duration_sec",
+		"load_stddev", "produced", "consumed",
+		"publish_errors", "consume_errors", "duration_sec",
 	}
 	if err := w.Write(header); err != nil {
 		return err
@@ -47,6 +48,8 @@ func ExportCSV(results []ExperimentResult, dir string) error {
 			fmt.Sprintf("%.6f", r.LoadStdDev),
 			fmt.Sprintf("%d", r.Produced),
 			fmt.Sprintf("%d", r.Consumed),
+			fmt.Sprintf("%d", r.PublishErrors),
+			fmt.Sprintf("%d", r.ConsumeErrors),
 			fmt.Sprintf("%.3f", r.Duration.Seconds()),
 		}
 		if err := w.Write(row); err != nil {

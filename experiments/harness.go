@@ -2,6 +2,7 @@ package experiments
 
 import (
 	"context"
+	"errors"
 
 	"github.com/Nyamerka/NyaQueue/internal/app"
 	"github.com/Nyamerka/NyaQueue/internal/kafkadriver"
@@ -9,6 +10,10 @@ import (
 	"github.com/Nyamerka/NyaQueue/pkg/transport"
 	"github.com/samber/oops"
 )
+
+var ErrNoMessage = errors.New("no message available")
+
+const grpcMaxFetchBytes = 1 << 20
 
 // Mode selects how the experiment communicates with the broker.
 type Mode int
@@ -104,6 +109,20 @@ func (h *Harness) Broker() *broker.Broker {
 	return nil
 }
 
+func (h *Harness) CreateTopic(ctx context.Context, topic string, cfg broker.TopicConfig) error {
+	switch h.mode {
+	case ModeInProcess, ModeGRPC:
+		brk := h.Broker()
+		if brk == nil {
+			return oops.Errorf("broker not initialised")
+		}
+		return brk.CreateTopic(topic, cfg)
+	case ModeKafka:
+		return h.kfk.CreateTopic(ctx, topic, cfg.NumPartitions)
+	}
+	return oops.Errorf("unsupported mode")
+}
+
 // Publish sends a message. For Kafka mode, priority is ignored.
 func (h *Harness) Publish(ctx context.Context, topic string, key, value []byte, priority uint8) error {
 	switch h.mode {
@@ -118,6 +137,52 @@ func (h *Harness) Publish(ctx context.Context, topic string, key, value []byte, 
 		return h.kfk.Produce(ctx, topic, key, value)
 	}
 	return oops.Errorf("unsupported mode")
+}
+
+type ConsumedMessage struct {
+	Value  []byte
+	Offset int64
+}
+
+func (h *Harness) Consume(ctx context.Context, topic, group string, partition int) (*ConsumedMessage, error) {
+	switch h.mode {
+	case ModeInProcess:
+		brk := h.app.Broker()
+		msg, nextOffset, err := brk.Consume(topic, group, partition)
+		if err != nil {
+			return nil, ErrNoMessage
+		}
+		if err := brk.Commit(group, topic, partition, int64(nextOffset)); err != nil {
+			return nil, oops.Wrapf(err, "commit")
+		}
+		return &ConsumedMessage{Value: msg.Value, Offset: int64(nextOffset - 1)}, nil
+
+	case ModeGRPC:
+		msgs, err := h.grpc.Consume(ctx, topic, group, int32(partition), grpcMaxFetchBytes)
+		if err != nil {
+			return nil, oops.Wrapf(err, "grpc consume")
+		}
+		if len(msgs) == 0 {
+			return nil, ErrNoMessage
+		}
+		env := msgs[0]
+		if err := h.grpc.Commit(ctx, topic, group, int32(partition), env.Offset+1); err != nil {
+			return nil, oops.Wrapf(err, "grpc commit")
+		}
+		return &ConsumedMessage{Value: env.Value, Offset: env.Offset}, nil
+
+	case ModeKafka:
+		msgs, err := h.kfk.Consume(ctx, topic, group, partition, grpcMaxFetchBytes)
+		if err != nil {
+			return nil, oops.Wrapf(err, "kafka consume")
+		}
+		if len(msgs) == 0 {
+			return nil, ErrNoMessage
+		}
+		return &ConsumedMessage{Value: msgs[0].Value, Offset: msgs[0].Offset}, nil
+	}
+	
+	return nil, oops.Errorf("unsupported mode")
 }
 
 // Close stops all resources.
