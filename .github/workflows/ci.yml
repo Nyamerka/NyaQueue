@@ -166,7 +166,7 @@ jobs:
             sleep 2
           done
 
-      - name: Run experiments (5s per scenario)
+      - name: Run experiments (1s per scenario)
         run: |
           docker compose -f deploy/docker-compose.yml --profile kafka --profile experiment run --rm experiment \
             --experiment.mode=inprocess,grpc,kafka \
@@ -174,7 +174,7 @@ jobs:
             --experiment.algorithms=all \
             --experiment.kafka_brokers=kafka:9092 \
             --experiment.broker_addr=broker:9090 \
-            --experiment.duration=5s \
+            --experiment.duration=1s \
             --experiment.output=/results
 
       - name: Dump compose logs on failure
