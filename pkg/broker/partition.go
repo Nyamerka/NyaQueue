@@ -10,6 +10,15 @@ import (
 	"github.com/tidwall/wal"
 )
 
+func walOptions(sp SyncPolicy) *wal.Options {
+	opts := *wal.DefaultOptions
+	switch sp {
+	case SyncNone, SyncInterval:
+		opts.NoSync = true
+	}
+	return &opts
+}
+
 type Partition struct {
 	mu            sync.RWMutex
 	id            int
@@ -20,9 +29,9 @@ type Partition struct {
 	scheduleMode  ScheduleMode
 }
 
-func NewPartition(id int, topicName, dataDir string, mode ScheduleMode) (*Partition, error) {
+func NewPartition(id int, topicName, dataDir string, mode ScheduleMode, syncPolicy SyncPolicy) (*Partition, error) {
 	dir := filepath.Join(dataDir, topicName, fmt.Sprintf("partition-%d", id))
-	log, err := wal.Open(dir, nil)
+	log, err := wal.Open(dir, walOptions(syncPolicy))
 	if err != nil {
 		return nil, oops.Wrapf(err, "open WAL partition %d", id)
 	}

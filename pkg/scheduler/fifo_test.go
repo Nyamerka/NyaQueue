@@ -27,7 +27,7 @@ func (s *FIFOSuite) TestSequentialRead() {
 	for _, tc := range tests {
 		s.Run(tc.name, func() {
 			dir := s.T().TempDir()
-			p, err := broker.NewPartition(0, "test", dir, broker.ModeFIFO)
+			p, err := broker.NewPartition(0, "test", dir, broker.ModeFIFO, broker.SyncNone)
 			require.NoError(s.T(), err)
 			defer p.Close()
 
@@ -51,7 +51,7 @@ func (s *FIFOSuite) TestSequentialRead() {
 
 func (s *FIFOSuite) TestNoMessages() {
 	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeFIFO)
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeFIFO, broker.SyncNone)
 	require.NoError(s.T(), err)
 	defer p.Close()
 

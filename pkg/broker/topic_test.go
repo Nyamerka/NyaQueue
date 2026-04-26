@@ -30,7 +30,7 @@ func (s *TopicSuite) TestNewTopic() {
 			cfg.NumPartitions = tc.partitions
 			cfg.ScheduleMode = tc.mode
 
-			t, err := NewTopic("test", s.T().TempDir(), cfg)
+			t, err := NewTopic("test", s.T().TempDir(), cfg, SyncNone)
 			require.NoError(s.T(), err)
 			defer t.Close()
 
@@ -47,7 +47,7 @@ func (s *TopicSuite) TestNewTopic() {
 func (s *TopicSuite) TestPartitionOutOfRange() {
 	cfg := DefaultTopicConfig()
 	cfg.NumPartitions = 2
-	t, err := NewTopic("test", s.T().TempDir(), cfg)
+	t, err := NewTopic("test", s.T().TempDir(), cfg, SyncNone)
 	require.NoError(s.T(), err)
 	defer t.Close()
 
@@ -65,7 +65,7 @@ func (s *TopicSuite) TestPartitionOutOfRange() {
 func (s *TopicSuite) TestPartitions() {
 	cfg := DefaultTopicConfig()
 	cfg.NumPartitions = 3
-	t, err := NewTopic("test", s.T().TempDir(), cfg)
+	t, err := NewTopic("test", s.T().TempDir(), cfg, SyncNone)
 	require.NoError(s.T(), err)
 	defer t.Close()
 

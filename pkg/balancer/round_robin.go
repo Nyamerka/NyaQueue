@@ -87,6 +87,8 @@ func (w *WeightedRoundRobin) OnMetrics(m broker.Metrics) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	resized := len(m.PartitionLoads) != len(w.weights)
+
 	w.weights = make([]float64, len(m.PartitionLoads))
 	for i, load := range m.PartitionLoads {
 		if load < w.minLoad {
@@ -94,8 +96,11 @@ func (w *WeightedRoundRobin) OnMetrics(m broker.Metrics) {
 		}
 		w.weights[i] = 1.0 / load
 	}
-	w.idx = 0
-	w.cw = 0
+
+	if resized {
+		w.idx = 0
+		w.cw = 0
+	}
 }
 
 func (w *WeightedRoundRobin) ensureWeights(n int) {

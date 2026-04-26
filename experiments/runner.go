@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"os"
 	"sync"
 	"time"
@@ -199,16 +200,26 @@ func runScenario(
 }
 
 func runProducer(ctx context.Context, h *Harness, sc benchmarks.Scenario, msgSize int, c *MetricsCollector) {
-	key := []byte("k")
+	var interval time.Duration
+	if sc.RatePerSec > 0 && sc.Producers > 0 {
+		perProducer := sc.RatePerSec / sc.Producers
+		if perProducer < 1 {
+			perProducer = 1
+		}
+		interval = time.Second / time.Duration(perProducer)
+	}
+
+	keyBuf := make([]byte, 8)
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
+		binary.BigEndian.PutUint64(keyBuf, rand.Uint64())
 		value := encodeValue(msgSize)
 		priority := sc.SamplePriority()
 
-		if err := h.Publish(ctx, expTopic, key, value, priority); err != nil {
+		if err := h.Publish(ctx, expTopic, keyBuf, value, priority); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
@@ -216,6 +227,14 @@ func runProducer(ctx context.Context, h *Harness, sc benchmarks.Scenario, msgSiz
 			continue
 		}
 		c.RecordProduce()
+
+		if interval > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(interval):
+			}
+		}
 	}
 }
 

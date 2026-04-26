@@ -10,6 +10,9 @@ const (
 	DefaultDQNMinReplay     = 64
 	DefaultDQNFallbackRatio = 0.8 // fallback to RR when throughput < ratio * baseline
 	DefaultDQNWeightInit    = 0.1
+	DefaultWRRMinLoad       = 0.01
+)
 
-	DefaultWRRMinLoad = 0.01
+const (
+	PSARebalanceLoadFactor = 2.0
 )

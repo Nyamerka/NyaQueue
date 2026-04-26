@@ -16,7 +16,7 @@ func TestPrioritySuite(t *testing.T) { suite.Run(t, new(PrioritySuite)) }
 
 func (s *PrioritySuite) TestHighestFirst() {
 	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority)
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -37,7 +37,7 @@ func (s *PrioritySuite) TestHighestFirst() {
 
 func (s *PrioritySuite) TestEmptyQueue() {
 	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority)
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -48,7 +48,7 @@ func (s *PrioritySuite) TestEmptyQueue() {
 
 func (s *PrioritySuite) TestNoPriorityIndex() {
 	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeFIFO)
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeFIFO, broker.SyncNone)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -66,7 +66,7 @@ func (s *PrioritySuite) TestEnqueueNoop() {
 
 func (s *PrioritySuite) TestSamePriorityFIFO() {
 	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority)
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone)
 	require.NoError(s.T(), err)
 	defer p.Close()
 

@@ -2,6 +2,7 @@ package balancer
 
 import (
 	"hash/fnv"
+	"math"
 	"sync"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
@@ -44,18 +45,29 @@ func (p *PSA) SelectPartition(_ string, key []byte, numPartitions int) int {
 
 	freeList := p.freeSlice()
 	if len(freeList) > 0 {
-		h := hashKey(key)
-		idx := h % uint64(len(freeList)+1)
-		if int(idx) < len(freeList) {
-			part := freeList[idx]
-			p.bindings[keyStr] = part
-			delete(p.free, part)
-			return part
-		}
+		part := p.leastLoadedFree(freeList)
+		p.bindings[keyStr] = part
+		delete(p.free, part)
+		return part
 	}
 
 	h := hashKey(key)
 	return int(h % uint64(numPartitions))
+}
+
+func (p *PSA) leastLoadedFree(freeList []int) int {
+	if len(p.loads) == 0 {
+		return freeList[0]
+	}
+	best := freeList[0]
+	bestLoad := math.MaxFloat64
+	for _, id := range freeList {
+		if id < len(p.loads) && p.loads[id] < bestLoad {
+			bestLoad = p.loads[id]
+			best = id
+		}
+	}
+	return best
 }
 
 func (p *PSA) OnMetrics(m broker.Metrics) {
@@ -66,14 +78,38 @@ func (p *PSA) OnMetrics(m broker.Metrics) {
 
 	for i, depth := range m.QueueDepth {
 		if depth == 0 {
-			for k, part := range p.bindings {
-				if part == i {
-					delete(p.bindings, k)
-				}
-			}
-			p.free[i] = struct{}{}
+			p.releasePartition(i)
 		}
 	}
+
+	if len(m.PartitionLoads) > 1 {
+		avg := avgLoad(m.PartitionLoads)
+		for i, load := range m.PartitionLoads {
+			if avg > 0 && load > PSARebalanceLoadFactor*avg {
+				p.releasePartition(i)
+			}
+		}
+	}
+}
+
+func (p *PSA) releasePartition(id int) {
+	for k, part := range p.bindings {
+		if part == id {
+			delete(p.bindings, k)
+		}
+	}
+	p.free[id] = struct{}{}
+}
+
+func avgLoad(loads []float64) float64 {
+	if len(loads) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, v := range loads {
+		sum += v
+	}
+	return sum / float64(len(loads))
 }
 
 func (p *PSA) freeSlice() []int {

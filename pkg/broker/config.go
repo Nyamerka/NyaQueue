@@ -15,12 +15,22 @@ const (
 	ModeDQNAdaptive                        // DQN balances priority vs fairness
 )
 
+type SyncPolicy int
+
+const (
+	SyncEveryWrite SyncPolicy = iota
+	SyncInterval
+	SyncNone
+)
+
 type Config struct {
 	SegmentMaxBytes   int           `koanf:"segment_max_bytes"`
 	SegmentMaxCount   int           `koanf:"segment_max_count"`
 	RetentionMaxBytes int64         `koanf:"retention_max_bytes"`
 	RetentionMaxAge   time.Duration `koanf:"retention_max_age"`
 	FlushIntervalMs   int           `koanf:"flush_interval_ms"`
+
+	SyncPolicy SyncPolicy `koanf:"sync_policy"` // 0=every write, 1=interval, 2=none
 
 	CompressionType int `koanf:"compression_type"` // 0=none, 1=snappy, 2=gzip, 3=lz4
 
@@ -115,6 +125,8 @@ func DefaultConfig() Config {
 		RetentionMaxBytes: 1 << 30, // 1GB
 		RetentionMaxAge:   168 * time.Hour,
 		FlushIntervalMs:   1000,
+
+		SyncPolicy: SyncInterval,
 
 		CompressionType: 0,
 

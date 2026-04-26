@@ -13,7 +13,7 @@ type Topic struct {
 	config     TopicConfig
 }
 
-func NewTopic(name, dataDir string, cfg TopicConfig) (*Topic, error) {
+func NewTopic(name, dataDir string, cfg TopicConfig, syncPolicy SyncPolicy) (*Topic, error) {
 	if cfg.NumPartitions <= 0 {
 		cfg.NumPartitions = 4
 	}
@@ -25,7 +25,7 @@ func NewTopic(name, dataDir string, cfg TopicConfig) (*Topic, error) {
 	}
 
 	for i := 0; i < cfg.NumPartitions; i++ {
-		p, err := NewPartition(i, name, dataDir, cfg.ScheduleMode)
+		p, err := NewPartition(i, name, dataDir, cfg.ScheduleMode, syncPolicy)
 		if err != nil {
 			t.Close()
 			return nil, oops.Wrapf(err, "create partition %d for topic %q", i, name)

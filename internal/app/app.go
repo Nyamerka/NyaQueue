@@ -65,7 +65,15 @@ func New(cfg broker.Config, dataDir string, opts ...Option) (*BrokerApp, error) 
 		opt(a)
 	}
 
-	offsetStore, err := broker.NewOffsetStore(dataDir)
+	var commitInterval time.Duration
+	if cfg.SyncPolicy != broker.SyncEveryWrite {
+		interval := cfg.FlushIntervalMs
+		if interval <= 0 {
+			interval = 100
+		}
+		commitInterval = time.Duration(interval) * time.Millisecond
+	}
+	offsetStore, err := broker.NewOffsetStore(dataDir, commitInterval)
 	if err != nil {
 		return nil, oops.Wrapf(err, "offset store")
 	}

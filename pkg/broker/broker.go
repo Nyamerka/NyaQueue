@@ -12,7 +12,7 @@ import (
 var (
 	ErrTopicAlreadyExists = errors.New("topic already exists")
 	ErrTopicNotFound      = errors.New("topic not found")
-	ErrNoMessages = errors.New("no messages available")
+	ErrNoMessages         = errors.New("no messages available")
 )
 
 type Balancer interface {
@@ -91,7 +91,7 @@ func (b *Broker) CreateTopic(name string, cfg TopicConfig) error {
 		return oops.Wrapf(ErrTopicAlreadyExists, "create topic %q", name)
 	}
 
-	t, err := NewTopic(name, b.dataDir, cfg)
+	t, err := NewTopic(name, b.dataDir, cfg, b.config.SyncPolicy)
 	if err != nil {
 		return err
 	}
