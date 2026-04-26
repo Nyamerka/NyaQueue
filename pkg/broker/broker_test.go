@@ -87,6 +87,39 @@ func (s *BrokerSuite) TestCommit() {
 	require.NoError(s.T(), b.Commit("grp", "t", 0, 42))
 }
 
+func (s *BrokerSuite) TestPublishBatch() {
+	b, cleanup := s.newBroker()
+	defer cleanup()
+
+	cfg := DefaultTopicConfig()
+	cfg.NumPartitions = 2
+	require.NoError(s.T(), b.CreateTopic("t", cfg))
+	b.SetScheduler("t", fifoScheduler{})
+
+	msgs := make([]*Message, 20)
+	for i := range msgs {
+		msgs[i] = NewMessage(0, []byte("k"), []byte("v"))
+	}
+
+	results := b.PublishBatch("t", msgs)
+	require.Len(s.T(), results, 20)
+
+	for _, r := range results {
+		require.NoError(s.T(), r.Err)
+		require.Greater(s.T(), r.Offset, uint64(0))
+	}
+}
+
+func (s *BrokerSuite) TestPublishBatchToUnknownTopic() {
+	b, cleanup := s.newBroker()
+	defer cleanup()
+
+	msgs := []*Message{NewMessage(0, nil, nil)}
+	results := b.PublishBatch("nonexistent", msgs)
+	require.Len(s.T(), results, 1)
+	require.Error(s.T(), results[0].Err)
+}
+
 func (s *BrokerSuite) TestConsumeNoScheduler() {
 	b, cleanup := s.newBroker()
 	defer cleanup()

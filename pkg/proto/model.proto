@@ -30,3 +30,16 @@ message TopicScheduleConfig {
   int64        anti_starvation_ms   = 3;
   double       dqn_throttle_on_load = 4;
 }
+
+// ProduceMessage is a single message inside a batch ProduceRequest.
+message ProduceMessage {
+  bytes  key      = 1;
+  bytes  value    = 2;
+  uint32 priority = 3;
+}
+
+// ProduceResult is a per-message result inside a batch ProduceResponse.
+message ProduceResult {
+  int32 partition = 1;
+  int64 offset    = 2;
+}

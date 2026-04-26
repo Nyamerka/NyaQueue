@@ -25,6 +25,7 @@ type ProduceResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Partition     int32                  `protobuf:"varint,1,opt,name=partition,proto3" json:"partition,omitempty"`
 	Offset        int64                  `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
+	Results       []*ProduceResult       `protobuf:"bytes,3,rep,name=results,proto3" json:"results,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -71,6 +72,13 @@ func (x *ProduceResponse) GetOffset() int64 {
 		return x.Offset
 	}
 	return 0
+}
+
+func (x *ProduceResponse) GetResults() []*ProduceResult {
+	if x != nil {
+		return x.Results
+	}
+	return nil
 }
 
 type ConsumeResponse struct {
@@ -349,10 +357,11 @@ var File_response_proto protoreflect.FileDescriptor
 
 const file_response_proto_rawDesc = "" +
 	"\n" +
-	"\x0eresponse.proto\x12\bnyaqueue\x1a\vmodel.proto\"G\n" +
+	"\x0eresponse.proto\x12\bnyaqueue\x1a\vmodel.proto\"z\n" +
 	"\x0fProduceResponse\x12\x1c\n" +
 	"\tpartition\x18\x01 \x01(\x05R\tpartition\x12\x16\n" +
-	"\x06offset\x18\x02 \x01(\x03R\x06offset\"H\n" +
+	"\x06offset\x18\x02 \x01(\x03R\x06offset\x121\n" +
+	"\aresults\x18\x03 \x03(\v2\x17.nyaqueue.ProduceResultR\aresults\"H\n" +
 	"\x0fConsumeResponse\x125\n" +
 	"\bmessages\x18\x01 \x03(\v2\x19.nyaqueue.MessageEnvelopeR\bmessages\"\x10\n" +
 	"\x0eCommitResponse\"\x15\n" +
@@ -392,17 +401,19 @@ var file_response_proto_goTypes = []any{
 	(*DeleteTopicResponse)(nil), // 4: nyaqueue.DeleteTopicResponse
 	(*ListTopicsResponse)(nil),  // 5: nyaqueue.ListTopicsResponse
 	(*MetricsResponse)(nil),     // 6: nyaqueue.MetricsResponse
-	(*MessageEnvelope)(nil),     // 7: nyaqueue.MessageEnvelope
-	(*TopicInfo)(nil),           // 8: nyaqueue.TopicInfo
+	(*ProduceResult)(nil),       // 7: nyaqueue.ProduceResult
+	(*MessageEnvelope)(nil),     // 8: nyaqueue.MessageEnvelope
+	(*TopicInfo)(nil),           // 9: nyaqueue.TopicInfo
 }
 var file_response_proto_depIdxs = []int32{
-	7, // 0: nyaqueue.ConsumeResponse.messages:type_name -> nyaqueue.MessageEnvelope
-	8, // 1: nyaqueue.ListTopicsResponse.topics:type_name -> nyaqueue.TopicInfo
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	7, // 0: nyaqueue.ProduceResponse.results:type_name -> nyaqueue.ProduceResult
+	8, // 1: nyaqueue.ConsumeResponse.messages:type_name -> nyaqueue.MessageEnvelope
+	9, // 2: nyaqueue.ListTopicsResponse.topics:type_name -> nyaqueue.TopicInfo
+	3, // [3:3] is the sub-list for method output_type
+	3, // [3:3] is the sub-list for method input_type
+	3, // [3:3] is the sub-list for extension type_name
+	3, // [3:3] is the sub-list for extension extendee
+	0, // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_response_proto_init() }

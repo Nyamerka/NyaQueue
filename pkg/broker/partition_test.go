@@ -72,6 +72,54 @@ func (s *PartitionSuite) TestFIFONoPriorityIndex() {
 	require.Nil(s.T(), p.PriorityIndex())
 }
 
+func (s *PartitionSuite) TestAppendBatch() {
+	p, err := NewPartition(0, "test", s.T().TempDir(), ModeFIFO, SyncNone)
+	require.NoError(s.T(), err)
+	defer p.Close()
+
+	msgs := make([]*Message, 50)
+	for i := range msgs {
+		msgs[i] = NewMessage(uint8(i%10), []byte("k"), []byte("v"))
+	}
+
+	offsets, err := p.AppendBatch(msgs)
+	require.NoError(s.T(), err)
+	require.Len(s.T(), offsets, 50)
+
+	for i, off := range offsets {
+		require.Equal(s.T(), uint64(i+1), off)
+		got, err := p.Read(off)
+		require.NoError(s.T(), err)
+		require.Equal(s.T(), msgs[i].Header.Priority, got.Header.Priority)
+	}
+	require.Equal(s.T(), uint64(50), p.HighWaterMark())
+}
+
+func (s *PartitionSuite) TestAppendBatchEmpty() {
+	p, err := NewPartition(0, "test", s.T().TempDir(), ModeFIFO, SyncNone)
+	require.NoError(s.T(), err)
+	defer p.Close()
+
+	offsets, err := p.AppendBatch(nil)
+	require.NoError(s.T(), err)
+	require.Nil(s.T(), offsets)
+}
+
+func (s *PartitionSuite) TestAppendBatchPriorityIndex() {
+	p, err := NewPartition(0, "test", s.T().TempDir(), ModeStrictPriority, SyncNone)
+	require.NoError(s.T(), err)
+	defer p.Close()
+
+	msgs := []*Message{
+		NewMessage(1, []byte("k"), []byte("a")),
+		NewMessage(9, []byte("k"), []byte("b")),
+		NewMessage(5, []byte("k"), []byte("c")),
+	}
+	_, err = p.AppendBatch(msgs)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), 3, p.PriorityIndex().Len())
+}
+
 func (s *PartitionSuite) TestRebuild() {
 	dir := s.T().TempDir()
 

@@ -53,6 +53,13 @@ func (s *Server) Addr() string {
 }
 
 func (s *Server) Produce(_ context.Context, req *pb.ProduceRequest) (*pb.ProduceResponse, error) {
+	if len(req.Messages) > 0 {
+		return s.produceBatch(req)
+	}
+	return s.produceSingle(req)
+}
+
+func (s *Server) produceSingle(req *pb.ProduceRequest) (*pb.ProduceResponse, error) {
 	msg := &broker.Message{
 		Header: broker.MessageHeader{
 			Priority:  uint8(req.Priority),
@@ -71,6 +78,50 @@ func (s *Server) Produce(_ context.Context, req *pb.ProduceRequest) (*pb.Produce
 		Partition: int32(partition),
 		Offset:    int64(offset),
 	}, nil
+}
+
+func (s *Server) produceBatch(req *pb.ProduceRequest) (*pb.ProduceResponse, error) {
+	now := time.Now().UnixNano()
+	msgs := make([]*broker.Message, len(req.Messages))
+	for i, m := range req.Messages {
+		msgs[i] = &broker.Message{
+			Header: broker.MessageHeader{
+				Priority:  uint8(m.Priority),
+				Timestamp: now,
+			},
+			Key:   m.Key,
+			Value: m.Value,
+		}
+	}
+
+	batchResults := s.broker.PublishBatch(req.Topic, msgs)
+
+	results := make([]*pb.ProduceResult, len(batchResults))
+	var firstErr error
+	for i, r := range batchResults {
+		if r.Err != nil && firstErr == nil {
+			firstErr = r.Err
+		}
+		results[i] = &pb.ProduceResult{
+			Partition: int32(r.Partition),
+			Offset:    int64(r.Offset),
+		}
+	}
+
+	if firstErr != nil && allFailed(batchResults) {
+		return nil, firstErr
+	}
+
+	return &pb.ProduceResponse{Results: results}, nil
+}
+
+func allFailed(results []broker.PublishResult) bool {
+	for _, r := range results {
+		if r.Err == nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.ConsumeResponse, error) {

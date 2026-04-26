@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,20 +16,22 @@ import (
 
 var offsetsBucket = []byte("offsets")
 
+// OffsetStore tracks consumer offsets. Hot-path reads and writes go through an
+// in-memory cache (sync.Map). A background goroutine periodically dumps dirty
+// entries to BoltDB for durability.
 type OffsetStore struct {
-	db *bbolt.DB
+	db    *bbolt.DB
+	cache sync.Map // string -> int64
 
-	batchMu       sync.Mutex
-	pendingWrites map[string]int64 // bucketKey -> offset
-	batchInterval time.Duration
-	stopCh        chan struct{}
-	stopped       chan struct{}
+	dumpInterval time.Duration
+	stopCh       chan struct{}
+	stopped      chan struct{}
 }
 
-// NewOffsetStore opens the offset database. When batchInterval > 0, commits
-// are accumulated in memory and flushed to disk periodically, trading a small
-// durability window for much higher throughput.
-func NewOffsetStore(dataDir string, batchInterval ...time.Duration) (*OffsetStore, error) {
+// NewOffsetStore opens the offset database. When dumpInterval > 0 the store
+// runs a background goroutine that flushes the in-memory cache to BoltDB at
+// that cadence, removing the fsync-per-commit overhead from the hot path.
+func NewOffsetStore(dataDir string, dumpInterval ...time.Duration) (*OffsetStore, error) {
 	path := filepath.Join(dataDir, "offsets.db")
 	db, err := bbolt.Open(path, 0600, nil)
 	if err != nil {
@@ -45,32 +48,81 @@ func NewOffsetStore(dataDir string, batchInterval ...time.Duration) (*OffsetStor
 	}
 
 	s := &OffsetStore{
-		db:            db,
-		pendingWrites: make(map[string]int64),
-		stopCh:        make(chan struct{}),
-		stopped:       make(chan struct{}),
+		db:      db,
+		stopCh:  make(chan struct{}),
+		stopped: make(chan struct{}),
 	}
-	if len(batchInterval) > 0 && batchInterval[0] > 0 {
-		s.batchInterval = batchInterval[0]
-		go s.flushLoop()
+
+	// Warm cache from BoltDB.
+	_ = db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(offsetsBucket)
+		return b.ForEach(func(k, v []byte) error {
+			s.cache.Store(string(k), int64(binary.BigEndian.Uint64(v)))
+			return nil
+		})
+	})
+
+	if len(dumpInterval) > 0 && dumpInterval[0] > 0 {
+		s.dumpInterval = dumpInterval[0]
+		go s.dumpLoop()
 	}
+
 	return s, nil
 }
 
-func (s *OffsetStore) bucketKey(topic string, partition int, group string) []byte {
-	return []byte(fmt.Sprintf("%s/%d/%s", topic, partition, group))
+func (s *OffsetStore) bucketKey(topic string, partition int, group string) string {
+	return fmt.Sprintf("%s/%d/%s", topic, partition, group)
 }
 
+// Commit stores the offset in the in-memory cache. The value is persisted to
+// BoltDB by the background dump goroutine (or synchronously when no dump
+// interval is configured).
 func (s *OffsetStore) Commit(group, topic string, partition int, offset int64) error {
-	key := string(s.bucketKey(topic, partition, group))
+	key := s.bucketKey(topic, partition, group)
+	s.cache.Store(key, offset)
 
-	if s.batchInterval > 0 {
-		s.batchMu.Lock()
-		s.pendingWrites[key] = offset
-		s.batchMu.Unlock()
+	if s.dumpInterval > 0 {
 		return nil
 	}
 
+	return s.writeOne(key, offset)
+}
+
+// Load returns the last committed offset for a consumer group.
+func (s *OffsetStore) Load(group, topic string, partition int) (int64, error) {
+	key := s.bucketKey(topic, partition, group)
+	if v, ok := s.cache.Load(key); ok {
+		return v.(int64), nil
+	}
+	return 0, oops.Errorf("offset not found for %s/%d/%s", topic, partition, group)
+}
+
+// CommitFloor returns the minimum committed offset across all consumer groups
+// for a given topic/partition. Used for WAL truncation and PriorityIndex rebuild.
+func (s *OffsetStore) CommitFloor(topic string, partition int) (int64, error) {
+	prefix := fmt.Sprintf("%s/%d/", topic, partition)
+	minOffset := int64(math.MaxInt64)
+	found := false
+
+	s.cache.Range(func(k, v any) bool {
+		key := k.(string)
+		if strings.HasPrefix(key, prefix) {
+			off := v.(int64)
+			if off < minOffset {
+				minOffset = off
+			}
+			found = true
+		}
+		return true
+	})
+
+	if !found {
+		return 0, nil
+	}
+	return minOffset, nil
+}
+
+func (s *OffsetStore) writeOne(key string, offset int64) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(offsetsBucket)
 		val := make([]byte, 8)
@@ -79,36 +131,36 @@ func (s *OffsetStore) Commit(group, topic string, partition int, offset int64) e
 	})
 }
 
-func (s *OffsetStore) flushLoop() {
+func (s *OffsetStore) dumpLoop() {
 	defer close(s.stopped)
-	ticker := time.NewTicker(s.batchInterval)
+	ticker := time.NewTicker(s.dumpInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			s.flush()
+			s.dump()
 		case <-s.stopCh:
-			s.flush()
+			s.dump()
 			return
 		}
 	}
 }
 
-func (s *OffsetStore) flush() {
-	s.batchMu.Lock()
-	batch := s.pendingWrites
-	s.pendingWrites = make(map[string]int64, len(batch))
-	s.batchMu.Unlock()
-
-	if len(batch) == 0 {
+func (s *OffsetStore) dump() {
+	snapshot := make(map[string]int64)
+	s.cache.Range(func(k, v any) bool {
+		snapshot[k.(string)] = v.(int64)
+		return true
+	})
+	if len(snapshot) == 0 {
 		return
 	}
 
 	_ = s.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(offsetsBucket)
-		val := make([]byte, 8)
-		for key, offset := range batch {
+		for key, offset := range snapshot {
+			val := make([]byte, 8)
 			binary.BigEndian.PutUint64(val, uint64(offset))
 			_ = b.Put([]byte(key), val)
 		}
@@ -116,63 +168,8 @@ func (s *OffsetStore) flush() {
 	})
 }
 
-func (s *OffsetStore) Load(group, topic string, partition int) (int64, error) {
-	key := string(s.bucketKey(topic, partition, group))
-
-	if s.batchInterval > 0 {
-		s.batchMu.Lock()
-		if off, ok := s.pendingWrites[key]; ok {
-			s.batchMu.Unlock()
-			return off, nil
-		}
-		s.batchMu.Unlock()
-	}
-
-	var offset int64
-	err := s.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(offsetsBucket)
-		val := b.Get([]byte(key))
-		if val == nil {
-			return oops.Errorf("offset not found for %s/%s/%d", group, topic, partition)
-		}
-		offset = int64(binary.BigEndian.Uint64(val))
-		return nil
-	})
-	return offset, err
-}
-
-// CommitFloor returns the minimum committed offset across all consumer groups
-// for a given topic/partition. Used for WAL truncation and PriorityIndex rebuild.
-func (s *OffsetStore) CommitFloor(topic string, partition int) (int64, error) {
-	prefix := []byte(fmt.Sprintf("%s/%d/", topic, partition))
-	minOffset := int64(math.MaxInt64)
-	found := false
-
-	err := s.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(offsetsBucket)
-		c := b.Cursor()
-
-		for k, v := c.Seek(prefix); k != nil && len(k) >= len(prefix) && string(k[:len(prefix)]) == string(prefix); k, v = c.Next() {
-			off := int64(binary.BigEndian.Uint64(v))
-			if off < minOffset {
-				minOffset = off
-			}
-			found = true
-		}
-		return nil
-	})
-
-	if err != nil {
-		return 0, err
-	}
-	if !found {
-		return 0, nil
-	}
-	return minOffset, nil
-}
-
 func (s *OffsetStore) Close() error {
-	if s.batchInterval > 0 {
+	if s.dumpInterval > 0 {
 		close(s.stopCh)
 		<-s.stopped
 	}

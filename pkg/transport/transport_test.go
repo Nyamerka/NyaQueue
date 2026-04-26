@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/balancer"
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
@@ -172,4 +173,45 @@ func (s *TransportSuite) TestMultipleProduceConsume() {
 func (s *TransportSuite) TestServerAddrBeforeStart() {
 	srv := NewServer(s.broker)
 	require.Empty(s.T(), srv.Addr())
+}
+
+func (s *TransportSuite) TestProduceBatch() {
+	ctx := context.Background()
+	s.createTopicWithScheduler("batch-test", 2, pb.ScheduleMode_FIFO)
+
+	msgs := make([]*pb.ProduceMessage, 10)
+	for i := range msgs {
+		msgs[i] = &pb.ProduceMessage{
+			Key:      []byte("k"),
+			Value:    []byte("v"),
+			Priority: 0,
+		}
+	}
+
+	results, err := s.client.ProduceBatch(ctx, "batch-test", msgs)
+	require.NoError(s.T(), err)
+	require.Len(s.T(), results, 10)
+
+	for _, r := range results {
+		require.Greater(s.T(), r.Offset, int64(0))
+	}
+}
+
+func (s *TransportSuite) TestBufferedProducer() {
+	ctx := context.Background()
+	s.createTopicWithScheduler("buf-test", 1, pb.ScheduleMode_FIFO)
+
+	bp := NewBufferedProducer(s.client, "buf-test", 5, 50*time.Millisecond)
+
+	for i := 0; i < 5; i++ {
+		err := bp.Send(ctx, []byte("k"), []byte("v"), 0)
+		require.NoError(s.T(), err)
+	}
+
+	err := bp.Flush(ctx)
+	require.NoError(s.T(), err)
+
+	msgs, err := s.client.Consume(ctx, "buf-test", "g1", 0, 65536)
+	require.NoError(s.T(), err)
+	require.NotEmpty(s.T(), msgs)
 }

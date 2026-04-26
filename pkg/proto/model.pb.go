@@ -274,6 +274,120 @@ func (x *TopicScheduleConfig) GetDqnThrottleOnLoad() float64 {
 	return 0
 }
 
+// ProduceMessage is a single message inside a batch ProduceRequest.
+type ProduceMessage struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	Priority      uint32                 `protobuf:"varint,3,opt,name=priority,proto3" json:"priority,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProduceMessage) Reset() {
+	*x = ProduceMessage{}
+	mi := &file_model_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProduceMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProduceMessage) ProtoMessage() {}
+
+func (x *ProduceMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_model_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProduceMessage.ProtoReflect.Descriptor instead.
+func (*ProduceMessage) Descriptor() ([]byte, []int) {
+	return file_model_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *ProduceMessage) GetKey() []byte {
+	if x != nil {
+		return x.Key
+	}
+	return nil
+}
+
+func (x *ProduceMessage) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+func (x *ProduceMessage) GetPriority() uint32 {
+	if x != nil {
+		return x.Priority
+	}
+	return 0
+}
+
+// ProduceResult is a per-message result inside a batch ProduceResponse.
+type ProduceResult struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Partition     int32                  `protobuf:"varint,1,opt,name=partition,proto3" json:"partition,omitempty"`
+	Offset        int64                  `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProduceResult) Reset() {
+	*x = ProduceResult{}
+	mi := &file_model_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProduceResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProduceResult) ProtoMessage() {}
+
+func (x *ProduceResult) ProtoReflect() protoreflect.Message {
+	mi := &file_model_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProduceResult.ProtoReflect.Descriptor instead.
+func (*ProduceResult) Descriptor() ([]byte, []int) {
+	return file_model_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *ProduceResult) GetPartition() int32 {
+	if x != nil {
+		return x.Partition
+	}
+	return 0
+}
+
+func (x *ProduceResult) GetOffset() int64 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
+
 var File_model_proto protoreflect.FileDescriptor
 
 const file_model_proto_rawDesc = "" +
@@ -293,7 +407,14 @@ const file_model_proto_rawDesc = "" +
 	"\x04mode\x18\x01 \x01(\x0e2\x16.nyaqueue.ScheduleModeR\x04mode\x12'\n" +
 	"\x0fpriority_levels\x18\x02 \x01(\x05R\x0epriorityLevels\x12,\n" +
 	"\x12anti_starvation_ms\x18\x03 \x01(\x03R\x10antiStarvationMs\x12/\n" +
-	"\x14dqn_throttle_on_load\x18\x04 \x01(\x01R\x11dqnThrottleOnLoad*?\n" +
+	"\x14dqn_throttle_on_load\x18\x04 \x01(\x01R\x11dqnThrottleOnLoad\"T\n" +
+	"\x0eProduceMessage\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\x12\x1a\n" +
+	"\bpriority\x18\x03 \x01(\rR\bpriority\"E\n" +
+	"\rProduceResult\x12\x1c\n" +
+	"\tpartition\x18\x01 \x01(\x05R\tpartition\x12\x16\n" +
+	"\x06offset\x18\x02 \x01(\x03R\x06offset*?\n" +
 	"\fScheduleMode\x12\b\n" +
 	"\x04FIFO\x10\x00\x12\x13\n" +
 	"\x0fSTRICT_PRIORITY\x10\x01\x12\x10\n" +
@@ -312,12 +433,14 @@ func file_model_proto_rawDescGZIP() []byte {
 }
 
 var file_model_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_model_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_model_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
 var file_model_proto_goTypes = []any{
 	(ScheduleMode)(0),           // 0: nyaqueue.ScheduleMode
 	(*MessageEnvelope)(nil),     // 1: nyaqueue.MessageEnvelope
 	(*TopicInfo)(nil),           // 2: nyaqueue.TopicInfo
 	(*TopicScheduleConfig)(nil), // 3: nyaqueue.TopicScheduleConfig
+	(*ProduceMessage)(nil),      // 4: nyaqueue.ProduceMessage
+	(*ProduceResult)(nil),       // 5: nyaqueue.ProduceResult
 }
 var file_model_proto_depIdxs = []int32{
 	0, // 0: nyaqueue.TopicInfo.mode:type_name -> nyaqueue.ScheduleMode
@@ -340,7 +463,7 @@ func file_model_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_model_proto_rawDesc), len(file_model_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   3,
+			NumMessages:   5,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -9,6 +9,7 @@ import "model.proto";
 message ProduceResponse {
   int32 partition = 1;
   int64 offset    = 2;
+  repeated ProduceResult results = 3;
 }
 
 message ConsumeResponse {

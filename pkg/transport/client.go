@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/samber/oops"
@@ -48,6 +49,18 @@ func (c *Client) Produce(ctx context.Context, topic string, key, value []byte, p
 		return 0, 0, err
 	}
 	return resp.Partition, resp.Offset, nil
+}
+
+// ProduceBatch sends a batch of messages in a single RPC.
+func (c *Client) ProduceBatch(ctx context.Context, topic string, msgs []*pb.ProduceMessage) ([]*pb.ProduceResult, error) {
+	resp, err := c.client.Produce(ctx, &pb.ProduceRequest{
+		Topic:    topic,
+		Messages: msgs,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Results, nil
 }
 
 func (c *Client) Consume(ctx context.Context, topic, group string, partition int32, maxBytes int32) ([]*pb.MessageEnvelope, error) {
@@ -99,4 +112,132 @@ func (c *Client) ListTopics(ctx context.Context) ([]*pb.TopicInfo, error) {
 
 func (c *Client) GetMetrics(ctx context.Context) (*pb.MetricsResponse, error) {
 	return c.client.GetMetrics(ctx, &pb.MetricsRequest{})
+}
+
+// ---------- BufferedProducer ----------
+
+// BufferedProducer accumulates messages and sends them in batches via a single
+// Produce RPC, amortising the per-RPC cost across many messages.
+type BufferedProducer struct {
+	client    *Client
+	topic     string
+	batchSize int
+	linger    time.Duration
+
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
+
+	mu     sync.Mutex
+	buf    []*pb.ProduceMessage
+	timer  *time.Timer
+	asyncErr error
+	closed bool
+}
+
+// NewBufferedProducer creates a producer that flushes when either batchSize
+// messages are accumulated or linger time elapses, whichever comes first.
+func NewBufferedProducer(c *Client, topic string, batchSize int, linger time.Duration) *BufferedProducer {
+	bgCtx, cancel := context.WithCancel(context.Background())
+	return &BufferedProducer{
+		client:    c,
+		topic:     topic,
+		batchSize: batchSize,
+		linger:    linger,
+		bgCtx:     bgCtx,
+		bgCancel:  cancel,
+		buf:       make([]*pb.ProduceMessage, 0, batchSize),
+	}
+}
+
+
+func (p *BufferedProducer) Send(ctx context.Context, key, value []byte, priority uint32) error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return oops.Errorf("buffered producer: closed")
+	}
+
+	if err := p.asyncErr; err != nil {
+		p.asyncErr = nil
+		p.mu.Unlock()
+		return err
+	}
+
+	p.buf = append(p.buf, &pb.ProduceMessage{
+		Key:      key,
+		Value:    value,
+		Priority: priority,
+	})
+
+	if len(p.buf) >= p.batchSize {
+		batch := p.buf
+		p.buf = make([]*pb.ProduceMessage, 0, p.batchSize)
+		p.stopTimerLocked()
+		p.mu.Unlock()
+		return p.send(ctx, batch)
+	}
+
+	if p.timer == nil && p.linger > 0 {
+		p.timer = time.AfterFunc(p.linger, p.flushFromTimer)
+	}
+	p.mu.Unlock()
+	return nil
+}
+
+// Flush sends any buffered messages immediately.
+func (p *BufferedProducer) Flush(ctx context.Context) error {
+	p.mu.Lock()
+	if len(p.buf) == 0 {
+		p.mu.Unlock()
+		return nil
+	}
+	batch := p.buf
+	p.buf = make([]*pb.ProduceMessage, 0, p.batchSize)
+	p.stopTimerLocked()
+	p.mu.Unlock()
+	return p.send(ctx, batch)
+}
+
+// Close drains any buffered messages, stops the linger timer, and prevents
+// further Send calls. Returns the error from the final flush (or nil).
+func (p *BufferedProducer) Close(ctx context.Context) error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
+	batch := p.buf
+	p.buf = nil
+	p.stopTimerLocked()
+	p.mu.Unlock()
+
+	p.bgCancel()
+
+	if len(batch) == 0 {
+		return nil
+	}
+	return p.send(ctx, batch)
+}
+
+func (p *BufferedProducer) flushFromTimer() {
+	if err := p.Flush(p.bgCtx); err != nil {
+		p.mu.Lock()
+		if p.asyncErr == nil {
+			p.asyncErr = err
+		}
+		p.mu.Unlock()
+	}
+}
+
+func (p *BufferedProducer) send(ctx context.Context, batch []*pb.ProduceMessage) error {
+	_, err := p.client.ProduceBatch(ctx, p.topic, batch)
+	return err
+}
+
+func (p *BufferedProducer) stopTimerLocked() {
+	if p.timer != nil {
+		p.timer.Stop()
+		p.timer = nil
+	}
 }

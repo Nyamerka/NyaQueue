@@ -2,6 +2,7 @@ package broker
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -73,4 +74,52 @@ func (s *OffsetStoreSuite) TestCommitFloorEmpty() {
 	floor, err := store.CommitFloor("nonexistent", 0)
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), int64(0), floor)
+}
+
+func (s *OffsetStoreSuite) TestDumpMode() {
+	dir := s.T().TempDir()
+	store, err := NewOffsetStore(dir, 50*time.Millisecond)
+	require.NoError(s.T(), err)
+
+	require.NoError(s.T(), store.Commit("g1", "t", 0, 100))
+	require.NoError(s.T(), store.Commit("g2", "t", 0, 200))
+
+	got, err := store.Load("g1", "t", 0)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), int64(100), got)
+
+	floor, err := store.CommitFloor("t", 0)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), int64(100), floor)
+
+	store.Close()
+
+	store2, err := NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+	defer store2.Close()
+
+	got, err = store2.Load("g1", "t", 0)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), int64(100), got)
+
+	got, err = store2.Load("g2", "t", 0)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), int64(200), got)
+}
+
+func (s *OffsetStoreSuite) TestCacheWarmup() {
+	dir := s.T().TempDir()
+
+	store, err := NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+	require.NoError(s.T(), store.Commit("g1", "t", 0, 42))
+	store.Close()
+
+	store2, err := NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+	defer store2.Close()
+
+	got, err := store2.Load("g1", "t", 0)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), int64(42), got)
 }

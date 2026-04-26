@@ -43,6 +43,14 @@ func (mc *MetricsCollector) RecordProduce(_ string, partition int) {
 	mc.partProduces[partition].Add(1)
 }
 
+func (mc *MetricsCollector) RecordProduceBatch(_ string, partition int, n int) {
+	atomic.AddInt64(&mc.produceCount, int64(n))
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	mc.ensurePartCountersLocked(partition + 1)
+	mc.partProduces[partition].Add(int64(n))
+}
+
 func (mc *MetricsCollector) RecordConsume(_ string, partition int) {
 	atomic.AddInt64(&mc.consumeCount, 1)
 	mc.mu.Lock()

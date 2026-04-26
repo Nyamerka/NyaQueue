@@ -82,6 +82,35 @@ func (s *MessageSuite) TestUnmarshalErrors() {
 	}
 }
 
+func (s *MessageSuite) TestMarshalPooled() {
+	msg := NewMessage(5, []byte("key-pooled"), []byte("value-pooled"))
+	pooled := msg.MarshalPooled()
+	regular := msg.Marshal()
+
+	require.Equal(s.T(), regular, pooled)
+
+	restored, err := UnmarshalMessage(pooled)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), uint8(5), restored.Header.Priority)
+	require.Equal(s.T(), []byte("key-pooled"), restored.Key)
+	require.Equal(s.T(), []byte("value-pooled"), restored.Value)
+
+	ReleaseMarshalBuf(pooled)
+}
+
+func (s *MessageSuite) TestMarshalPooledReuse() {
+	msg := NewMessage(0, []byte("k"), []byte("v"))
+
+	buf1 := msg.MarshalPooled()
+	copy1 := make([]byte, len(buf1))
+	copy(copy1, buf1)
+	ReleaseMarshalBuf(buf1)
+
+	buf2 := msg.MarshalPooled()
+	require.Equal(s.T(), copy1, buf2)
+	ReleaseMarshalBuf(buf2)
+}
+
 func (s *MessageSuite) TestNewMessageTimestamp() {
 	before := time.Now().UnixNano()
 	msg := NewMessage(0, nil, nil)

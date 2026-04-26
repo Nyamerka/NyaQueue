@@ -59,27 +59,55 @@ func NewPartition(id int, topicName, dataDir string, mode ScheduleMode, syncPoli
 
 func (p *Partition) ID() int { return p.id }
 
-// Append writes a message to the WAL and returns its offset.
-// If the partition uses priority scheduling, the offset is added to the PriorityIndex.
+// Append writes a single message to the WAL and returns its offset.
 func (p *Partition) Append(msg *Message) (uint64, error) {
-	data := msg.Marshal()
+	offsets, err := p.AppendBatch([]*Message{msg})
+	if err != nil {
+		return 0, err
+	}
+	return offsets[0], nil
+}
+
+// AppendBatch writes a slice of messages to the WAL in a single WriteBatch
+// call, removing per-message fsync overhead. Returns the offsets assigned to
+// each message.
+func (p *Partition) AppendBatch(msgs []*Message) ([]uint64, error) {
+	if len(msgs) == 0 {
+		return nil, nil
+	}
+
+	var batch wal.Batch
+	offsets := make([]uint64, len(msgs))
+	buffers := make([][]byte, len(msgs))
 
 	p.mu.Lock()
-	offset := p.nextOffset
-	err := p.log.Write(offset, data)
-	if err != nil {
-		p.mu.Unlock()
-		return 0, oops.Wrapf(err, "WAL write")
+	for i, msg := range msgs {
+		offsets[i] = p.nextOffset
+		buffers[i] = msg.MarshalPooled()
+		batch.Write(p.nextOffset, buffers[i])
+		p.nextOffset++
 	}
-	p.nextOffset++
+
+	err := p.log.WriteBatch(&batch)
 	pi := p.priorityIndex
 	p.mu.Unlock()
 
-	if pi != nil {
-		pi.Add(int(msg.Header.Priority), int64(offset), time.Now())
+	for _, buf := range buffers {
+		ReleaseMarshalBuf(buf)
 	}
 
-	return offset, nil
+	if err != nil {
+		return nil, oops.Wrapf(err, "WAL write batch")
+	}
+
+	if pi != nil {
+		now := time.Now()
+		for i, msg := range msgs {
+			pi.Add(int(msg.Header.Priority), int64(offsets[i]), now)
+		}
+	}
+
+	return offsets, nil
 }
 
 func (p *Partition) Read(offset uint64) (*Message, error) {

@@ -65,6 +65,10 @@ func (h *KafkaHarness) CreateTopic(ctx context.Context, name string, partitions 
 }
 
 func (h *KafkaHarness) Produce(ctx context.Context, topic string, key, value []byte) error {
+	return h.ProduceBatch(ctx, topic, []kafka.Message{{Key: key, Value: value}})
+}
+
+func (h *KafkaHarness) ProduceBatch(ctx context.Context, topic string, msgs []kafka.Message) error {
 	w, ok := h.writers[topic]
 	if !ok {
 		w = &kafka.Writer{
@@ -77,10 +81,7 @@ func (h *KafkaHarness) Produce(ctx context.Context, topic string, key, value []b
 		h.writers[topic] = w
 	}
 
-	return w.WriteMessages(ctx, kafka.Message{
-		Key:   key,
-		Value: value,
-	})
+	return w.WriteMessages(ctx, msgs...)
 }
 
 func (h *KafkaHarness) Consume(ctx context.Context, topic, group string, partition int, maxBytes int) ([]Message, error) {

@@ -27,6 +27,7 @@ type ProduceRequest struct {
 	Key           []byte                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
 	Value         []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
 	Priority      uint32                 `protobuf:"varint,4,opt,name=priority,proto3" json:"priority,omitempty"`
+	Messages      []*ProduceMessage      `protobuf:"bytes,5,rep,name=messages,proto3" json:"messages,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -87,6 +88,13 @@ func (x *ProduceRequest) GetPriority() uint32 {
 		return x.Priority
 	}
 	return 0
+}
+
+func (x *ProduceRequest) GetMessages() []*ProduceMessage {
+	if x != nil {
+		return x.Messages
+	}
+	return nil
 }
 
 type ConsumeRequest struct {
@@ -405,12 +413,13 @@ var File_request_proto protoreflect.FileDescriptor
 
 const file_request_proto_rawDesc = "" +
 	"\n" +
-	"\rrequest.proto\x12\bnyaqueue\x1a\vmodel.proto\"j\n" +
+	"\rrequest.proto\x12\bnyaqueue\x1a\vmodel.proto\"\xa0\x01\n" +
 	"\x0eProduceRequest\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x12\x1a\n" +
-	"\bpriority\x18\x04 \x01(\rR\bpriority\"w\n" +
+	"\bpriority\x18\x04 \x01(\rR\bpriority\x124\n" +
+	"\bmessages\x18\x05 \x03(\v2\x18.nyaqueue.ProduceMessageR\bmessages\"w\n" +
 	"\x0eConsumeRequest\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x14\n" +
 	"\x05group\x18\x02 \x01(\tR\x05group\x12\x1c\n" +
@@ -451,15 +460,17 @@ var file_request_proto_goTypes = []any{
 	(*DeleteTopicRequest)(nil),  // 4: nyaqueue.DeleteTopicRequest
 	(*ListTopicsRequest)(nil),   // 5: nyaqueue.ListTopicsRequest
 	(*MetricsRequest)(nil),      // 6: nyaqueue.MetricsRequest
-	(*TopicScheduleConfig)(nil), // 7: nyaqueue.TopicScheduleConfig
+	(*ProduceMessage)(nil),      // 7: nyaqueue.ProduceMessage
+	(*TopicScheduleConfig)(nil), // 8: nyaqueue.TopicScheduleConfig
 }
 var file_request_proto_depIdxs = []int32{
-	7, // 0: nyaqueue.CreateTopicRequest.schedule_config:type_name -> nyaqueue.TopicScheduleConfig
-	1, // [1:1] is the sub-list for method output_type
-	1, // [1:1] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	7, // 0: nyaqueue.ProduceRequest.messages:type_name -> nyaqueue.ProduceMessage
+	8, // 1: nyaqueue.CreateTopicRequest.schedule_config:type_name -> nyaqueue.TopicScheduleConfig
+	2, // [2:2] is the sub-list for method output_type
+	2, // [2:2] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_request_proto_init() }

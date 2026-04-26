@@ -175,6 +175,76 @@ func (b *Broker) Publish(topicName string, msg *Message) (partition int, offset 
 	return partIdx, offset, nil
 }
 
+type PublishResult struct {
+	Partition int
+	Offset    uint64
+	Err       error
+}
+
+func (b *Broker) PublishBatch(topicName string, msgs []*Message) []PublishResult {
+	results := make([]PublishResult, len(msgs))
+
+	b.mu.RLock()
+	t, exists := b.topics[topicName]
+	bal := b.balancer
+	bp := b.backpressure
+	b.mu.RUnlock()
+
+	if !exists {
+		for i := range results {
+			results[i].Err = oops.Errorf("topic %q not found", topicName)
+		}
+		return results
+	}
+
+	numParts := t.NumPartitions()
+
+	type indexed struct {
+		msg *Message
+		idx int
+	}
+	groups := make(map[int][]indexed, numParts)
+
+	for i, msg := range msgs {
+		partIdx := bal.SelectPartition(topicName, msg.Key, numParts)
+		results[i].Partition = partIdx
+
+		if bp != nil && bp.Check(partIdx) == BPClosed {
+			results[i].Err = ErrThrottled
+			continue
+		}
+		groups[partIdx] = append(groups[partIdx], indexed{msg, i})
+	}
+
+	for partIdx, batch := range groups {
+		p, err := t.Partition(partIdx)
+		if err != nil {
+			for _, item := range batch {
+				results[item.idx].Err = err
+			}
+			continue
+		}
+
+		batchMsgs := make([]*Message, len(batch))
+		for j, item := range batch {
+			batchMsgs[j] = item.msg
+		}
+
+		offsets, err := p.AppendBatch(batchMsgs)
+		for j, item := range batch {
+			if err != nil {
+				results[item.idx].Err = err
+			} else {
+				results[item.idx].Offset = offsets[j]
+			}
+		}
+
+		b.metrics.RecordProduceBatch(topicName, partIdx, len(batch))
+	}
+
+	return results
+}
+
 func (b *Broker) Consume(topicName, group string, partIdx int) (*Message, uint64, error) {
 	b.mu.RLock()
 	t, exists := b.topics[topicName]
