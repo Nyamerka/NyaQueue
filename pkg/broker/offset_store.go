@@ -122,6 +122,28 @@ func (s *OffsetStore) CommitFloor(topic string, partition int) (int64, error) {
 	return minOffset, nil
 }
 
+func (s *OffsetStore) DeleteTopic(topic string) {
+	prefix := topic + "/"
+	var keys []string
+	s.cache.Range(func(k, _ any) bool {
+		if strings.HasPrefix(k.(string), prefix) {
+			keys = append(keys, k.(string))
+		}
+		return true
+	})
+	for _, k := range keys {
+		s.cache.Delete(k)
+	}
+
+	_ = s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(offsetsBucket)
+		for _, k := range keys {
+			_ = b.Delete([]byte(k))
+		}
+		return nil
+	})
+}
+
 func (s *OffsetStore) writeOne(key string, offset int64) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(offsetsBucket)

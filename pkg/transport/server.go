@@ -125,7 +125,7 @@ func allFailed(results []broker.PublishResult) bool {
 }
 
 func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.ConsumeResponse, error) {
-	msg, offset, err := s.broker.Consume(req.Topic, req.Group, int(req.Partition))
+	msg, nextOffset, err := s.broker.Consume(req.Topic, req.Group, int(req.Partition))
 	if err != nil {
 		if errors.Is(err, broker.ErrNoMessages) {
 			return &pb.ConsumeResponse{}, nil
@@ -134,7 +134,7 @@ func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.Consume
 	}
 
 	env := &pb.MessageEnvelope{
-		Offset:    int64(offset),
+		Offset:    int64(nextOffset) - 1,
 		Key:       msg.Key,
 		Value:     msg.Value,
 		Priority:  uint32(msg.Header.Priority),

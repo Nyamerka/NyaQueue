@@ -3,6 +3,8 @@ package broker
 import (
 	"errors"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -114,7 +116,20 @@ func (b *Broker) DeleteTopic(name string) error {
 	}
 	delete(b.topics, name)
 	delete(b.schedulers, name)
-	return t.Close()
+
+	if err := t.Close(); err != nil {
+		return err
+	}
+
+	if err := os.RemoveAll(filepath.Join(b.dataDir, name)); err != nil {
+		return oops.Wrapf(err, "remove topic data dir %q", name)
+	}
+
+	if b.offsetStore != nil {
+		b.offsetStore.DeleteTopic(name)
+	}
+
+	return nil
 }
 
 func (b *Broker) GetTopic(name string) (*Topic, error) {
