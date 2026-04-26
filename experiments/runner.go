@@ -34,6 +34,7 @@ type Runner struct {
 	Modes        []Mode
 	KafkaBrokers []string
 	Duration     time.Duration // override scenario duration if > 0
+	BrokerAddr string
 }
 
 // RunAll executes every (scenario, algorithm, mode) combination and returns results.
@@ -82,11 +83,21 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		BrokerConfig: broker.DefaultConfig(),
 		DataDir:      dataDir,
 		Algorithm:    alg,
+		BrokerAddr:   r.BrokerAddr,
 	})
 	if err != nil {
 		return ExperimentResult{}, err
 	}
 	defer h.Close()
+
+	if h.IsExternal() {
+		cleanCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if delErr := h.DeleteTopic(cleanCtx, expTopic); delErr != nil && !errors.Is(delErr, broker.ErrTopicNotFound) {
+			cancel()
+			return ExperimentResult{}, oops.Wrapf(delErr, "delete stale topic")
+		}
+		cancel()
+	}
 
 	topicCfg := topicConfigFor(sc)
 	topicCfg.ScheduleMode = alg.Mode
@@ -94,6 +105,7 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	if err := h.CreateTopic(ctx, expTopic, topicCfg); err != nil {
 		return ExperimentResult{}, oops.Wrapf(err, "create topic")
 	}
+	
 	if brk := h.Broker(); brk != nil {
 		brk.SetScheduler(expTopic, alg.NewScheduler())
 	}

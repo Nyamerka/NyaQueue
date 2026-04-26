@@ -42,10 +42,11 @@ func (m Mode) String() string {
 
 // Harness abstracts the target system (NyaQueue in-process, NyaQueue gRPC, or Kafka).
 type Harness struct {
-	mode Mode
-	app  *app.BrokerApp
-	grpc *transport.Client
-	kfk  *kafkadriver.KafkaHarness
+	mode     Mode
+	app      *app.BrokerApp
+	grpc     *transport.Client
+	kfk      *kafkadriver.KafkaHarness
+	external bool // true when grpc connects to an external broker (not a local one)
 }
 
 // HarnessConfig describes how to create a harness.
@@ -55,6 +56,7 @@ type HarnessConfig struct {
 	DataDir      string
 	Algorithm    AlgorithmConfig
 	KafkaBrokers []string
+	BrokerAddr string
 }
 
 // NewHarness creates and starts the target system.
@@ -75,24 +77,34 @@ func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 		h.app = a
 
 	case ModeGRPC:
-		a, err := app.New(cfg.BrokerConfig, cfg.DataDir,
-			app.WithBalancerFactory(cfg.Algorithm.NewBalancer),
-			app.WithGRPC(":0"),
-		)
-		if err != nil {
-			return nil, oops.Wrapf(err, "app new")
-		}
-		if err := a.Start(); err != nil {
-			return nil, oops.Wrapf(err, "app start")
-		}
-		h.app = a
+		if cfg.BrokerAddr != "" {
+			client, err := transport.NewClient(cfg.BrokerAddr)
+			if err != nil {
+				return nil, oops.Wrapf(err, "grpc client to %s", cfg.BrokerAddr)
+			}
+			h.grpc = client
+			h.external = true
+		} else {
+			// Local broker with gRPC: loopback connection inside the same process.
+			a, err := app.New(cfg.BrokerConfig, cfg.DataDir,
+				app.WithBalancerFactory(cfg.Algorithm.NewBalancer),
+				app.WithGRPC(":0"),
+			)
+			if err != nil {
+				return nil, oops.Wrapf(err, "app new")
+			}
+			if err := a.Start(); err != nil {
+				return nil, oops.Wrapf(err, "app start")
+			}
+			h.app = a
 
-		client, err := transport.NewClient(a.Addr())
-		if err != nil {
-			a.Stop()
-			return nil, oops.Wrapf(err, "grpc client")
+			client, err := transport.NewClient(a.Addr())
+			if err != nil {
+				a.Stop()
+				return nil, oops.Wrapf(err, "grpc client")
+			}
+			h.grpc = client
 		}
-		h.grpc = client
 
 	case ModeKafka:
 		h.kfk = kafkadriver.New(cfg.KafkaBrokers)
@@ -102,6 +114,10 @@ func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 	}
 
 	return h, nil
+}
+
+func (h *Harness) IsExternal() bool {
+	return h.external || h.mode == ModeKafka
 }
 
 // Broker returns the in-process broker (nil for Kafka mode).
@@ -114,14 +130,41 @@ func (h *Harness) Broker() *broker.Broker {
 
 func (h *Harness) CreateTopic(ctx context.Context, topic string, cfg broker.TopicConfig) error {
 	switch h.mode {
-	case ModeInProcess, ModeGRPC:
-		brk := h.Broker()
-		if brk == nil {
-			return oops.Errorf("broker not initialised")
+	case ModeInProcess:
+		return h.app.Broker().CreateTopic(topic, cfg)
+	case ModeGRPC:
+		if h.external {
+			mode := pb.ScheduleMode_FIFO
+			switch cfg.ScheduleMode {
+			case broker.ModeStrictPriority:
+				mode = pb.ScheduleMode_STRICT_PRIORITY
+			case broker.ModeDQNAdaptive:
+				mode = pb.ScheduleMode_DQN_ADAPTIVE
+			}
+			return h.grpc.CreateTopic(ctx, topic, int32(cfg.NumPartitions), mode)
 		}
-		return brk.CreateTopic(topic, cfg)
+		return h.app.Broker().CreateTopic(topic, cfg)
 	case ModeKafka:
 		return h.kfk.CreateTopic(ctx, topic, cfg.NumPartitions)
+	}
+	return oops.Errorf("unsupported mode")
+}
+
+// DeleteTopic removes a topic. Used between runs when connecting to an
+// external broker to avoid ErrTopicAlreadyExists on the next CreateTopic call.
+func (h *Harness) DeleteTopic(ctx context.Context, topic string) error {
+	switch h.mode {
+	case ModeInProcess:
+		return h.app.Broker().DeleteTopic(topic)
+	case ModeGRPC:
+		if h.external {
+			return h.grpc.DeleteTopic(ctx, topic)
+		}
+		return h.app.Broker().DeleteTopic(topic)
+	case ModeKafka:
+		// Kafka topics are not deleted between runs — consumers re-read from
+		// the committed offset, so stale messages are never visible.
+		return nil
 	}
 	return oops.Errorf("unsupported mode")
 }

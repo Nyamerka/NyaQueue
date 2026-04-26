@@ -26,6 +26,7 @@ func main() {
 	fs.String("experiment.scenarios", "all", "comma-separated scenarios or 'all'")
 	fs.String("experiment.algorithms", "all", "comma-separated algorithms or 'all'")
 	fs.String("experiment.kafka_brokers", "localhost:9092", "kafka broker addresses")
+	fs.String("experiment.broker_addr", "", "external NyaQueue broker address for grpc mode (e.g. broker:9090)")
 	fs.String("experiment.output", "experiments/results", "output directory for results")
 	fs.String("experiment.duration", "", "per-scenario duration (e.g. 30s)")
 	_ = fs.Parse(os.Args[1:])
@@ -39,6 +40,7 @@ func main() {
 	scenarioStr := k.String("experiment.scenarios")
 	algorithmStr := k.String("experiment.algorithms")
 	kafkaBrokersStr := k.String("experiment.kafka_brokers")
+	brokerAddr := k.String("experiment.broker_addr")
 	outputDir := k.String("experiment.output")
 	durationStr := k.String("experiment.duration")
 	duration := 10 * time.Second
@@ -67,6 +69,7 @@ func main() {
 		Algorithms:   algorithms,
 		Modes:        modes,
 		KafkaBrokers: strings.Split(kafkaBrokersStr, ","),
+		BrokerAddr:   brokerAddr,
 		Duration:     duration,
 	}
 

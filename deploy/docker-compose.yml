@@ -97,13 +97,15 @@ services:
       dockerfile: deploy/Dockerfile
       target: experiment
     command:
-      - "--experiment.mode=inprocess,kafka"
+      - "--experiment.mode=inprocess,grpc,kafka"
       - "--experiment.scenarios=all"
       - "--experiment.algorithms=all"
       - "--experiment.kafka_brokers=kafka:9092"
+      - "--experiment.broker_addr=broker:9090"
       - "--experiment.duration=30s"
       - "--experiment.output=/results"
     depends_on:
+      - broker
       - kafka
     volumes:
       - ./results:/results
