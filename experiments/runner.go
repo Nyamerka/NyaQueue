@@ -88,6 +88,7 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	defer h.Close()
 
 	topicCfg := topicConfigFor(sc)
+	topicCfg.ScheduleMode = alg.Mode
 
 	if err := h.CreateTopic(ctx, expTopic, topicCfg); err != nil {
 		return ExperimentResult{}, oops.Wrapf(err, "create topic")

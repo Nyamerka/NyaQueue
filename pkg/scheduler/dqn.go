@@ -117,7 +117,7 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 
 	entry, ok := pi.PopWithThreshold(threshold)
 	if !ok {
-		return nil, consumerOffset, oops.Errorf("no pending messages")
+		return nil, consumerOffset, broker.ErrNoMessages
 	}
 
 	msg, err := partition.Read(uint64(entry.WalOffset))
@@ -161,7 +161,7 @@ func (d *DQNScheduler) SetFallbackFIFO(on bool) {
 func (d *DQNScheduler) fifoFallback(partition *broker.Partition, consumerOffset uint64) (*broker.Message, uint64, error) {
 	hwm := partition.HighWaterMark()
 	if consumerOffset > hwm {
-		return nil, consumerOffset, oops.Errorf("no new messages")
+		return nil, consumerOffset, broker.ErrNoMessages
 	}
 	msg, err := partition.Read(consumerOffset)
 	if err != nil {

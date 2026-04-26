@@ -12,6 +12,7 @@ import (
 var (
 	ErrTopicAlreadyExists = errors.New("topic already exists")
 	ErrTopicNotFound      = errors.New("topic not found")
+	ErrNoMessages = errors.New("no messages available")
 )
 
 type Balancer interface {

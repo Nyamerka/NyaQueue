@@ -150,7 +150,10 @@ func (h *Harness) Consume(ctx context.Context, topic, group string, partition in
 		brk := h.app.Broker()
 		msg, nextOffset, err := brk.Consume(topic, group, partition)
 		if err != nil {
-			return nil, ErrNoMessage
+			if errors.Is(err, broker.ErrNoMessages) {
+				return nil, ErrNoMessage
+			}
+			return nil, oops.Wrapf(err, "consume")
 		}
 		if err := brk.Commit(group, topic, partition, int64(nextOffset)); err != nil {
 			return nil, oops.Wrapf(err, "commit")
@@ -160,6 +163,9 @@ func (h *Harness) Consume(ctx context.Context, topic, group string, partition in
 	case ModeGRPC:
 		msgs, err := h.grpc.Consume(ctx, topic, group, int32(partition), grpcMaxFetchBytes)
 		if err != nil {
+			if errors.Is(err, broker.ErrNoMessages) {
+				return nil, ErrNoMessage
+			}
 			return nil, oops.Wrapf(err, "grpc consume")
 		}
 		if len(msgs) == 0 {

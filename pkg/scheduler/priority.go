@@ -19,7 +19,7 @@ func (s *StrictPriority) Next(partition *broker.Partition, _ uint64) (*broker.Me
 
 	entry, ok := pi.PopHighest()
 	if !ok {
-		return nil, 0, oops.Errorf("no pending messages")
+		return nil, 0, broker.ErrNoMessages
 	}
 
 	msg, err := partition.Read(uint64(entry.WalOffset))

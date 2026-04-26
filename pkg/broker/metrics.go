@@ -87,17 +87,25 @@ func (mc *MetricsCollector) Collect() Metrics {
 	var depths []int
 	for _, t := range topics {
 		for _, p := range t.Partitions() {
-			hwm := float64(p.HighWaterMark())
+			pID := p.ID()
+
+			mc.mu.Lock()
+			var produces, consumes int64
+			if pID < len(mc.partProduces) {
+				produces = mc.partProduces[pID].Load()
+				consumes = mc.partConsumes[pID].Load()
+			}
+			mc.mu.Unlock()
+
+			pending := produces - consumes
+			if pending < 0 {
+				pending = 0
+			}
+			depths = append(depths, int(pending))
+
 			load := 0.0
-			if hwm > 0 {
-				depth := p.QueueDepth()
-				load = float64(depth) / hwm
-				if load > 1 {
-					load = 1
-				}
-				depths = append(depths, depth)
-			} else {
-				depths = append(depths, 0)
+			if produces > 0 {
+				load = float64(pending) / float64(produces)
 			}
 			loads = append(loads, load)
 		}

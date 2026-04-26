@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"net"
 	"time"
 
@@ -75,6 +76,9 @@ func (s *Server) Produce(_ context.Context, req *pb.ProduceRequest) (*pb.Produce
 func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.ConsumeResponse, error) {
 	msg, offset, err := s.broker.Consume(req.Topic, req.Group, int(req.Partition))
 	if err != nil {
+		if errors.Is(err, broker.ErrNoMessages) {
+			return &pb.ConsumeResponse{}, nil
+		}
 		return nil, err
 	}
 
