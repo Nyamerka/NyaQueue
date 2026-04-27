@@ -150,8 +150,7 @@ func (h *Harness) CreateTopic(ctx context.Context, topic string, cfg broker.Topi
 	return oops.Errorf("unsupported mode")
 }
 
-// DeleteTopic removes a topic. Used between runs when connecting to an
-// external broker to avoid ErrTopicAlreadyExists on the next CreateTopic call.
+// DeleteTopic removes a topic. Used between runs to ensure each experiment starts with a clean topic state.
 func (h *Harness) DeleteTopic(ctx context.Context, topic string) error {
 	switch h.mode {
 	case ModeInProcess:
@@ -162,9 +161,11 @@ func (h *Harness) DeleteTopic(ctx context.Context, topic string) error {
 		}
 		return h.app.Broker().DeleteTopic(topic)
 	case ModeKafka:
-		// Kafka topics are not deleted between runs — consumers re-read from
-		// the committed offset, so stale messages are never visible.
-		return nil
+		err := h.kfk.DeleteTopic(ctx, topic)
+		if errors.Is(err, kafkadriver.ErrTopicNotFound) {
+			return broker.ErrTopicNotFound
+		}
+		return err
 	}
 	return oops.Errorf("unsupported mode")
 }

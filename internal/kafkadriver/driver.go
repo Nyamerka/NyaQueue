@@ -2,6 +2,7 @@ package kafkadriver
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strconv"
 	"time"
@@ -9,6 +10,10 @@ import (
 	"github.com/samber/oops"
 	"github.com/segmentio/kafka-go"
 )
+
+// ErrTopicNotFound is returned by DeleteTopic when the topic does not exist on
+// the broker. Callers can use errors.Is to skip first-run cleanup gracefully.
+var ErrTopicNotFound = oops.Errorf("kafka: topic not found")
 
 // Message mirrors the minimal fields needed by experiments.
 type Message struct {
@@ -62,6 +67,47 @@ func (h *KafkaHarness) CreateTopic(ctx context.Context, name string, partitions 
 		NumPartitions:     partitions,
 		ReplicationFactor: 1,
 	})
+}
+
+func (h *KafkaHarness) DeleteTopic(ctx context.Context, name string) error {
+	conn, err := kafka.DialContext(ctx, "tcp", h.brokers[0])
+	if err != nil {
+		return oops.Wrapf(err, "dial")
+	}
+	defer conn.Close()
+
+	controller, err := conn.Controller()
+	if err != nil {
+		return oops.Wrapf(err, "controller")
+	}
+
+	controllerConn, err := kafka.Dial("tcp", net.JoinHostPort(controller.Host, strconv.Itoa(controller.Port)))
+	if err != nil {
+		return oops.Wrapf(err, "dial controller")
+	}
+	defer controllerConn.Close()
+
+	if err := controllerConn.DeleteTopics(name); err != nil {
+		var kerr kafka.Error
+		if errors.As(err, &kerr) && kerr == kafka.UnknownTopicOrPartition {
+			return ErrTopicNotFound
+		}
+		return oops.Wrapf(err, "delete kafka topic %q", name)
+	}
+
+	// Drop cached writers/readers so the next run reconnects with fresh metadata.
+	if w, ok := h.writers[name]; ok {
+		_ = w.Close()
+		delete(h.writers, name)
+	}
+	for k, r := range h.readers {
+		if k.topic == name {
+			_ = r.Close()
+			delete(h.readers, k)
+		}
+	}
+
+	return nil
 }
 
 func (h *KafkaHarness) Produce(ctx context.Context, topic string, key, value []byte) error {

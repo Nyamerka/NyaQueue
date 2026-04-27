@@ -24,7 +24,7 @@ const (
 	drainGracePeriod     = 500 * time.Millisecond
 	defaultMsgSize       = 256
 	expGroup             = "exp-group"
-	expTopic             = "bench"
+	expTopic = "nyaqueue-experiment"
 )
 
 // Runner orchestrates experiment runs across scenarios and algorithms.
@@ -130,6 +130,13 @@ func (r *Runner) runKafka(ctx context.Context, sc benchmarks.Scenario, dur time.
 		return ExperimentResult{}, err
 	}
 	defer h.Close()
+
+	cleanCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	if delErr := h.DeleteTopic(cleanCtx, expTopic); delErr != nil && !errors.Is(delErr, broker.ErrTopicNotFound) {
+		cancel()
+		return ExperimentResult{}, oops.Wrapf(delErr, "delete stale kafka topic")
+	}
+	cancel()
 
 	topicCfg := topicConfigFor(sc)
 	if err := h.CreateTopic(ctx, expTopic, topicCfg); err != nil {
