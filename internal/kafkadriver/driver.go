@@ -5,17 +5,15 @@ import (
 	"errors"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/samber/oops"
 	"github.com/segmentio/kafka-go"
 )
 
-// ErrTopicNotFound is returned by DeleteTopic when the topic does not exist on
-// the broker. Callers can use errors.Is to skip first-run cleanup gracefully.
 var ErrTopicNotFound = oops.Errorf("kafka: topic not found")
 
-// Message mirrors the minimal fields needed by experiments.
 type Message struct {
 	Key      []byte
 	Value    []byte
@@ -23,9 +21,10 @@ type Message struct {
 	Priority uint8
 }
 
-// KafkaHarness wraps segmentio/kafka-go for comparison experiments.
 type KafkaHarness struct {
 	brokers []string
+
+	mu      sync.RWMutex
 	writers map[string]*kafka.Writer
 	readers map[readerKey]*kafka.Reader
 }
@@ -69,6 +68,8 @@ func (h *KafkaHarness) CreateTopic(ctx context.Context, name string, partitions 
 	})
 }
 
+// DeleteTopic removes a topic from Kafka. Returns ErrTopicNotFound when the
+// topic does not exist so callers can skip first-run cleanup.
 func (h *KafkaHarness) DeleteTopic(ctx context.Context, name string) error {
 	conn, err := kafka.DialContext(ctx, "tcp", h.brokers[0])
 	if err != nil {
@@ -95,7 +96,7 @@ func (h *KafkaHarness) DeleteTopic(ctx context.Context, name string) error {
 		return oops.Wrapf(err, "delete kafka topic %q", name)
 	}
 
-	// Drop cached writers/readers so the next run reconnects with fresh metadata.
+	h.mu.Lock()
 	if w, ok := h.writers[name]; ok {
 		_ = w.Close()
 		delete(h.writers, name)
@@ -106,6 +107,7 @@ func (h *KafkaHarness) DeleteTopic(ctx context.Context, name string) error {
 			delete(h.readers, k)
 		}
 	}
+	h.mu.Unlock()
 
 	return nil
 }
@@ -115,36 +117,36 @@ func (h *KafkaHarness) Produce(ctx context.Context, topic string, key, value []b
 }
 
 func (h *KafkaHarness) ProduceBatch(ctx context.Context, topic string, msgs []kafka.Message) error {
-	w, ok := h.writers[topic]
-	if !ok {
-		w = &kafka.Writer{
-			Addr:         kafka.TCP(h.brokers...),
-			Topic:        topic,
-			Balancer:     &kafka.RoundRobin{},
-			BatchTimeout: 10 * time.Millisecond,
-			BatchSize:    100,
-			RequiredAcks: kafka.RequireOne,
-		}
-		h.writers[topic] = w
-	}
+	return h.writerFor(topic).WriteMessages(ctx, msgs...)
+}
 
-	return w.WriteMessages(ctx, msgs...)
+func (h *KafkaHarness) writerFor(topic string) *kafka.Writer {
+	h.mu.RLock()
+	if w, ok := h.writers[topic]; ok {
+		h.mu.RUnlock()
+		return w
+	}
+	h.mu.RUnlock()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if w, ok := h.writers[topic]; ok {
+		return w
+	}
+	w := &kafka.Writer{
+		Addr:         kafka.TCP(h.brokers...),
+		Topic:        topic,
+		Balancer:     &kafka.RoundRobin{},
+		BatchTimeout: 10 * time.Millisecond,
+		BatchSize:    100,
+		RequiredAcks: kafka.RequireOne,
+	}
+	h.writers[topic] = w
+	return w
 }
 
 func (h *KafkaHarness) Consume(ctx context.Context, topic, group string, partition int, maxBytes int) ([]Message, error) {
-	rk := readerKey{topic: topic, group: group, partition: partition}
-	r, ok := h.readers[rk]
-	if !ok {
-		r = kafka.NewReader(kafka.ReaderConfig{
-			Brokers:   h.brokers,
-			Topic:     topic,
-			GroupID:   group,
-			Partition: partition,
-			MaxBytes:  maxBytes,
-			MaxWait:   10 * time.Millisecond,
-		})
-		h.readers[rk] = r
-	}
+	r := h.readerFor(topic, group, partition, maxBytes)
 
 	msg, err := r.ReadMessage(ctx)
 	if err != nil {
@@ -157,7 +159,37 @@ func (h *KafkaHarness) Consume(ctx context.Context, topic, group string, partiti
 	}}, nil
 }
 
+func (h *KafkaHarness) readerFor(topic, group string, partition, maxBytes int) *kafka.Reader {
+	rk := readerKey{topic: topic, group: group, partition: partition}
+
+	h.mu.RLock()
+	if r, ok := h.readers[rk]; ok {
+		h.mu.RUnlock()
+		return r
+	}
+	h.mu.RUnlock()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if r, ok := h.readers[rk]; ok {
+		return r
+	}
+	r := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:     h.brokers,
+		Topic:       topic,
+		Partition:   partition,
+		MaxBytes:    maxBytes,
+		MaxWait:     10 * time.Millisecond,
+		StartOffset: kafka.FirstOffset,
+	})
+	h.readers[rk] = r
+	return r
+}
+
 func (h *KafkaHarness) Close() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
 	for _, w := range h.writers {
 		w.Close()
 	}
