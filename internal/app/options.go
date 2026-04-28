@@ -48,6 +48,13 @@ func WithGRPC(addr string) Option {
 	}
 }
 
+// WithHTTP enables HTTP REST transport on the given address.
+func WithHTTP(addr string) Option {
+	return func(a *BrokerApp) {
+		a.httpAddr = addr
+	}
+}
+
 // WithLoadPredictor enables the LSTM-based load predictor that feeds
 // predicted partition loads into the DQN balancer and backpressure controller.
 func WithLoadPredictor(window, horizon int, interval time.Duration) Option {

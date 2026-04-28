@@ -137,8 +137,8 @@ func (h *KafkaHarness) writerFor(topic string) *kafka.Writer {
 		Addr:         kafka.TCP(h.brokers...),
 		Topic:        topic,
 		Balancer:     &kafka.RoundRobin{},
-		BatchTimeout: 10 * time.Millisecond,
-		BatchSize:    100,
+		BatchTimeout: 5 * time.Millisecond,
+		BatchSize:    16,
 		RequiredAcks: kafka.RequireOne,
 	}
 	h.writers[topic] = w

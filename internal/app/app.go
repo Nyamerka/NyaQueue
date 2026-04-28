@@ -38,6 +38,7 @@ type BrokerApp struct {
 	balancerFactory func() broker.Balancer
 	schedulers      map[string]broker.Scheduler
 	grpcAddr        string
+	httpAddr        string
 	metricsInterval time.Duration
 
 	loadPredictorCfg *loadPredictorConfig
@@ -47,6 +48,7 @@ type BrokerApp struct {
 	broker        *broker.Broker
 	offsetStore   *broker.OffsetStore
 	server        *transport.Server
+	httpServer    *transport.HTTPServer
 	loadPredictor *broker.LoadPredictor
 	opt           *optimizer.Optimizer
 }
@@ -145,11 +147,22 @@ func (a *BrokerApp) Start() error {
 			return oops.Wrapf(err, "grpc start")
 		}
 	}
+
+	if a.httpAddr != "" {
+		a.httpServer = transport.NewHTTPServer(a.broker)
+		if err := a.httpServer.Start(a.httpAddr); err != nil {
+			return oops.Wrapf(err, "http start")
+		}
+	}
+
 	return nil
 }
 
 // Stop gracefully shuts down all components.
 func (a *BrokerApp) Stop() {
+	if a.httpServer != nil {
+		a.httpServer.Stop()
+	}
 	if a.server != nil {
 		a.server.Stop()
 	}
@@ -171,6 +184,14 @@ func (a *BrokerApp) Broker() *broker.Broker {
 func (a *BrokerApp) Addr() string {
 	if a.server != nil {
 		return a.server.Addr()
+	}
+	return ""
+}
+
+// HTTPAddr returns the HTTP listen address, or empty string if HTTP is not enabled.
+func (a *BrokerApp) HTTPAddr() string {
+	if a.httpServer != nil {
+		return a.httpServer.Addr()
 	}
 	return ""
 }

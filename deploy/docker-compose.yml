@@ -6,6 +6,7 @@ services:
       target: broker
     ports:
       - "9090:9090"
+      - "8080:8080"
     volumes:
       - nyaqueue-data:/data
     cpus: "2.0"
@@ -111,7 +112,7 @@ services:
       dockerfile: deploy/Dockerfile
       target: experiment
     command:
-      - "--experiment.mode=inprocess,grpc,kafka"
+      - "--experiment.mode=inprocess,grpc,http,kafka"
       - "--experiment.scenarios=all"
       - "--experiment.algorithms=all"
       - "--experiment.kafka_brokers=kafka:9092"

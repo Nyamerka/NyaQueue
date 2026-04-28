@@ -21,7 +21,7 @@ COPY --from=builder /bin/broker /usr/local/bin/broker
 COPY deploy/configs/broker.yaml /etc/nyaqueue/config.yaml
 RUN mkdir -p /data && chown -R nyaqueue:nyaqueue /data
 USER nyaqueue
-EXPOSE 9090
+EXPOSE 9090 8080
 ENTRYPOINT ["broker", "-config", "/etc/nyaqueue/config.yaml"]
 
 FROM base AS producer

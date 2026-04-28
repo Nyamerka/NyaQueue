@@ -231,8 +231,8 @@ func runProducer(ctx context.Context, h *Harness, sc benchmarks.Scenario, msgSiz
 	}
 }
 
-// runRateLimitedProducer sends one message at a time with a sleep between
-// sends. Batching adds no benefit here since the rate limiter serialises sends.
+const produceLingerInterval = 5 * time.Millisecond
+
 func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenario, msgSize int, c *MetricsCollector) {
 	perProducer := sc.RatePerSec / sc.Producers
 	if perProducer < 1 {
@@ -240,28 +240,56 @@ func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scena
 	}
 	interval := time.Second / time.Duration(perProducer)
 
+	batch := make([]BatchItem, 0, produceBatchSize)
+	linger := time.NewTimer(produceLingerInterval)
+	linger.Stop()
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		n, err := h.PublishBatch(ctx, expTopic, batch)
+		for i := 0; i < n; i++ {
+			c.RecordProduce()
+		}
+		if err != nil && n < len(batch) {
+			for range batch[n:] {
+				c.RecordPublishError()
+			}
+		}
+		batch = batch[:0]
+		linger.Stop()
+	}
+
 	keyBuf := make([]byte, 8)
 	for {
 		if ctx.Err() != nil {
+			flush()
 			return
 		}
 
+		key := make([]byte, 8)
 		binary.BigEndian.PutUint64(keyBuf, rand.Uint64())
-		value := encodeValue(msgSize)
-		priority := sc.SamplePriority()
+		copy(key, keyBuf)
 
-		if err := h.Publish(ctx, expTopic, keyBuf, value, priority); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			c.RecordPublishError()
-		} else {
-			c.RecordProduce()
+		batch = append(batch, BatchItem{
+			Key:      key,
+			Value:    encodeValue(msgSize),
+			Priority: sc.SamplePriority(),
+		})
+
+		if len(batch) >= produceBatchSize {
+			flush()
+		} else if len(batch) == 1 {
+			linger.Reset(produceLingerInterval)
 		}
 
 		select {
 		case <-ctx.Done():
+			flush()
 			return
+		case <-linger.C:
+			flush()
 		case <-time.After(interval):
 		}
 	}
@@ -318,7 +346,7 @@ func runConsumer(ctx context.Context, h *Harness, partition int, c *MetricsColle
 			return
 		}
 
-		msg, err := h.Consume(ctx, expTopic, expGroup, partition)
+		msgs, err := h.ConsumeBatch(ctx, expTopic, expGroup, partition)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -335,12 +363,14 @@ func runConsumer(ctx context.Context, h *Harness, partition int, c *MetricsColle
 			continue
 		}
 
-		latency, ok := decodeLatency(msg.Value)
-		if !ok {
-			c.RecordConsumeError()
-			continue
+		for _, msg := range msgs {
+			latency, ok := decodeLatency(msg.Value)
+			if !ok {
+				c.RecordConsumeError()
+				continue
+			}
+			c.RecordConsumeWithPriority(msg.Priority, latency)
 		}
-		c.RecordConsumeWithPriority(msg.Priority, latency)
 	}
 }
 

@@ -125,25 +125,42 @@ func allFailed(results []broker.PublishResult) bool {
 }
 
 func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.ConsumeResponse, error) {
-	msg, nextOffset, err := s.broker.Consume(req.Topic, req.Group, int(req.Partition))
-	if err != nil {
-		if errors.Is(err, broker.ErrNoMessages) {
-			return &pb.ConsumeResponse{}, nil
+	maxBytes := int(req.MaxBytes)
+	if maxBytes <= 0 {
+		maxBytes = 1 << 20
+	}
+
+	var (
+		envelopes  []*pb.MessageEnvelope
+		totalBytes int
+	)
+
+	for totalBytes < maxBytes {
+		msg, nextOffset, err := s.broker.Consume(req.Topic, req.Group, int(req.Partition))
+		if err != nil {
+			if errors.Is(err, broker.ErrNoMessages) {
+				break
+			}
+			if len(envelopes) > 0 {
+				break
+			}
+			return nil, err
 		}
-		return nil, err
+
+		env := &pb.MessageEnvelope{
+			Offset:    int64(nextOffset) - 1,
+			Key:       msg.Key,
+			Value:     msg.Value,
+			Priority:  uint32(msg.Header.Priority),
+			Timestamp: msg.Header.Timestamp,
+		}
+		envelopes = append(envelopes, env)
+		totalBytes += len(msg.Key) + len(msg.Value)
+
+		_ = s.broker.Commit(req.Group, req.Topic, int(req.Partition), int64(nextOffset))
 	}
 
-	env := &pb.MessageEnvelope{
-		Offset:    int64(nextOffset) - 1,
-		Key:       msg.Key,
-		Value:     msg.Value,
-		Priority:  uint32(msg.Header.Priority),
-		Timestamp: msg.Header.Timestamp,
-	}
-
-	return &pb.ConsumeResponse{
-		Messages: []*pb.MessageEnvelope{env},
-	}, nil
+	return &pb.ConsumeResponse{Messages: envelopes}, nil
 }
 
 func (s *Server) Commit(_ context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {

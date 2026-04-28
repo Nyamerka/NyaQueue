@@ -22,7 +22,7 @@ import (
 
 func main() {
 	fs := flag.NewFlagSet("experiment", flag.ContinueOnError)
-	fs.String("experiment.mode", "inprocess", "comma-separated modes: inprocess,grpc,kafka")
+	fs.String("experiment.mode", "inprocess", "comma-separated modes: inprocess,grpc,http,kafka")
 	fs.String("experiment.scenarios", "all", "comma-separated scenarios or 'all'")
 	fs.String("experiment.algorithms", "all", "comma-separated algorithms or 'all'")
 	fs.String("experiment.kafka_brokers", "localhost:9092", "kafka broker addresses")
@@ -113,7 +113,7 @@ func main() {
 
 func parseModes(s string) []experiments.Mode {
 	if s == "all" {
-		return []experiments.Mode{experiments.ModeInProcess, experiments.ModeGRPC, experiments.ModeKafka}
+		return []experiments.Mode{experiments.ModeInProcess, experiments.ModeGRPC, experiments.ModeHTTP, experiments.ModeKafka}
 	}
 	var modes []experiments.Mode
 	for _, m := range strings.Split(s, ",") {
@@ -122,6 +122,8 @@ func parseModes(s string) []experiments.Mode {
 			modes = append(modes, experiments.ModeInProcess)
 		case "grpc":
 			modes = append(modes, experiments.ModeGRPC)
+		case "http":
+			modes = append(modes, experiments.ModeHTTP)
 		case "kafka":
 			modes = append(modes, experiments.ModeKafka)
 		}

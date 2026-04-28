@@ -26,6 +26,9 @@ type MetricsCollector struct {
 
 	partProduces []atomic.Int64
 	partConsumes []atomic.Int64
+
+	prevPartProduces []int64
+	prevPartConsumes []int64
 }
 
 func NewMetricsCollector(b *Broker) *MetricsCollector {
@@ -66,6 +69,18 @@ func (mc *MetricsCollector) ensurePartCountersLocked(minLen int) {
 	}
 }
 
+func (mc *MetricsCollector) savePrevCountersLocked() {
+	n := len(mc.partProduces)
+	if len(mc.prevPartProduces) < n {
+		mc.prevPartProduces = make([]int64, n)
+		mc.prevPartConsumes = make([]int64, n)
+	}
+	for i := 0; i < n; i++ {
+		mc.prevPartProduces[i] = mc.partProduces[i].Load()
+		mc.prevPartConsumes[i] = mc.partConsumes[i].Load()
+	}
+}
+
 func (mc *MetricsCollector) Collect() Metrics {
 	mc.mu.Lock()
 	now := time.Now()
@@ -103,6 +118,12 @@ func (mc *MetricsCollector) Collect() Metrics {
 				produces = mc.partProduces[pID].Load()
 				consumes = mc.partConsumes[pID].Load()
 			}
+
+			var prevProd, prevCons int64
+			if pID < len(mc.prevPartProduces) {
+				prevProd = mc.prevPartProduces[pID]
+				prevCons = mc.prevPartConsumes[pID]
+			}
 			mc.mu.Unlock()
 
 			pending := produces - consumes
@@ -111,13 +132,23 @@ func (mc *MetricsCollector) Collect() Metrics {
 			}
 			depths = append(depths, int(pending))
 
+			deltaProd := produces - prevProd
+			deltaCons := consumes - prevCons
 			load := 0.0
-			if produces > 0 {
-				load = float64(pending) / float64(produces)
+			if deltaProd > 0 {
+				deltaPending := deltaProd - deltaCons
+				if deltaPending < 0 {
+					deltaPending = 0
+				}
+				load = float64(deltaPending) / float64(deltaProd)
 			}
 			loads = append(loads, load)
 		}
 	}
+
+	mc.mu.Lock()
+	mc.savePrevCountersLocked()
+	mc.mu.Unlock()
 
 	successRate := 1.0
 	if produced > 0 && consumed == 0 {

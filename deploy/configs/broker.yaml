@@ -1,5 +1,6 @@
 server:
   addr: ":9090"
+  http_addr: ":8080"
   data_dir: "/data"
 
 broker:

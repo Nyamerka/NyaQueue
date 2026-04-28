@@ -3,6 +3,7 @@ package experiments
 import (
 	"context"
 	"errors"
+	"time"
 
 	kafka "github.com/segmentio/kafka-go"
 
@@ -24,6 +25,7 @@ type Mode int
 const (
 	ModeInProcess Mode = iota
 	ModeGRPC
+	ModeHTTP
 	ModeKafka
 )
 
@@ -33,6 +35,8 @@ func (m Mode) String() string {
 		return "inprocess"
 	case ModeGRPC:
 		return "grpc"
+	case ModeHTTP:
+		return "http"
 	case ModeKafka:
 		return "kafka"
 	default:
@@ -40,13 +44,14 @@ func (m Mode) String() string {
 	}
 }
 
-// Harness abstracts the target system (NyaQueue in-process, NyaQueue gRPC, or Kafka).
+// Harness abstracts the target system (NyaQueue in-process, NyaQueue gRPC, NyaQueue HTTP, or Kafka).
 type Harness struct {
-	mode     Mode
-	app      *app.BrokerApp
-	grpc     *transport.Client
-	kfk      *kafkadriver.KafkaHarness
-	external bool // true when grpc connects to an external broker (not a local one)
+	mode       Mode
+	app        *app.BrokerApp
+	grpc       *transport.Client
+	httpClient *transport.HTTPClient
+	kfk        *kafkadriver.KafkaHarness
+	external   bool
 }
 
 // HarnessConfig describes how to create a harness.
@@ -56,7 +61,7 @@ type HarnessConfig struct {
 	DataDir      string
 	Algorithm    AlgorithmConfig
 	KafkaBrokers []string
-	BrokerAddr string
+	BrokerAddr   string
 }
 
 // NewHarness creates and starts the target system.
@@ -104,6 +109,35 @@ func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 				return nil, oops.Wrapf(err, "grpc client")
 			}
 			h.grpc = client
+
+			if err := waitForGRPCReady(ctx, client); err != nil {
+				a.Stop()
+				return nil, oops.Wrapf(err, "grpc readiness")
+			}
+		}
+
+	case ModeHTTP:
+		if cfg.BrokerAddr != "" {
+			h.httpClient = transport.NewHTTPClient(cfg.BrokerAddr)
+			h.external = true
+		} else {
+			a, err := app.New(cfg.BrokerConfig, cfg.DataDir,
+				app.WithBalancerFactory(cfg.Algorithm.NewBalancer),
+				app.WithHTTP(":0"),
+			)
+			if err != nil {
+				return nil, oops.Wrapf(err, "app new")
+			}
+			if err := a.Start(); err != nil {
+				return nil, oops.Wrapf(err, "app start")
+			}
+			h.app = a
+			h.httpClient = transport.NewHTTPClient(a.HTTPAddr())
+
+			if err := waitForHTTPReady(ctx, h.httpClient); err != nil {
+				a.Stop()
+				return nil, oops.Wrapf(err, "http readiness")
+			}
 		}
 
 	case ModeKafka:
@@ -144,6 +178,18 @@ func (h *Harness) CreateTopic(ctx context.Context, topic string, cfg broker.Topi
 			return h.grpc.CreateTopic(ctx, topic, int32(cfg.NumPartitions), mode)
 		}
 		return h.app.Broker().CreateTopic(topic, cfg)
+	case ModeHTTP:
+		if h.external {
+			mode := "fifo"
+			switch cfg.ScheduleMode {
+			case broker.ModeStrictPriority:
+				mode = "strict_priority"
+			case broker.ModeDQNAdaptive:
+				mode = "dqn_adaptive"
+			}
+			return h.httpClient.CreateTopic(ctx, topic, int32(cfg.NumPartitions), mode)
+		}
+		return h.app.Broker().CreateTopic(topic, cfg)
 	case ModeKafka:
 		return h.kfk.CreateTopic(ctx, topic, cfg.NumPartitions)
 	}
@@ -158,6 +204,11 @@ func (h *Harness) DeleteTopic(ctx context.Context, topic string) error {
 	case ModeGRPC:
 		if h.external {
 			return h.grpc.DeleteTopic(ctx, topic)
+		}
+		return h.app.Broker().DeleteTopic(topic)
+	case ModeHTTP:
+		if h.external {
+			return h.httpClient.DeleteTopic(ctx, topic)
 		}
 		return h.app.Broker().DeleteTopic(topic)
 	case ModeKafka:
@@ -179,6 +230,9 @@ func (h *Harness) Publish(ctx context.Context, topic string, key, value []byte, 
 		return err
 	case ModeGRPC:
 		_, _, err := h.grpc.Produce(ctx, topic, key, value, uint32(priority))
+		return err
+	case ModeHTTP:
+		_, _, err := h.httpClient.Produce(ctx, topic, key, value, uint32(priority))
 		return err
 	case ModeKafka:
 		return h.kfk.Produce(ctx, topic, key, value)
@@ -204,11 +258,11 @@ func (h *Harness) PublishBatch(ctx context.Context, topic string, items []BatchI
 		}
 
 		var (
-			results = h.app.Broker().PublishBatch(topic, msgs)
-			ok = 0
+			results  = h.app.Broker().PublishBatch(topic, msgs)
+			ok       = 0
 			firstErr error
 		)
-		
+
 		for _, r := range results {
 			if r.Err == nil {
 				ok++
@@ -228,6 +282,21 @@ func (h *Harness) PublishBatch(ctx context.Context, topic string, items []BatchI
 			}
 		}
 		results, err := h.grpc.ProduceBatch(ctx, topic, pbmsgs)
+		if err != nil {
+			return 0, err
+		}
+		return len(results), nil
+
+	case ModeHTTP:
+		records := make([]transport.HTTPProduceRecord, len(items))
+		for i, it := range items {
+			records[i] = transport.HTTPProduceRecord{
+				Key:      it.Key,
+				Value:    it.Value,
+				Priority: uint32(it.Priority),
+			}
+		}
+		results, err := h.httpClient.ProduceBatch(ctx, topic, records)
 		if err != nil {
 			return 0, err
 		}
@@ -253,7 +322,7 @@ type ConsumedMessage struct {
 	Priority uint8 // 0 = highest, 9 = lowest; 0 when not available (Kafka)
 }
 
-func (h *Harness) Consume(ctx context.Context, topic, group string, partition int) (*ConsumedMessage, error) {
+func (h *Harness) ConsumeBatch(ctx context.Context, topic, group string, partition int) ([]*ConsumedMessage, error) {
 	switch h.mode {
 	case ModeInProcess:
 		brk := h.app.Broker()
@@ -267,32 +336,50 @@ func (h *Harness) Consume(ctx context.Context, topic, group string, partition in
 		if err := brk.Commit(group, topic, partition, int64(nextOffset)); err != nil {
 			return nil, oops.Wrapf(err, "commit")
 		}
-		return &ConsumedMessage{
+		return []*ConsumedMessage{{
 			Value:    msg.Value,
 			Offset:   int64(nextOffset - 1),
 			Priority: msg.Header.Priority,
-		}, nil
+		}}, nil
 
 	case ModeGRPC:
-		msgs, err := h.grpc.Consume(ctx, topic, group, int32(partition), grpcMaxFetchBytes)
+		envs, err := h.grpc.Consume(ctx, topic, group, int32(partition), grpcMaxFetchBytes)
 		if err != nil {
 			if errors.Is(err, broker.ErrNoMessages) {
 				return nil, ErrNoMessage
 			}
 			return nil, oops.Wrapf(err, "grpc consume")
 		}
-		if len(msgs) == 0 {
+		if len(envs) == 0 {
 			return nil, ErrNoMessage
 		}
-		env := msgs[0]
-		if err := h.grpc.Commit(ctx, topic, group, int32(partition), env.Offset+1); err != nil {
-			return nil, oops.Wrapf(err, "grpc commit")
+		result := make([]*ConsumedMessage, len(envs))
+		for i, env := range envs {
+			result[i] = &ConsumedMessage{
+				Value:    env.Value,
+				Offset:   env.Offset,
+				Priority: uint8(env.Priority),
+			}
 		}
-		return &ConsumedMessage{
-			Value:    env.Value,
-			Offset:   env.Offset,
-			Priority: uint8(env.Priority),
-		}, nil
+		return result, nil
+
+	case ModeHTTP:
+		envs, err := h.httpClient.Consume(ctx, topic, group, int32(partition), grpcMaxFetchBytes)
+		if err != nil {
+			return nil, oops.Wrapf(err, "http consume")
+		}
+		if len(envs) == 0 {
+			return nil, ErrNoMessage
+		}
+		result := make([]*ConsumedMessage, len(envs))
+		for i, env := range envs {
+			result[i] = &ConsumedMessage{
+				Value:    env.Value,
+				Offset:   env.Offset,
+				Priority: uint8(env.Priority),
+			}
+		}
+		return result, nil
 
 	case ModeKafka:
 		msgs, err := h.kfk.Consume(ctx, topic, group, partition, grpcMaxFetchBytes)
@@ -302,17 +389,57 @@ func (h *Harness) Consume(ctx context.Context, topic, group string, partition in
 		if len(msgs) == 0 {
 			return nil, ErrNoMessage
 		}
-		// Kafka doesn't carry priority natively — priority is 0 (unknown).
-		return &ConsumedMessage{Value: msgs[0].Value, Offset: msgs[0].Offset}, nil
+		return []*ConsumedMessage{{Value: msgs[0].Value, Offset: msgs[0].Offset}}, nil
 	}
 
 	return nil, oops.Errorf("unsupported mode")
+}
+
+func waitForHTTPReady(ctx context.Context, c *transport.HTTPClient) error {
+	deadline := time.After(5 * time.Second)
+	for {
+		probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		_, err := c.ListTopics(probeCtx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-deadline:
+			return oops.Wrapf(err, "http server not ready after 5s")
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func waitForGRPCReady(ctx context.Context, c *transport.Client) error {
+	deadline := time.After(5 * time.Second)
+	for {
+		probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		_, err := c.ListTopics(probeCtx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-deadline:
+			return oops.Wrapf(err, "grpc server not ready after 5s")
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 // Close stops all resources.
 func (h *Harness) Close() error {
 	if h.grpc != nil {
 		h.grpc.Close()
+	}
+	if h.httpClient != nil {
+		h.httpClient.Close()
 	}
 	if h.app != nil {
 		h.app.Stop()

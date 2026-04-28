@@ -48,10 +48,17 @@ func main() {
 		log.Fatalf("config validation: %v", err)
 	}
 
-	a, err := app.New(cfg, dataDir,
+	httpAddr := k.String("server.http_addr")
+
+	opts := []app.Option{
 		app.WithDefaultBalancer(),
 		app.WithGRPC(addr),
-	)
+	}
+	if httpAddr != "" {
+		opts = append(opts, app.WithHTTP(httpAddr))
+	}
+
+	a, err := app.New(cfg, dataDir, opts...)
 	if err != nil {
 		log.Fatalf("init: %v", err)
 	}
@@ -60,7 +67,10 @@ func main() {
 		log.Fatalf("start: %v", err)
 	}
 
-	log.Printf("NyaQueue broker listening on %s", a.Addr())
+	log.Printf("NyaQueue broker gRPC listening on %s", a.Addr())
+	if ha := a.HTTPAddr(); ha != "" {
+		log.Printf("NyaQueue broker HTTP listening on %s", ha)
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

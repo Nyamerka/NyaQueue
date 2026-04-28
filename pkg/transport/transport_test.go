@@ -208,7 +208,7 @@ func (s *TransportSuite) TestConsumeReturnsCorrectOffset() {
 
 	msgs, err := s.client.Consume(ctx, "offset-test", "g1", 0, 65536)
 	require.NoError(s.T(), err)
-	require.Len(s.T(), msgs, 1)
+	require.GreaterOrEqual(s.T(), len(msgs), 1)
 	require.Equal(s.T(), int64(1), msgs[0].Offset, "first message should have WAL offset 1")
 	require.Equal(s.T(), []byte("v1"), msgs[0].Value)
 }
@@ -222,21 +222,18 @@ func (s *TransportSuite) TestConsumeSequentialNoSkip() {
 		require.NoError(s.T(), err)
 	}
 
-	for i := 0; i < 5; i++ {
-		msgs, err := s.client.Consume(ctx, "seq-test", "g1", 0, 65536)
-		require.NoError(s.T(), err)
-		require.Len(s.T(), msgs, 1)
+	msgs, err := s.client.Consume(ctx, "seq-test", "g1", 0, 1<<20)
+	require.NoError(s.T(), err)
+	require.Len(s.T(), msgs, 5, "batch consume should return all 5 messages")
 
-		require.Equal(s.T(), int64(i+1), msgs[0].Offset,
+	for i, m := range msgs {
+		require.Equal(s.T(), int64(i+1), m.Offset,
 			"message %d should have offset %d", i, i+1)
-
-		err = s.client.Commit(ctx, "seq-test", "g1", 0, msgs[0].Offset+1)
-		require.NoError(s.T(), err)
 	}
 
-	msgs, err := s.client.Consume(ctx, "seq-test", "g1", 0, 65536)
+	noMore, err := s.client.Consume(ctx, "seq-test", "g1", 0, 1<<20)
 	require.NoError(s.T(), err)
-	require.Empty(s.T(), msgs, "all messages consumed, should be empty")
+	require.Empty(s.T(), noMore, "all messages consumed and auto-committed")
 }
 
 func (s *TransportSuite) TestDeleteTopicCleansData() {
@@ -246,7 +243,7 @@ func (s *TransportSuite) TestDeleteTopicCleansData() {
 	_, _, err := s.client.Produce(ctx, "del-clean", []byte("k"), []byte("old"), 0)
 	require.NoError(s.T(), err)
 
-	err = s.client.Commit(ctx, "del-clean", "g1", 0, 2)
+	_, err = s.client.Consume(ctx, "del-clean", "g1", 0, 65536)
 	require.NoError(s.T(), err)
 
 	err = s.client.DeleteTopic(ctx, "del-clean")
@@ -259,7 +256,7 @@ func (s *TransportSuite) TestDeleteTopicCleansData() {
 
 	msgs, err := s.client.Consume(ctx, "del-clean", "g1", 0, 65536)
 	require.NoError(s.T(), err)
-	require.Len(s.T(), msgs, 1)
+	require.GreaterOrEqual(s.T(), len(msgs), 1)
 	require.Equal(s.T(), []byte("new"), msgs[0].Value,
 		"after delete+recreate, should only see new messages")
 	require.Equal(s.T(), int64(1), msgs[0].Offset,
@@ -283,4 +280,53 @@ func (s *TransportSuite) TestBufferedProducer() {
 	msgs, err := s.client.Consume(ctx, "buf-test", "g1", 0, 65536)
 	require.NoError(s.T(), err)
 	require.NotEmpty(s.T(), msgs)
+}
+
+func (s *TransportSuite) TestClientReadyImmediatelyAfterServerStart() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := s.client.ListTopics(ctx)
+	require.NoError(s.T(), err, "gRPC server should accept requests immediately after Start()")
+}
+
+func (s *TransportSuite) TestBatchConsume() {
+	ctx := context.Background()
+	s.createTopicWithScheduler("bc-test", 1, pb.ScheduleMode_FIFO)
+
+	for i := 0; i < 5; i++ {
+		_, _, err := s.client.Produce(ctx, "bc-test", []byte("k"), []byte{byte(i)}, 0)
+		require.NoError(s.T(), err)
+	}
+
+	msgs, err := s.client.Consume(ctx, "bc-test", "g1", 0, 1<<20)
+	require.NoError(s.T(), err)
+	require.GreaterOrEqual(s.T(), len(msgs), 2,
+		"batch consume should return multiple messages in one RPC")
+
+	noMore, err := s.client.Consume(ctx, "bc-test", "g1", 0, 1<<20)
+	require.NoError(s.T(), err)
+	require.Empty(s.T(), noMore,
+		"all messages already consumed and auto-committed")
+}
+
+func (s *TransportSuite) TestProduceBatchPreservesValues() {
+	ctx := context.Background()
+	s.createTopicWithScheduler("val-test", 1, pb.ScheduleMode_FIFO)
+
+	msgs := []*pb.ProduceMessage{
+		{Key: []byte("k1"), Value: []byte("hello"), Priority: 0},
+		{Key: []byte("k2"), Value: []byte("world"), Priority: 3},
+	}
+
+	results, err := s.client.ProduceBatch(ctx, "val-test", msgs)
+	require.NoError(s.T(), err)
+	require.Len(s.T(), results, 2)
+
+	consumed, err := s.client.Consume(ctx, "val-test", "g1", 0, 1<<20)
+	require.NoError(s.T(), err)
+	require.Len(s.T(), consumed, 2, "batch produce of 2 should yield 2 consumed")
+	require.Equal(s.T(), []byte("hello"), consumed[0].Value)
+	require.Equal(s.T(), []byte("world"), consumed[1].Value)
+	require.Equal(s.T(), uint32(3), consumed[1].Priority)
 }
