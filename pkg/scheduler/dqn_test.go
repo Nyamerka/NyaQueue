@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/stretchr/testify/require"
@@ -216,6 +217,7 @@ func (s *DQNSchedSuite) TestAsyncTrainingDoesNotBlockInference() {
 		dqn.OnMetrics(broker.Metrics{AvgLatency: float64(i)})
 	}
 
-	require.Greater(s.T(), dqn.replayBuffer.Len(), 0,
-		"experience should be collected via async channel")
+	require.Eventually(s.T(), func() bool {
+		return dqn.replayBuffer.Len() > 0
+	}, time.Second, 5*time.Millisecond, "experience should be collected via async channel")
 }
