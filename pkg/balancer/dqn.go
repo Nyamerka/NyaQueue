@@ -43,9 +43,12 @@ type DQNBalancer struct {
 	trainEvery    int
 	weightInit    float64
 
-	backend   backends.Backend
-	ctx       *context.Context
-	stateSize int
+	backend    backends.Backend
+	ctx        *context.Context
+	fwdExec    *context.Exec
+	nextQExec  *context.Exec
+	trainExec  *context.Exec
+	stateSize  int
 
 	replayBuffer *nn.ReplayBuffer
 
@@ -121,12 +124,43 @@ func (d *DQNBalancer) initGoMLX() {
 	d.backend = backends.MustNew()
 	d.ctx = context.New()
 
-	// Run a single forward pass to initialize variables with correct shapes.
-	initExec := context.MustNewExec(d.backend, d.ctx, func(ctx *context.Context, state *Node) *Node {
+	// fwdExec initializes variables; built first so Reuse() finds them below.
+	d.fwdExec = context.MustNewExec(d.backend, d.ctx, func(ctx *context.Context, state *Node) *Node {
 		return d.qNetworkGraph(ctx, state)
 	})
 	dummyState := make([]float64, d.stateSize)
-	initExec.MustExec(dummyState)
+	d.fwdExec.MustExec(dummyState)
+
+	d.nextQExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
+		func(ctx *context.Context, states *Node) *Node {
+			h := layers.Dense(ctx.In("hidden"), states, true, d.hiddenSize)
+			h = activations.Relu(h)
+			q := layers.Dense(ctx.In("output"), h, true, d.numPartitions)
+			return ReduceMax(q, -1)
+		})
+
+	d.trainExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
+		func(ctx *context.Context, states, targetQ, actionIdx *Node) *Node {
+			g := states.Graph()
+			h := layers.Dense(ctx.In("hidden"), states, true, d.hiddenSize)
+			h = activations.Relu(h)
+			qAll := layers.Dense(ctx.In("output"), h, true, d.numPartitions)
+			oneHot := OneHot(ConvertDType(actionIdx, dtypes.Int32), d.numPartitions, qAll.DType())
+			qSelected := ReduceSum(Mul(qAll, oneHot), -1)
+			diff := Sub(qSelected, targetQ)
+			loss := ReduceAllMean(Mul(diff, diff))
+			grads := ctx.BuildTrainableVariablesGradientsGraph(loss)
+			lr := Const(g, d.lr)
+			idx := 0
+			ctx.EnumerateVariables(func(v *context.Variable) {
+				if v.Trainable && v.InUseByGraph(g) {
+					w := v.ValueGraph(g)
+					v.SetValueGraph(Sub(w, Mul(lr, grads[idx])))
+					idx++
+				}
+			})
+			return loss
+		})
 }
 
 // qNetworkGraph builds the Q-network: Dense(hiddenSize) → ReLU → Dense(numPartitions).
@@ -142,10 +176,7 @@ func (d *DQNBalancer) qNetworkGraph(ctx *context.Context, state *Node) *Node {
 // forward performs a single forward pass returning Q-values for the state.
 // Caller must hold at least weightsMu.RLock.
 func (d *DQNBalancer) forward(state []float64) []float64 {
-	fwdExec := context.MustNewExec(d.backend, d.ctx.Reuse(), func(ctx *context.Context, st *Node) *Node {
-		return d.qNetworkGraph(ctx, st)
-	})
-	result := fwdExec.MustExec1(state)
+	result := d.fwdExec.MustExec1(state)
 	return tensorToFloat64Slice(result)
 }
 
@@ -335,16 +366,10 @@ func (d *DQNBalancer) trainStep() {
 	statesT := tensors.FromFlatDataAndDimensions(statesBuf, bs, d.stateSize)
 	nextStatesT := tensors.FromFlatDataAndDimensions(nextStatesBuf, bs, d.stateSize)
 
-	// Compute target Q-values: r + gamma * max(Q(s', a')) * (1-done)
+	// Compute target Q-values: r + gamma * max(Q(s', a')) * (1-done).
+	// Uses pre-built exec; RLock allows concurrent inference during this read.
 	d.weightsMu.RLock()
-	nextQExec := context.MustNewExec(d.backend, d.ctx.Reuse(),
-		func(ctx *context.Context, states *Node) *Node {
-			h := layers.Dense(ctx.In("hidden"), states, true, d.hiddenSize)
-			h = activations.Relu(h)
-			q := layers.Dense(ctx.In("output"), h, true, d.numPartitions)
-			return ReduceMax(q, -1) // max Q per sample: [bs]
-		})
-	maxNextQT := nextQExec.MustExec1(nextStatesT)
+	maxNextQT := d.nextQExec.MustExec1(nextStatesT)
 	d.weightsMu.RUnlock()
 
 	maxNextQ := tensorToFloat64Slice(maxNextQT)
@@ -353,47 +378,13 @@ func (d *DQNBalancer) trainStep() {
 		targets[i] = rewards[i] + d.gamma*maxNextQ[i]*(1-dones[i])
 	}
 
-	// Training step with gradient descent.
+	// Weight update: exclusive lock so inference sees a consistent snapshot.
 	d.weightsMu.Lock()
 	defer d.weightsMu.Unlock()
 
-	trainExec := context.MustNewExec(d.backend, d.ctx.Reuse(),
-		func(ctx *context.Context, states, targetQ, actionIdx *Node) *Node {
-			g := states.Graph()
-
-			// Forward pass: [bs, stateSize] → [bs, numPartitions]
-			h := layers.Dense(ctx.In("hidden"), states, true, d.hiddenSize)
-			h = activations.Relu(h)
-			qAll := layers.Dense(ctx.In("output"), h, true, d.numPartitions)
-
-			// Select Q-values for taken actions via one-hot masking.
-			oneHot := OneHot(ConvertDType(actionIdx, dtypes.Int32), d.numPartitions, qAll.DType())
-			qSelected := ReduceSum(Mul(qAll, oneHot), -1) // [bs]
-
-			// MSE loss.
-			diff := Sub(qSelected, targetQ)
-			loss := ReduceAllMean(Mul(diff, diff))
-
-			// Autograd: compute gradients for all trainable variables.
-			grads := ctx.BuildTrainableVariablesGradientsGraph(loss)
-
-			// Apply SGD update: w -= lr * grad
-			lr := Const(g, d.lr)
-			idx := 0
-			ctx.EnumerateVariables(func(v *context.Variable) {
-				if v.Trainable && v.InUseByGraph(g) {
-					w := v.ValueGraph(g)
-					v.SetValueGraph(Sub(w, Mul(lr, grads[idx])))
-					idx++
-				}
-			})
-
-			return loss
-		})
-
 	actionsT := tensors.FromFlatDataAndDimensions(actions, bs)
 	targetsT := tensors.FromFlatDataAndDimensions(targets, bs)
-	trainExec.MustExec(statesT, targetsT, actionsT)
+	d.trainExec.MustExec(statesT, targetsT, actionsT)
 }
 
 func padOrTrunc(s []float64, n int) []float64 {
