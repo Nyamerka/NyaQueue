@@ -56,13 +56,14 @@ type Harness struct {
 
 // HarnessConfig describes how to create a harness.
 type HarnessConfig struct {
-	Mode          Mode
-	BrokerConfig  broker.Config
-	DataDir       string
-	Algorithm     AlgorithmConfig
-	NumPartitions int // passed to NewBalancer so partition-aware balancers use the correct K
-	KafkaBrokers  []string
-	BrokerAddr    string
+	Mode           Mode
+	BrokerConfig   broker.Config
+	DataDir        string
+	Algorithm      AlgorithmConfig
+	NumPartitions  int    // passed to NewBalancer so partition-aware balancers use the correct K
+	KafkaBrokers   []string
+	BrokerAddr     string // gRPC address
+	HTTPBrokerAddr string // HTTP address; falls back to BrokerAddr when empty
 }
 
 // NewHarness creates and starts the target system.
@@ -122,8 +123,12 @@ func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 		}
 
 	case ModeHTTP:
-		if cfg.BrokerAddr != "" {
-			h.httpClient = transport.NewHTTPClient(cfg.BrokerAddr)
+		httpAddr := cfg.HTTPBrokerAddr
+		if httpAddr == "" {
+			httpAddr = cfg.BrokerAddr
+		}
+		if httpAddr != "" {
+			h.httpClient = transport.NewHTTPClient(httpAddr)
 			h.external = true
 		} else {
 			a, err := app.New(cfg.BrokerConfig, cfg.DataDir,

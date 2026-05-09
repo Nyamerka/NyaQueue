@@ -29,12 +29,13 @@ const (
 
 // Runner orchestrates experiment runs across scenarios and algorithms.
 type Runner struct {
-	Scenarios    []benchmarks.Scenario
-	Algorithms   []AlgorithmConfig
-	Modes        []Mode
-	KafkaBrokers []string
-	Duration     time.Duration // override scenario duration if > 0
-	BrokerAddr   string
+	Scenarios      []benchmarks.Scenario
+	Algorithms     []AlgorithmConfig
+	Modes          []Mode
+	KafkaBrokers   []string
+	Duration       time.Duration // override scenario duration if > 0
+	BrokerAddr     string        // gRPC broker address for external mode
+	HTTPBrokerAddr string        // HTTP broker address for external mode (default: BrokerAddr)
 }
 
 // RunAll executes every (scenario, algorithm, mode) combination and returns results.
@@ -87,12 +88,13 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	topicCfg.ScheduleMode = alg.Mode
 
 	h, err := NewHarness(ctx, HarnessConfig{
-		Mode:          mode,
-		BrokerConfig:  broker.DefaultConfig(),
-		DataDir:       dataDir,
-		Algorithm:     alg,
-		NumPartitions: topicCfg.NumPartitions,
-		BrokerAddr:    r.BrokerAddr,
+		Mode:           mode,
+		BrokerConfig:   broker.DefaultConfig(),
+		DataDir:        dataDir,
+		Algorithm:      alg,
+		NumPartitions:  topicCfg.NumPartitions,
+		BrokerAddr:     r.BrokerAddr,
+		HTTPBrokerAddr: r.HTTPBrokerAddr,
 	})
 	if err != nil {
 		return ExperimentResult{}, err
