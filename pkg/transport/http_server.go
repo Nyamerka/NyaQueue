@@ -3,6 +3,7 @@ package transport
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -194,7 +195,10 @@ func (s *HTTPServer) handleConsume(w http.ResponseWriter, r *http.Request) {
 		})
 		totalBytes += len(msg.Key) + len(msg.Value)
 
-		_ = s.broker.Commit(group, topic, partition, int64(nextOffset))
+		if err := s.broker.Commit(group, topic, partition, int64(nextOffset)); err != nil {
+			log.Printf("auto-commit failed (topic=%s group=%s partition=%d offset=%d): %v",
+				topic, group, partition, nextOffset, err)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, HTTPConsumeResponse{Messages: envelopes})

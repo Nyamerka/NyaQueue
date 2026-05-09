@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -59,4 +60,36 @@ func (s *LoadPredictorSuite) TestEmptyPredictions() {
 	lp := NewLoadPredictor(10, 3, time.Second)
 	preds := lp.Predictions()
 	require.Empty(s.T(), preds)
+}
+
+func (s *LoadPredictorSuite) TestConcurrentUpdateAndPredict() {
+	lp := NewLoadPredictor(10, 3, 1*time.Millisecond)
+	lp.Start()
+	defer lp.Stop()
+
+	const goroutines = 8
+	const iterations = 200
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				lp.Update([]float64{0.1, 0.2, 0.3, 0.4})
+			}
+		}()
+	}
+
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_ = lp.Predictions()
+			}
+		}()
+	}
+
+	wg.Wait()
 }

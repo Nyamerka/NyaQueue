@@ -16,6 +16,7 @@ type PartitionPrediction struct {
 // Uses moving-average as baseline; LSTM inference can replace predict().
 type LoadPredictor struct {
 	predictions atomic.Value // stores []PartitionPrediction
+	mu          sync.Mutex
 	history     map[int]*RingBuffer
 	window      int
 	horizon     int
@@ -44,6 +45,7 @@ func (lp *LoadPredictor) Predictions() []PartitionPrediction {
 }
 
 func (lp *LoadPredictor) Update(loads []float64) {
+	lp.mu.Lock()
 	for i, load := range loads {
 		buf, ok := lp.history[i]
 		if !ok {
@@ -52,12 +54,20 @@ func (lp *LoadPredictor) Update(loads []float64) {
 		}
 		buf.Push(load)
 	}
+	lp.mu.Unlock()
 	lp.predict()
 }
 
 func (lp *LoadPredictor) predict() {
-	preds := make([]PartitionPrediction, 0, len(lp.history))
+	lp.mu.Lock()
+	snapshot := make(map[int]*RingBuffer, len(lp.history))
 	for id, buf := range lp.history {
+		snapshot[id] = buf
+	}
+	lp.mu.Unlock()
+
+	preds := make([]PartitionPrediction, 0, len(snapshot))
+	for id, buf := range snapshot {
 		vals := buf.Values()
 		current := 0.0
 		if len(vals) > 0 {

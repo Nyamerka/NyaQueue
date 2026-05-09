@@ -3,6 +3,7 @@ package broker
 import (
 	"encoding/binary"
 	"fmt"
+	"log"
 	"math"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,12 @@ var offsetsBucket = []byte("offsets")
 // OffsetStore tracks consumer offsets. Hot-path reads and writes go through an
 // in-memory cache (sync.Map). A background goroutine periodically dumps dirty
 // entries to BoltDB for durability.
+//
+// Trade-off: when dumpInterval > 0, offsets committed between the last
+// successful flush and a crash are lost. On restart consumers will re-receive
+// messages from the last persisted offset (at-least-once semantics). This is a
+// deliberate compromise to keep fsync off the hot path; set dumpInterval to 0
+// (or use SyncEveryWrite) for stronger guarantees at the cost of throughput.
 type OffsetStore struct {
 	db    *bbolt.DB
 	cache sync.Map // string -> int64
@@ -179,15 +186,19 @@ func (s *OffsetStore) dump() {
 		return
 	}
 
-	_ = s.db.Update(func(tx *bbolt.Tx) error {
+	if err := s.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(offsetsBucket)
 		for key, offset := range snapshot {
 			val := make([]byte, 8)
 			binary.BigEndian.PutUint64(val, uint64(offset))
-			_ = b.Put([]byte(key), val)
+			if err := b.Put([]byte(key), val); err != nil {
+				return err
+			}
 		}
 		return nil
-	})
+	}); err != nil {
+		log.Printf("offset store: flush to BoltDB failed (%d entries): %v", len(snapshot), err)
+	}
 }
 
 func (s *OffsetStore) Close() error {

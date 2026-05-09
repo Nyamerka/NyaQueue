@@ -37,7 +37,7 @@ func (s *DQNSuite) TestSelectPartition() {
 }
 
 func (s *DQNSuite) TestFallbackWatchdog() {
-	dqn := NewDQNBalancer(4, WithDQNEpsilon(0.0))
+	dqn := NewDQNBalancer(4, WithDQNEpsilon(0.0), WithDQNLoadThreshold(0))
 	dqn.SetBaseThroughput(1000)
 
 	dqn.OnMetrics(broker.Metrics{
@@ -53,6 +53,25 @@ func (s *DQNSuite) TestFallbackWatchdog() {
 	})
 
 	require.False(s.T(), dqn.IsFallbackActive())
+}
+
+func (s *DQNSuite) TestProactiveWatchdog() {
+	dqn := NewDQNBalancer(4, WithDQNLoadThreshold(0.7))
+
+	dqn.OnMetrics(broker.Metrics{
+		PartitionLoads: []float64{0.3, 0.3, 0.3, 0.3},
+	})
+	require.False(s.T(), dqn.IsFallbackActive(), "low load should not trigger fallback")
+
+	dqn.OnMetrics(broker.Metrics{
+		PartitionLoads: []float64{0.8, 0.9, 0.7, 0.85},
+	})
+	require.True(s.T(), dqn.IsFallbackActive(), "high mean load should trigger proactive fallback")
+
+	dqn.OnMetrics(broker.Metrics{
+		PartitionLoads: []float64{0.3, 0.3, 0.3, 0.3},
+	})
+	require.False(s.T(), dqn.IsFallbackActive(), "load recovery should deactivate fallback")
 }
 
 func (s *DQNSuite) TestOnMetricsTrains() {

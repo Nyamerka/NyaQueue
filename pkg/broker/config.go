@@ -95,6 +95,9 @@ var configValidator = govy.New(
 	govy.For(func(c Config) int { return c.BatchSize }).
 		WithName("batch_size").
 		Rules(rules.GTE(1)),
+	govy.For(func(c Config) int { return c.BatchMemoryBytes }).
+		WithName("batch_memory_bytes").
+		Rules(rules.GTE(1024), rules.LTE(64<<20)),
 	govy.For(func(c Config) int { return c.FetchMinBytes }).
 		WithName("fetch_min_bytes").
 		Rules(rules.GTE(1)),

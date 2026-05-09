@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
 	"time"
 
@@ -124,6 +125,9 @@ func allFailed(results []broker.PublishResult) bool {
 	return true
 }
 
+// Consume implements at-most-once delivery: offsets are committed per message
+// inside the loop so that Broker.Consume advances correctly. If the RPC fails
+// after a commit, the client won't receive the already-committed messages.
 func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.ConsumeResponse, error) {
 	maxBytes := int(req.MaxBytes)
 	if maxBytes <= 0 {
@@ -157,7 +161,10 @@ func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.Consume
 		envelopes = append(envelopes, env)
 		totalBytes += len(msg.Key) + len(msg.Value)
 
-		_ = s.broker.Commit(req.Group, req.Topic, int(req.Partition), int64(nextOffset))
+		if err := s.broker.Commit(req.Group, req.Topic, int(req.Partition), int64(nextOffset)); err != nil {
+			log.Printf("auto-commit failed (topic=%s group=%s partition=%d offset=%d): %v",
+				req.Topic, req.Group, req.Partition, nextOffset, err)
+		}
 	}
 
 	return &pb.ConsumeResponse{Messages: envelopes}, nil

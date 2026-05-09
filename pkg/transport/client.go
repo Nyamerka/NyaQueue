@@ -117,26 +117,37 @@ func (c *Client) GetMetrics(ctx context.Context) (*pb.MetricsResponse, error) {
 // BufferedProducer accumulates messages and sends them in batches via a single
 // Produce RPC, amortising the per-RPC cost across many messages.
 type BufferedProducer struct {
-	client    *Client
-	topic     string
-	batchSize int
-	linger    time.Duration
+	client         *Client
+	topic          string
+	batchSize      int
+	maxMemoryBytes int
+	linger         time.Duration
 
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
 
 	mu       sync.Mutex
 	buf      []*pb.ProduceMessage
+	bufBytes int
 	timer    *time.Timer
 	asyncErr error
 	closed   bool
 }
 
+var ErrBufferMemoryExceeded = oops.Errorf("buffered producer: batch memory limit exceeded")
+
+type BufferedProducerOption func(*BufferedProducer)
+
+func WithMaxMemoryBytes(n int) BufferedProducerOption {
+	return func(p *BufferedProducer) { p.maxMemoryBytes = n }
+}
+
 // NewBufferedProducer creates a producer that flushes when either batchSize
-// messages are accumulated or linger time elapses, whichever comes first.
-func NewBufferedProducer(c *Client, topic string, batchSize int, linger time.Duration) *BufferedProducer {
+// messages are accumulated, memory limit is reached, or linger time elapses,
+// whichever comes first.
+func NewBufferedProducer(c *Client, topic string, batchSize int, linger time.Duration, opts ...BufferedProducerOption) *BufferedProducer {
 	bgCtx, cancel := context.WithCancel(context.Background())
-	return &BufferedProducer{
+	bp := &BufferedProducer{
 		client:    c,
 		topic:     topic,
 		batchSize: batchSize,
@@ -145,6 +156,10 @@ func NewBufferedProducer(c *Client, topic string, batchSize int, linger time.Dur
 		bgCancel:  cancel,
 		buf:       make([]*pb.ProduceMessage, 0, batchSize),
 	}
+	for _, opt := range opts {
+		opt(bp)
+	}
+	return bp
 }
 
 func (p *BufferedProducer) Send(ctx context.Context, key, value []byte, priority uint32) error {
@@ -160,15 +175,36 @@ func (p *BufferedProducer) Send(ctx context.Context, key, value []byte, priority
 		return err
 	}
 
+	msgBytes := len(key) + len(value)
+
+	if p.maxMemoryBytes > 0 && p.bufBytes+msgBytes > p.maxMemoryBytes && len(p.buf) > 0 {
+		batch := p.buf
+		p.buf = make([]*pb.ProduceMessage, 0, p.batchSize)
+		p.bufBytes = 0
+		p.stopTimerLocked()
+		p.mu.Unlock()
+		if err := p.send(ctx, batch); err != nil {
+			return err
+		}
+		return p.Send(ctx, key, value, priority)
+	}
+
+	if p.maxMemoryBytes > 0 && msgBytes > p.maxMemoryBytes {
+		p.mu.Unlock()
+		return ErrBufferMemoryExceeded
+	}
+
 	p.buf = append(p.buf, &pb.ProduceMessage{
 		Key:      key,
 		Value:    value,
 		Priority: priority,
 	})
+	p.bufBytes += msgBytes
 
-	if len(p.buf) >= p.batchSize {
+	if len(p.buf) >= p.batchSize || (p.maxMemoryBytes > 0 && p.bufBytes >= p.maxMemoryBytes) {
 		batch := p.buf
 		p.buf = make([]*pb.ProduceMessage, 0, p.batchSize)
+		p.bufBytes = 0
 		p.stopTimerLocked()
 		p.mu.Unlock()
 		return p.send(ctx, batch)
@@ -190,6 +226,7 @@ func (p *BufferedProducer) Flush(ctx context.Context) error {
 	}
 	batch := p.buf
 	p.buf = make([]*pb.ProduceMessage, 0, p.batchSize)
+	p.bufBytes = 0
 	p.stopTimerLocked()
 	p.mu.Unlock()
 	return p.send(ctx, batch)
@@ -206,6 +243,7 @@ func (p *BufferedProducer) Close(ctx context.Context) error {
 	p.closed = true
 	batch := p.buf
 	p.buf = nil
+	p.bufBytes = 0
 	p.stopTimerLocked()
 	p.mu.Unlock()
 

@@ -40,6 +40,7 @@ type DQNBalancer struct {
 
 	fallbackRR     *RoundRobin
 	fallbackRatio  float64
+	loadThreshold  float64
 	baseThroughput float64
 	fallbackActive bool
 
@@ -60,6 +61,7 @@ func WithDQNReplayBufSize(n int) DQNOption {
 func WithDQNBatchSize(n int) DQNOption         { return func(d *DQNBalancer) { d.batchSize = n } }
 func WithDQNMinReplay(n int) DQNOption         { return func(d *DQNBalancer) { d.minReplay = n } }
 func WithDQNFallbackRatio(r float64) DQNOption { return func(d *DQNBalancer) { d.fallbackRatio = r } }
+func WithDQNLoadThreshold(t float64) DQNOption { return func(d *DQNBalancer) { d.loadThreshold = t } }
 func WithDQNWeightInit(s float64) DQNOption    { return func(d *DQNBalancer) { d.weightInit = s } }
 
 func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
@@ -75,6 +77,7 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 		replayBuffer:   nn.NewReplayBuffer(DefaultDQNReplayBufSize),
 		fallbackRR:     NewRoundRobin(),
 		fallbackRatio:  DefaultDQNFallbackRatio,
+		loadThreshold:  DefaultDQNLoadThreshold,
 		loads:          make([]float64, numPartitions),
 		predictedLoads: make([]float64, numPartitions),
 	}
@@ -137,13 +140,24 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 		d.loads = m.PartitionLoads
 	}
 
-	if d.baseThroughput > 0 {
-		if m.Throughput < d.fallbackRatio*d.baseThroughput {
-			d.fallbackActive = true
-		} else {
-			d.fallbackActive = false
+	shouldFallback := false
+
+	if d.baseThroughput > 0 && m.Throughput < d.fallbackRatio*d.baseThroughput {
+		shouldFallback = true
+	}
+
+	if d.loadThreshold > 0 && len(m.PartitionLoads) > 0 {
+		meanLoad := 0.0
+		for _, l := range m.PartitionLoads {
+			meanLoad += l
+		}
+		meanLoad /= float64(len(m.PartitionLoads))
+		if meanLoad > d.loadThreshold {
+			shouldFallback = true
 		}
 	}
+
+	d.fallbackActive = shouldFallback
 
 	if d.lastState != nil {
 		reward := d.computeReward(m)

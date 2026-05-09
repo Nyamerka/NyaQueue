@@ -139,7 +139,7 @@ func (h *KafkaHarness) writerFor(topic string) *kafka.Writer {
 		Balancer:     &kafka.RoundRobin{},
 		BatchTimeout: 5 * time.Millisecond,
 		BatchSize:    16,
-		RequiredAcks: kafka.RequireOne,
+		RequiredAcks: kafka.RequireAll,
 	}
 	h.writers[topic] = w
 	return w
