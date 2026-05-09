@@ -350,3 +350,85 @@ func (fifoScheduler) Next(p *Partition, offset uint64) (*Message, uint64, error)
 }
 
 func (fifoScheduler) Enqueue(*Message, int64) {}
+
+type trackingScheduler struct {
+	fifoScheduler
+	stopped chan struct{}
+}
+
+func newTrackingScheduler() *trackingScheduler {
+	return &trackingScheduler{stopped: make(chan struct{})}
+}
+
+func (t *trackingScheduler) Stop() {
+	select {
+	case <-t.stopped:
+	default:
+		close(t.stopped)
+	}
+}
+
+func (t *trackingScheduler) isStopped() bool {
+	select {
+	case <-t.stopped:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *BrokerSuite) TestDeleteTopicStopsScheduler() {
+	b, cleanup := s.newBroker()
+	defer cleanup()
+
+	cfg := DefaultTopicConfig()
+	cfg.NumPartitions = 1
+	require.NoError(s.T(), b.CreateTopic("t", cfg))
+
+	ts := newTrackingScheduler()
+	b.SetScheduler("t", ts)
+
+	require.False(s.T(), ts.isStopped(), "scheduler should not be stopped before delete")
+
+	require.NoError(s.T(), b.DeleteTopic("t"))
+	require.True(s.T(), ts.isStopped(), "scheduler must be stopped on DeleteTopic")
+}
+
+func (s *BrokerSuite) TestBrokerStopStopsAllSchedulers() {
+	dir := s.T().TempDir()
+	store, err := NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+
+	b := New(DefaultConfig(), dir, noopBalancer{}, store)
+
+	cfg := DefaultTopicConfig()
+	cfg.NumPartitions = 1
+	require.NoError(s.T(), b.CreateTopic("t1", cfg))
+	require.NoError(s.T(), b.CreateTopic("t2", cfg))
+
+	ts1 := newTrackingScheduler()
+	ts2 := newTrackingScheduler()
+	b.SetScheduler("t1", ts1)
+	b.SetScheduler("t2", ts2)
+
+	b.Stop()
+
+	require.True(s.T(), ts1.isStopped(), "scheduler for t1 must be stopped on broker Stop")
+	require.True(s.T(), ts2.isStopped(), "scheduler for t2 must be stopped on broker Stop")
+}
+
+func (s *BrokerSuite) TestSetSchedulerStopsOld() {
+	b, cleanup := s.newBroker()
+	defer cleanup()
+
+	cfg := DefaultTopicConfig()
+	cfg.NumPartitions = 1
+	require.NoError(s.T(), b.CreateTopic("t", cfg))
+
+	old := newTrackingScheduler()
+	b.SetScheduler("t", old)
+	require.False(s.T(), old.isStopped())
+
+	b.SetScheduler("t", newTrackingScheduler())
+	require.True(s.T(), old.isStopped(), "old scheduler must be stopped when replaced")
+}

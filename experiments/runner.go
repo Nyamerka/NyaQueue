@@ -24,7 +24,7 @@ const (
 	drainGracePeriod     = 500 * time.Millisecond
 	defaultMsgSize       = 256
 	expGroup             = "exp-group"
-	expTopic = "nyaqueue-experiment"
+	expTopic             = "nyaqueue-experiment"
 )
 
 // Runner orchestrates experiment runs across scenarios and algorithms.
@@ -42,6 +42,10 @@ type Runner struct {
 func (r *Runner) RunAll(ctx context.Context) ([]ExperimentResult, error) {
 	var results []ExperimentResult
 
+	disabledModes := make(map[Mode]bool)
+	consecutiveFails := make(map[Mode]int)
+	const failFastThreshold = 3
+
 	for _, sc := range r.Scenarios {
 		dur := sc.Duration
 		if r.Duration > 0 {
@@ -49,22 +53,42 @@ func (r *Runner) RunAll(ctx context.Context) ([]ExperimentResult, error) {
 		}
 
 		for _, mode := range r.Modes {
+			if disabledModes[mode] {
+				log.Printf("SKIP %s/%s: mode disabled (fail-fast)", mode, sc.Name)
+				continue
+			}
+
 			if mode == ModeKafka {
 				res, err := r.runKafka(ctx, sc, dur)
 				if err != nil {
 					log.Printf("SKIP kafka/%s: %v", sc.Name, err)
+					consecutiveFails[mode]++
+					if consecutiveFails[mode] >= failFastThreshold {
+						log.Printf("DISABLE mode %s: %d consecutive failures", mode, consecutiveFails[mode])
+						disabledModes[mode] = true
+					}
 					continue
 				}
+				consecutiveFails[mode] = 0
 				results = append(results, res)
 				continue
 			}
 
 			for _, alg := range r.Algorithms {
+				if disabledModes[mode] {
+					break
+				}
 				res, err := r.runNyaQueue(ctx, sc, alg, mode, dur)
 				if err != nil {
 					log.Printf("SKIP %s/%s/%s: %v", mode, alg.Name, sc.Name, err)
+					consecutiveFails[mode]++
+					if consecutiveFails[mode] >= failFastThreshold {
+						log.Printf("DISABLE mode %s: %d consecutive failures", mode, consecutiveFails[mode])
+						disabledModes[mode] = true
+					}
 					continue
 				}
+				consecutiveFails[mode] = 0
 				results = append(results, res)
 			}
 		}
@@ -111,7 +135,18 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	}
 
 	if err := h.CreateTopic(ctx, expTopic, topicCfg); err != nil {
-		return ExperimentResult{}, oops.Wrapf(err, "create topic")
+		if errors.Is(err, broker.ErrTopicAlreadyExists) {
+			log.Printf("  topic %q exists, retrying delete+create...", expTopic)
+			delCtx, delCancel := context.WithTimeout(ctx, 5*time.Second)
+			_ = h.DeleteTopic(delCtx, expTopic)
+			delCancel()
+			time.Sleep(100 * time.Millisecond)
+			if err := h.CreateTopic(ctx, expTopic, topicCfg); err != nil {
+				return ExperimentResult{}, oops.Wrapf(err, "create topic after retry")
+			}
+		} else {
+			return ExperimentResult{}, oops.Wrapf(err, "create topic")
+		}
 	}
 
 	if brk := h.Broker(); brk != nil {

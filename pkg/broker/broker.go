@@ -78,6 +78,7 @@ func (b *Broker) SetBalancer(bal Balancer) {
 func (b *Broker) SetScheduler(topic string, sched Scheduler) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.stopScheduler(topic)
 	b.schedulers[topic] = sched
 }
 
@@ -114,6 +115,17 @@ func (b *Broker) CreateTopic(name string, cfg TopicConfig) error {
 	return nil
 }
 
+func (b *Broker) stopScheduler(name string) {
+	sched, ok := b.schedulers[name]
+	if !ok {
+		return
+	}
+	if s, ok := sched.(Stopper); ok {
+		s.Stop()
+	}
+	delete(b.schedulers, name)
+}
+
 func (b *Broker) DeleteTopic(name string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -123,7 +135,7 @@ func (b *Broker) DeleteTopic(name string) error {
 		return oops.Wrapf(ErrTopicNotFound, "delete topic %q", name)
 	}
 	delete(b.topics, name)
-	delete(b.schedulers, name)
+	b.stopScheduler(name)
 
 	if err := t.Close(); err != nil {
 		return err
@@ -413,6 +425,10 @@ func (b *Broker) Stop() {
 
 	if s, ok := b.balancer.(Stopper); ok {
 		s.Stop()
+	}
+
+	for name := range b.schedulers {
+		b.stopScheduler(name)
 	}
 
 	for _, t := range b.topics {
