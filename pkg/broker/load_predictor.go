@@ -85,6 +85,22 @@ func (lp *LoadPredictor) predict() {
 	lp.predictions.Store(preds)
 }
 
+func (lp *LoadPredictor) PredictAll(horizon int) []float64 {
+	preds := lp.Predictions()
+	if len(preds) == 0 {
+		return nil
+	}
+	result := make([]float64, len(preds))
+	for i, p := range preds {
+		if len(p.Predicted) > 0 {
+			result[i] = p.Predicted[0]
+		} else {
+			result[i] = p.Current
+		}
+	}
+	return result
+}
+
 func (lp *LoadPredictor) Start() {
 	go func() {
 		ticker := time.NewTicker(lp.interval)

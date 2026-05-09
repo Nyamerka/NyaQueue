@@ -60,7 +60,7 @@ type HarnessConfig struct {
 	BrokerConfig   broker.Config
 	DataDir        string
 	Algorithm      AlgorithmConfig
-	NumPartitions  int    // passed to NewBalancer so partition-aware balancers use the correct K
+	NumPartitions  int // passed to NewBalancer so partition-aware balancers use the correct K
 	KafkaBrokers   []string
 	BrokerAddr     string // gRPC address
 	HTTPBrokerAddr string // HTTP address; falls back to BrokerAddr when empty
@@ -327,30 +327,34 @@ func (h *Harness) PublishBatch(ctx context.Context, topic string, items []BatchI
 }
 
 type ConsumedMessage struct {
-	Value    []byte
-	Offset   int64
-	Priority uint8 // 0 = highest, 9 = lowest; 0 when not available (Kafka)
+	Value       []byte
+	Offset      int64
+	Priority    uint8 // 0 = highest, 9 = lowest; 0 when not available (Kafka)
+	ProduceTime int64 // broker receive timestamp (unix nanos), 0 if unavailable
+	AppendTime  int64 // WAL write timestamp (unix nanos), 0 if unavailable
 }
 
 func (h *Harness) ConsumeBatch(ctx context.Context, topic, group string, partition int) ([]*ConsumedMessage, error) {
 	switch h.mode {
 	case ModeInProcess:
 		brk := h.app.Broker()
-		msg, nextOffset, err := brk.Consume(topic, group, partition)
+		msgs, _, err := brk.ConsumeBatch(topic, group, partition, 16)
 		if err != nil {
 			if errors.Is(err, broker.ErrNoMessages) {
 				return nil, ErrNoMessage
 			}
-			return nil, oops.Wrapf(err, "consume")
+			return nil, oops.Wrapf(err, "consume batch")
 		}
-		if err := brk.Commit(group, topic, partition, int64(nextOffset)); err != nil {
-			return nil, oops.Wrapf(err, "commit")
+		result := make([]*ConsumedMessage, len(msgs))
+		for i, msg := range msgs {
+			result[i] = &ConsumedMessage{
+				Value:       msg.Value,
+				Priority:    msg.Header.Priority,
+				ProduceTime: msg.Header.ProduceTime,
+				AppendTime:  msg.Header.AppendTime,
+			}
 		}
-		return []*ConsumedMessage{{
-			Value:    msg.Value,
-			Offset:   int64(nextOffset - 1),
-			Priority: msg.Header.Priority,
-		}}, nil
+		return result, nil
 
 	case ModeGRPC:
 		envs, err := h.grpc.Consume(ctx, topic, group, int32(partition), grpcMaxFetchBytes)
@@ -403,6 +407,33 @@ func (h *Harness) ConsumeBatch(ctx context.Context, topic, group string, partiti
 	}
 
 	return nil, oops.Errorf("unsupported mode")
+}
+
+// GetPartitionLoads retrieves partition loads from the broker regardless of mode.
+// For Kafka, returns nil (Kafka doesn't expose NyaQueue-style partition loads).
+func (h *Harness) GetPartitionLoads(ctx context.Context) ([]float64, error) {
+	switch h.mode {
+	case ModeInProcess:
+		if brk := h.Broker(); brk != nil {
+			return brk.Metrics().PartitionLoads, nil
+		}
+		return nil, nil
+	case ModeGRPC:
+		resp, err := h.grpc.GetMetrics(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return resp.PartitionLoads, nil
+	case ModeHTTP:
+		resp, err := h.httpClient.GetMetrics(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return resp.PartitionLoads, nil
+	case ModeKafka:
+		return nil, nil
+	}
+	return nil, nil
 }
 
 func waitForHTTPReady(ctx context.Context, c *transport.HTTPClient) error {

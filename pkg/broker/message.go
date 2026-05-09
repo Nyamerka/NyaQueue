@@ -13,7 +13,7 @@ const (
 	timestampFieldSize = 8
 	keyLenFieldSize    = 4
 
-	timestampOffset = priorityFieldSize                  // 1
+	timestampOffset = priorityFieldSize                      // 1
 	keyLenOffset    = priorityFieldSize + timestampFieldSize // 9 (== HeaderSize)
 	keyOffset       = keyLenOffset + keyLenFieldSize         // 13
 
@@ -37,8 +37,10 @@ var marshalPool = sync.Pool{
 }
 
 type MessageHeader struct {
-	Priority  uint8
-	Timestamp int64 // unix nanos
+	Priority    uint8
+	Timestamp   int64 // unix nanos — client enqueue time
+	ProduceTime int64 // unix nanos — time when broker receives the message
+	AppendTime  int64 // unix nanos — time when written to WAL
 }
 
 type Message struct {

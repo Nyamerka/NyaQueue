@@ -47,12 +47,17 @@ func NewOptimizer(b *broker.Broker, params []TunableParam, interval time.Duratio
 		currentVals[i] = 0.5
 	}
 
+	effectiveInterval := interval
+	if effectiveInterval == 0 {
+		effectiveInterval = 1100 * time.Millisecond
+	}
+
 	return &Optimizer{
 		ddpg:        NewDDPG(stateSize, actionSize, 0.0001),
 		params:      active,
 		broker:      b,
-		interval:    interval,
-		batchSize:   64,
+		interval:    effectiveInterval,
+		batchSize:   256,
 		currentVals: currentVals,
 		stopCh:      make(chan struct{}),
 	}
@@ -98,6 +103,14 @@ func (o *Optimizer) step() {
 		rawVal := Denormalize(o.currentVals[i], o.params[i].Min, o.params[i].Max)
 		newVal := ClipAction(rawVal, delta, o.params[i].Min, o.params[i].Max)
 		o.currentVals[i] = Normalize(newVal, o.params[i].Min, o.params[i].Max)
+	}
+
+	newCfg := o.broker.Config()
+	for i, p := range o.params {
+		broker.SetParamByName(&newCfg, p.Name, Denormalize(o.currentVals[i], p.Min, p.Max))
+	}
+	if err := o.broker.ApplyConfig(newCfg); err != nil {
+		log.Printf("[optimizer] ApplyConfig failed: %v", err)
 	}
 
 	if o.prevMetrics != nil {

@@ -33,6 +33,36 @@ func (c *HTTPClient) Close() error {
 	return nil
 }
 
+type HTTPMetricsResponse struct {
+	Throughput     float64   `json:"Throughput"`
+	PartitionLoads []float64 `json:"PartitionLoads"`
+	PredictedLoads []float64 `json:"PredictedLoads"`
+	SuccessRate    float64   `json:"SuccessRate"`
+}
+
+func (c *HTTPClient) GetMetrics(ctx context.Context) (*HTTPMetricsResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/metrics", nil)
+	if err != nil {
+		return nil, oops.Wrapf(err, "new request")
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, oops.Wrapf(err, "do request")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, readHTTPError(resp)
+	}
+
+	var m HTTPMetricsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		return nil, oops.Wrapf(err, "decode metrics")
+	}
+	return &m, nil
+}
+
 func (c *HTTPClient) Produce(ctx context.Context, topic string, key, value []byte, priority uint32) (int, int64, error) {
 	results, err := c.ProduceBatch(ctx, topic, []HTTPProduceRecord{{Key: key, Value: value, Priority: priority}})
 	if err != nil {

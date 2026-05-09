@@ -56,13 +56,14 @@ func TestRunnerCreateTopicRetryDeleteCreate(t *testing.T) {
 
 	tcfg := broker.DefaultTopicConfig()
 	tcfg.NumPartitions = 1
-	require.NoError(t, b.CreateTopic(expTopic, tcfg))
+	testTopic := expTopicName("test", "test", ModeInProcess)
+	require.NoError(t, b.CreateTopic(testTopic, tcfg))
 
-	err = b.CreateTopic(expTopic, tcfg)
+	err = b.CreateTopic(testTopic, tcfg)
 	require.ErrorIs(t, err, broker.ErrTopicAlreadyExists)
 
-	require.NoError(t, b.DeleteTopic(expTopic))
-	require.NoError(t, b.CreateTopic(expTopic, tcfg))
+	require.NoError(t, b.DeleteTopic(testTopic))
+	require.NoError(t, b.CreateTopic(testTopic, tcfg))
 
 	h, err := NewHarness(ctx, HarnessConfig{
 		Mode:         ModeInProcess,

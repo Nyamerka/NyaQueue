@@ -10,6 +10,7 @@ import (
 	pb "github.com/Nyamerka/NyaQueue/pkg/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 )
 
 type Client struct {
@@ -23,6 +24,11 @@ func NewClient(addr string) (*Client, error) {
 
 	conn, err := grpc.DialContext(ctx, addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                10 * time.Second,
+			Timeout:             3 * time.Second,
+			PermitWithoutStream: true,
+		}),
 	)
 	if err != nil {
 		return nil, oops.Wrapf(err, "connect to %s", addr)

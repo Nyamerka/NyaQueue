@@ -142,6 +142,46 @@ func (s *LoadPredictorSuite) TestYuleWalkerZeroVariance() {
 	require.Nil(s.T(), coeffs, "zero-variance series should return nil coefficients")
 }
 
+func (s *LoadPredictorSuite) TestPredictAll() {
+	lp := NewLoadPredictor(20, 5, 100*time.Millisecond)
+
+	for i := 0; i < 15; i++ {
+		lp.Update([]float64{0.3 + float64(i)*0.01, 0.5 + float64(i)*0.01})
+	}
+
+	predicted := lp.PredictAll(8)
+	require.Len(s.T(), predicted, 2)
+	require.Greater(s.T(), predicted[0], 0.3, "predicted load should be above initial for partition 0")
+	require.Greater(s.T(), predicted[1], 0.4, "predicted load should be reasonable for partition 1")
+}
+
+func (s *LoadPredictorSuite) TestBrokerMetricsIncludesPredictions() {
+	dir := s.T().TempDir()
+	store, err := NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+
+	cfg := DefaultConfig()
+	b := New(cfg, dir, noopBalancer{}, store)
+	b.SetBackpressure(NewBackpressureController(nil, 0.99, 3))
+	b.Start()
+	defer b.Stop()
+
+	tcfg := DefaultTopicConfig()
+	tcfg.NumPartitions = 2
+	require.NoError(s.T(), b.CreateTopic("t", tcfg))
+	b.SetScheduler("t", fifoScheduler{})
+
+	for i := 0; i < 50; i++ {
+		msg := NewMessage(0, []byte("k"), []byte("v"))
+		b.Publish("t", msg)
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	m := b.Metrics()
+	require.NotNil(s.T(), m.PartitionLoads)
+}
+
 func (s *LoadPredictorSuite) TestConcurrentUpdateAndPredict() {
 	lp := NewLoadPredictor(10, 3, 1*time.Millisecond)
 	lp.Start()

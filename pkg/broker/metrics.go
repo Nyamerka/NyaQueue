@@ -10,6 +10,7 @@ type Metrics struct {
 	Throughput     float64
 	AvgLatency     float64
 	PartitionLoads []float64
+	PredictedLoads []float64
 	SuccessRate    float64
 	QueueDepth     []int
 	Timestamp      time.Time
@@ -29,6 +30,8 @@ type MetricsCollector struct {
 
 	prevPartProduces []int64
 	prevPartConsumes []int64
+
+	throughputHistory []float64
 }
 
 func NewMetricsCollector(b *Broker) *MetricsCollector {

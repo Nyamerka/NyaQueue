@@ -2,7 +2,9 @@ package optimizer
 
 import (
 	"testing"
+	"time"
 
+	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
@@ -195,3 +197,30 @@ func (s *ParamsSuite) TestNormalizeDenormalizeRoundTrip() {
 		})
 	}
 }
+
+func (s *ParamsSuite) TestOptimizerAppliesConfig() {
+	dir := s.T().TempDir()
+	cfg := broker.DefaultConfig()
+	b := broker.New(cfg, dir, noopBal{}, nil)
+	b.Start()
+	defer b.Stop()
+
+	params := []TunableParam{
+		{"BatchSize", 1, 1000, 1.0},
+	}
+
+	opt := NewOptimizer(b, params, 100*time.Millisecond)
+	opt.Start()
+	defer opt.Stop()
+
+	time.Sleep(3 * time.Second)
+
+	newCfg := b.Config()
+	require.NotEqual(s.T(), cfg.BatchSize, newCfg.BatchSize,
+		"optimizer should have changed BatchSize via ApplyConfig")
+}
+
+type noopBal struct{}
+
+func (noopBal) SelectPartition(string, []byte, int) int { return 0 }
+func (noopBal) OnMetrics(broker.Metrics)                {}

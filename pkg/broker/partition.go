@@ -80,8 +80,11 @@ func (p *Partition) AppendBatch(msgs []*Message) ([]uint64, error) {
 	offsets := make([]uint64, len(msgs))
 	buffers := make([][]byte, len(msgs))
 
+	appendTime := time.Now().UnixNano()
+
 	p.mu.Lock()
 	for i, msg := range msgs {
+		msg.Header.AppendTime = appendTime
 		offsets[i] = p.nextOffset
 		buffers[i] = msg.MarshalPooled()
 		batch.Write(p.nextOffset, buffers[i])

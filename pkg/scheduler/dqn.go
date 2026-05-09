@@ -125,8 +125,10 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 	}
 
 	d.stateMu.Lock()
-	if d.fallbackFIFO {
-		d.stateMu.Unlock()
+	fallback := d.fallbackFIFO
+	d.stateMu.Unlock()
+
+	if fallback {
 		return d.fifoFallback(partition, consumerOffset)
 	}
 
@@ -142,11 +144,6 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 		threshold = floats.MaxIdx(q)
 	}
 
-	d.threshold = threshold
-	d.lastState = state
-	d.lastAction = threshold
-	d.stateMu.Unlock()
-
 	entry, ok := pi.PopWithThreshold(threshold)
 	if !ok {
 		return nil, consumerOffset, broker.ErrNoMessages
@@ -156,6 +153,12 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 	if err != nil {
 		return nil, 0, err
 	}
+
+	d.stateMu.Lock()
+	d.threshold = threshold
+	d.lastState = state
+	d.lastAction = threshold
+	d.stateMu.Unlock()
 
 	return msg, uint64(entry.WalOffset), nil
 }

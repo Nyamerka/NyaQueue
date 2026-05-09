@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	hdrhistogram "github.com/HdrHistogram/hdrhistogram-go"
 	"gonum.org/v1/gonum/stat"
 )
 
@@ -64,9 +65,13 @@ type PriorityStats struct {
 // partition-load samples and error counters during an experiment run.
 type MetricsCollector struct {
 	mu          sync.Mutex
-	latencies   []time.Duration
+	latency     *hdrhistogram.Histogram // 1µs..30s, 4 significant figures
 	loadStddevs []float64
 	byPriority  [10]prioritySampler
+
+	enqueueToFlush  *hdrhistogram.Histogram
+	flushToAppend   *hdrhistogram.Histogram
+	appendToConsume *hdrhistogram.Histogram
 
 	produced      atomic.Int64
 	consumed      atomic.Int64
@@ -77,7 +82,12 @@ type MetricsCollector struct {
 }
 
 func NewMetricsCollector() *MetricsCollector {
-	return &MetricsCollector{}
+	return &MetricsCollector{
+		latency:         hdrhistogram.New(1, 30_000_000, 4), // 1µs to 30s in µs
+		enqueueToFlush:  hdrhistogram.New(1, 30_000_000, 4),
+		flushToAppend:   hdrhistogram.New(1, 30_000_000, 4),
+		appendToConsume: hdrhistogram.New(1, 30_000_000, 4),
+	}
 }
 
 func (c *MetricsCollector) Start() {
@@ -106,12 +116,47 @@ func (c *MetricsCollector) RecordConsume(latency time.Duration) {
 // latency for the given message. priority must be in [0, 9].
 func (c *MetricsCollector) RecordConsumeWithPriority(priority uint8, latency time.Duration) {
 	c.consumed.Add(1)
+	us := latency.Microseconds()
+	if us < 1 {
+		us = 1
+	}
 	c.mu.Lock()
-	c.latencies = append(c.latencies, latency)
+	c.latency.RecordValue(us)
 	c.mu.Unlock()
 
 	if int(priority) < len(c.byPriority) {
 		c.byPriority[priority].record(latency)
+	}
+}
+
+// RecordConsumeMultiStage records the breakdown of latency phases.
+// enqueueTime: client timestamp, produceTime: broker receive, appendTime: WAL write.
+func (c *MetricsCollector) RecordConsumeMultiStage(enqueueTime, produceTime, appendTime int64) {
+	now := time.Now().UnixNano()
+	if produceTime > 0 && appendTime > 0 {
+		c.mu.Lock()
+		if produceTime > enqueueTime {
+			us := (produceTime - enqueueTime) / 1000
+			if us < 1 {
+				us = 1
+			}
+			c.enqueueToFlush.RecordValue(us)
+		}
+		if appendTime > produceTime {
+			us := (appendTime - produceTime) / 1000
+			if us < 1 {
+				us = 1
+			}
+			c.flushToAppend.RecordValue(us)
+		}
+		if now > appendTime {
+			us := (now - appendTime) / 1000
+			if us < 1 {
+				us = 1
+			}
+			c.appendToConsume.RecordValue(us)
+		}
+		c.mu.Unlock()
 	}
 }
 
@@ -152,6 +197,10 @@ type ExperimentResult struct {
 	ConsumeErrors int64         `json:"consume_errors"`
 	Duration      time.Duration `json:"duration_ns"`
 
+	LatencyEnqueueToFlushP50  time.Duration `json:"latency_enqueue_to_flush_p50_ns"`
+	LatencyFlushToAppendP50   time.Duration `json:"latency_flush_to_append_p50_ns"`
+	LatencyAppendToConsumeP50 time.Duration `json:"latency_append_to_consume_p50_ns"`
+
 	// LatencyByPriority breaks down latency per priority level (0=highest,
 	// 9=lowest). Meaningful only when the scenario uses mixed priorities and
 	// the system under test supports priority scheduling.
@@ -183,19 +232,24 @@ func (c *MetricsCollector) Snapshot(scenario, algorithm, system, mode string) Ex
 		result.Throughput = float64(consumed) / duration.Seconds()
 	}
 
-	if len(c.latencies) > 0 {
-		sorted := make([]float64, len(c.latencies))
-		for i, l := range c.latencies {
-			sorted[i] = float64(l)
-		}
-		slices.Sort(sorted)
-		result.LatencyP50 = time.Duration(percentile(sorted, 0.50))
-		result.LatencyP95 = time.Duration(percentile(sorted, 0.95))
-		result.LatencyP99 = time.Duration(percentile(sorted, 0.99))
+	if c.latency.TotalCount() > 0 {
+		result.LatencyP50 = time.Duration(c.latency.ValueAtQuantile(50)) * time.Microsecond
+		result.LatencyP95 = time.Duration(c.latency.ValueAtQuantile(95)) * time.Microsecond
+		result.LatencyP99 = time.Duration(c.latency.ValueAtQuantile(99)) * time.Microsecond
 	}
 
 	if len(c.loadStddevs) > 0 {
 		result.LoadStdDev = stat.Mean(c.loadStddevs, nil)
+	}
+
+	if c.enqueueToFlush.TotalCount() > 0 {
+		result.LatencyEnqueueToFlushP50 = time.Duration(c.enqueueToFlush.ValueAtQuantile(50)) * time.Microsecond
+	}
+	if c.flushToAppend.TotalCount() > 0 {
+		result.LatencyFlushToAppendP50 = time.Duration(c.flushToAppend.ValueAtQuantile(50)) * time.Microsecond
+	}
+	if c.appendToConsume.TotalCount() > 0 {
+		result.LatencyAppendToConsumeP50 = time.Duration(c.appendToConsume.ValueAtQuantile(50)) * time.Microsecond
 	}
 
 	c.mu.Unlock()

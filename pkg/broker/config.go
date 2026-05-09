@@ -165,6 +165,56 @@ func DefaultTopicConfig() TopicConfig {
 	}
 }
 
+func SetParamByName(cfg *Config, name string, val float64) {
+	v := int(val)
+	switch name {
+	case "SegmentMaxBytes":
+		cfg.SegmentMaxBytes = v
+	case "SegmentMaxCount":
+		cfg.SegmentMaxCount = v
+	case "RetentionMaxBytes":
+		cfg.RetentionMaxBytes = int64(val)
+	case "RetentionMaxAge":
+		cfg.RetentionMaxAge = time.Duration(val)
+	case "FlushIntervalMs":
+		cfg.FlushIntervalMs = v
+	case "CompressionType":
+		cfg.CompressionType = v
+	case "MaxConnections":
+		cfg.MaxConnections = v
+	case "RecvBufferBytes":
+		cfg.RecvBufferBytes = v
+	case "SendBufferBytes":
+		cfg.SendBufferBytes = v
+	case "MaxMessageBytes":
+		cfg.MaxMessageBytes = v
+	case "ReadTimeoutMs":
+		cfg.ReadTimeoutMs = v
+	case "WriteTimeoutMs":
+		cfg.WriteTimeoutMs = v
+	case "NumNetworkGoroutines":
+		cfg.NumNetworkGoroutines = v
+	case "NumIOGoroutines":
+		cfg.NumIOGoroutines = v
+	case "MaxQueuedRequests":
+		cfg.MaxQueuedRequests = v
+	case "BatchSize":
+		cfg.BatchSize = v
+	case "BatchMemoryBytes":
+		cfg.BatchMemoryBytes = v
+	case "LingerMs":
+		cfg.LingerMs = v
+	case "FetchMinBytes":
+		cfg.FetchMinBytes = v
+	case "FetchMaxWaitMs":
+		cfg.FetchMaxWaitMs = v
+	case "MaxFetchBytes":
+		cfg.MaxFetchBytes = v
+	case "ConsumerSessionTimeoutMs":
+		cfg.ConsumerSessionTimeoutMs = v
+	}
+}
+
 const NumTunableParams = 22
 
 type ParamRange struct {

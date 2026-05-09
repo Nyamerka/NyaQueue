@@ -11,6 +11,14 @@ services:
       - nyaqueue-data:/data
     cpus: "2.0"
     mem_limit: "1.5g"
+    sysctls:
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_fin_timeout: 30
+      net.ipv4.ip_local_port_range: "1024 65000"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
   broker-exporter:
     build:
@@ -125,6 +133,14 @@ services:
       - kafka
     volumes:
       - ./results:/results
+    sysctls:
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.tcp_fin_timeout: 30
+      net.ipv4.ip_local_port_range: "1024 65000"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
 volumes:
   nyaqueue-data:

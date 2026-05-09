@@ -7,19 +7,25 @@ import (
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/Nyamerka/NyaQueue/pkg/nn"
-	"gonum.org/v1/gonum/floats"
-	"gonum.org/v1/gonum/mat"
+	"github.com/gomlx/gomlx/backends"
+	"github.com/gomlx/gomlx/pkg/core/dtypes"
+	. "github.com/gomlx/gomlx/pkg/core/graph"
+	"github.com/gomlx/gomlx/pkg/core/tensors"
+	"github.com/gomlx/gomlx/pkg/ml/context"
+	"github.com/gomlx/gomlx/pkg/ml/layers"
+	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
 	"gonum.org/v1/gonum/stat"
+
+	_ "github.com/gomlx/gomlx/backends/simplego"
 )
 
-// DQNBalancer uses a Deep Q-Network to select partitions based on current
-// and predicted loads.
+// DQNBalancer uses a Deep Q-Network (GoMLX-backed) to select partitions based
+// on current and predicted loads.
 //
 // Architecture: inference and training are separated to eliminate hot-path
 // contention. SelectPartition() takes a RLock on model weights for a single
 // forward pass. A background training goroutine drains experience from a
-// non-blocking channel, pushes it into the replay buffer, and periodically
-// runs backprop under a full Lock.
+// non-blocking channel and periodically runs backprop via GoMLX autograd.
 //
 // State vector: [partition_loads..., predicted_loads..., msg_rate, avg_msg_size]
 // Action: partition index (discrete)
@@ -37,10 +43,9 @@ type DQNBalancer struct {
 	trainEvery    int
 	weightInit    float64
 
-	w1 *mat.Dense // [hiddenSize x stateSize]
-	b1 []float64  // [hiddenSize]
-	w2 *mat.Dense // [numActions x hiddenSize]
-	b2 []float64  // [numActions]
+	backend   backends.Backend
+	ctx       *context.Context
+	stateSize int
 
 	replayBuffer *nn.ReplayBuffer
 
@@ -105,28 +110,43 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 		opt(d)
 	}
 
-	stateSize := numPartitions*2 + 2
-	d.initWeights(stateSize, numPartitions)
-
+	d.stateSize = numPartitions*2 + 2
+	d.initGoMLX()
 	go d.trainLoop()
 
 	return d
 }
 
-func (d *DQNBalancer) initWeights(stateSize, numActions int) {
-	w1Data := make([]float64, d.hiddenSize*stateSize)
-	for i := range w1Data {
-		w1Data[i] = rand.NormFloat64() * d.weightInit
-	}
-	d.w1 = mat.NewDense(d.hiddenSize, stateSize, w1Data)
-	d.b1 = make([]float64, d.hiddenSize)
+func (d *DQNBalancer) initGoMLX() {
+	d.backend = backends.MustNew()
+	d.ctx = context.New()
 
-	w2Data := make([]float64, numActions*d.hiddenSize)
-	for i := range w2Data {
-		w2Data[i] = rand.NormFloat64() * d.weightInit
-	}
-	d.w2 = mat.NewDense(numActions, d.hiddenSize, w2Data)
-	d.b2 = make([]float64, numActions)
+	// Run a single forward pass to initialize variables with correct shapes.
+	initExec := context.MustNewExec(d.backend, d.ctx, func(ctx *context.Context, state *Node) *Node {
+		return d.qNetworkGraph(ctx, state)
+	})
+	dummyState := make([]float64, d.stateSize)
+	initExec.MustExec(dummyState)
+}
+
+// qNetworkGraph builds the Q-network: Dense(hiddenSize) → ReLU → Dense(numPartitions).
+func (d *DQNBalancer) qNetworkGraph(ctx *context.Context, state *Node) *Node {
+	x := InsertAxes(state, 0) // [1, stateSize]
+	h := layers.Dense(ctx.In("hidden"), x, true, d.hiddenSize)
+	h = activations.Relu(h)
+	q := layers.Dense(ctx.In("output"), h, true, d.numPartitions)
+	q = Reshape(q, d.numPartitions) // flatten to [numPartitions]
+	return q
+}
+
+// forward performs a single forward pass returning Q-values for the state.
+// Caller must hold at least weightsMu.RLock.
+func (d *DQNBalancer) forward(state []float64) []float64 {
+	fwdExec := context.MustNewExec(d.backend, d.ctx.Reuse(), func(ctx *context.Context, st *Node) *Node {
+		return d.qNetworkGraph(ctx, st)
+	})
+	result := fwdExec.MustExec1(state)
+	return tensorToFloat64Slice(result)
 }
 
 // SelectPartition picks a partition via DQN inference. Only takes a RLock on
@@ -150,10 +170,10 @@ func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions in
 	}
 
 	d.weightsMu.RLock()
-	qValues, _ := d.forward(state)
+	qValues := d.forward(state)
 	d.weightsMu.RUnlock()
 
-	action := floats.MaxIdx(qValues[:numPartitions])
+	action := argmax(qValues[:numPartitions])
 
 	d.stateMu.Lock()
 	d.lastState = state
@@ -170,6 +190,9 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 
 	if len(m.PartitionLoads) > 0 {
 		d.loads = m.PartitionLoads
+	}
+	if len(m.PredictedLoads) > 0 {
+		d.predictedLoads = m.PredictedLoads
 	}
 
 	shouldFallback := false
@@ -275,40 +298,6 @@ func (d *DQNBalancer) buildStateLocked() []float64 {
 	return state
 }
 
-func (d *DQNBalancer) forward(state []float64) ([]float64, []float64) {
-	_, stateSize := d.w1.Dims()
-	s := state
-	if len(s) < stateSize {
-		padded := make([]float64, stateSize)
-		copy(padded, s)
-		s = padded
-	} else if len(s) > stateSize {
-		s = s[:stateSize]
-	}
-
-	sv := mat.NewVecDense(stateSize, s)
-	hv := mat.NewVecDense(d.hiddenSize, nil)
-	hv.MulVec(d.w1, sv)
-
-	hidden := make([]float64, d.hiddenSize)
-	copy(hidden, hv.RawVector().Data)
-	floats.Add(hidden, d.b1)
-	for i, v := range hidden {
-		if v < 0 {
-			hidden[i] = 0
-		}
-	}
-
-	hv2 := mat.NewVecDense(d.hiddenSize, hidden)
-	qv := mat.NewVecDense(d.numPartitions, nil)
-	qv.MulVec(d.w2, hv2)
-
-	q := make([]float64, d.numPartitions)
-	copy(q, qv.RawVector().Data)
-	floats.Add(q, d.b2)
-	return q, hidden
-}
-
 func computeReward(m broker.Metrics) float64 {
 	if len(m.PartitionLoads) == 0 {
 		return 0
@@ -316,63 +305,137 @@ func computeReward(m broker.Metrics) float64 {
 	return -stat.StdDev(m.PartitionLoads, nil)
 }
 
+// trainStep performs one DQN training step using GoMLX autograd.
 func (d *DQNBalancer) trainStep() {
 	if d.replayBuffer.Len() < d.minReplay {
 		return
 	}
 
 	batch := d.replayBuffer.Sample(d.batchSize)
+	bs := len(batch)
 
+	statesBuf := make([]float64, bs*d.stateSize)
+	nextStatesBuf := make([]float64, bs*d.stateSize)
+	actions := make([]float64, bs)
+	rewards := make([]float64, bs)
+	dones := make([]float64, bs)
+
+	for i, t := range batch {
+		copy(statesBuf[i*d.stateSize:], padOrTrunc(t.State, d.stateSize))
+		copy(nextStatesBuf[i*d.stateSize:], padOrTrunc(t.NextState, d.stateSize))
+		if len(t.Action) > 0 {
+			actions[i] = t.Action[0]
+		}
+		rewards[i] = t.Reward
+		if t.Done {
+			dones[i] = 1.0
+		}
+	}
+
+	statesT := tensors.FromFlatDataAndDimensions(statesBuf, bs, d.stateSize)
+	nextStatesT := tensors.FromFlatDataAndDimensions(nextStatesBuf, bs, d.stateSize)
+
+	// Compute target Q-values: r + gamma * max(Q(s', a')) * (1-done)
+	d.weightsMu.RLock()
+	nextQExec := context.MustNewExec(d.backend, d.ctx.Reuse(),
+		func(ctx *context.Context, states *Node) *Node {
+			h := layers.Dense(ctx.In("hidden"), states, true, d.hiddenSize)
+			h = activations.Relu(h)
+			q := layers.Dense(ctx.In("output"), h, true, d.numPartitions)
+			return ReduceMax(q, -1) // max Q per sample: [bs]
+		})
+	maxNextQT := nextQExec.MustExec1(nextStatesT)
+	d.weightsMu.RUnlock()
+
+	maxNextQ := tensorToFloat64Slice(maxNextQT)
+	targets := make([]float64, bs)
+	for i := range batch {
+		targets[i] = rewards[i] + d.gamma*maxNextQ[i]*(1-dones[i])
+	}
+
+	// Training step with gradient descent.
 	d.weightsMu.Lock()
 	defer d.weightsMu.Unlock()
 
-	for _, t := range batch {
-		qValues, hidden := d.forward(t.State)
-		nextQ, _ := d.forward(t.NextState)
-		maxNextQ := floats.Max(nextQ)
+	trainExec := context.MustNewExec(d.backend, d.ctx.Reuse(),
+		func(ctx *context.Context, states, targetQ, actionIdx *Node) *Node {
+			g := states.Graph()
 
-		action := 0
-		if len(t.Action) > 0 {
-			action = int(t.Action[0])
-		}
-		if action >= len(qValues) {
-			continue
-		}
+			// Forward pass: [bs, stateSize] → [bs, numPartitions]
+			h := layers.Dense(ctx.In("hidden"), states, true, d.hiddenSize)
+			h = activations.Relu(h)
+			qAll := layers.Dense(ctx.In("output"), h, true, d.numPartitions)
 
-		target := t.Reward + d.gamma*maxNextQ
-		if t.Done {
-			target = t.Reward
-		}
+			// Select Q-values for taken actions via one-hot masking.
+			oneHot := OneHot(ConvertDType(actionIdx, dtypes.Int32), d.numPartitions, qAll.DType())
+			qSelected := ReduceSum(Mul(qAll, oneHot), -1) // [bs]
 
-		tdError := target - qValues[action]
-		d.updateWeights(t.State, action, tdError, hidden)
-	}
+			// MSE loss.
+			diff := Sub(qSelected, targetQ)
+			loss := ReduceAllMean(Mul(diff, diff))
+
+			// Autograd: compute gradients for all trainable variables.
+			grads := ctx.BuildTrainableVariablesGradientsGraph(loss)
+
+			// Apply SGD update: w -= lr * grad
+			lr := Const(g, d.lr)
+			idx := 0
+			ctx.EnumerateVariables(func(v *context.Variable) {
+				if v.Trainable && v.InUseByGraph(g) {
+					w := v.ValueGraph(g)
+					v.SetValueGraph(Sub(w, Mul(lr, grads[idx])))
+					idx++
+				}
+			})
+
+			return loss
+		})
+
+	actionsT := tensors.FromFlatDataAndDimensions(actions, bs)
+	targetsT := tensors.FromFlatDataAndDimensions(targets, bs)
+	trainExec.MustExec(statesT, targetsT, actionsT)
 }
 
-func (d *DQNBalancer) updateWeights(state []float64, action int, tdError float64, hidden []float64) {
-	if action >= d.numPartitions {
-		return
+func padOrTrunc(s []float64, n int) []float64 {
+	if len(s) == n {
+		return s
 	}
+	out := make([]float64, n)
+	copy(out, s)
+	return out
+}
 
-	w2Row := d.w2.RawRowView(action)
-	w2Snap := make([]float64, len(w2Row))
-	copy(w2Snap, w2Row)
-
-	floats.AddScaled(w2Row, d.lr*tdError, hidden)
-	d.b2[action] += d.lr * tdError
-
-	_, stateSize := d.w1.Dims()
-	sLen := len(state)
-	if sLen > stateSize {
-		sLen = stateSize
+func argmax(s []float64) int {
+	if len(s) == 0 {
+		return 0
 	}
-	for i := 0; i < d.hiddenSize; i++ {
-		if hidden[i] <= 0 {
-			continue
+	best := 0
+	for i := 1; i < len(s); i++ {
+		if s[i] > s[best] {
+			best = i
 		}
-		dH := tdError * w2Snap[i]
-		w1Row := d.w1.RawRowView(i)
-		floats.AddScaled(w1Row[:sLen], d.lr*dH, state[:sLen])
-		d.b1[i] += d.lr * dH
+	}
+	return best
+}
+
+func tensorToFloat64Slice(t *tensors.Tensor) []float64 {
+	val := t.Value()
+	switch v := val.(type) {
+	case []float64:
+		out := make([]float64, len(v))
+		copy(out, v)
+		return out
+	case []float32:
+		out := make([]float64, len(v))
+		for i, x := range v {
+			out[i] = float64(x)
+		}
+		return out
+	case float64:
+		return []float64{v}
+	case float32:
+		return []float64{float64(v)}
+	default:
+		return nil
 	}
 }

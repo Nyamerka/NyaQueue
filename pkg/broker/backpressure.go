@@ -1,5 +1,7 @@
 package broker
 
+import "sync"
+
 type BackpressureState int
 
 const (
@@ -11,9 +13,11 @@ const (
 // BackpressureController throttles producers based on LoadPredictor predictions.
 // Falls back to open-by-default when no predictor is connected.
 type BackpressureController struct {
-	predictor *LoadPredictor
-	threshold float64
-	horizon   int
+	predictor      *LoadPredictor
+	threshold      float64
+	horizon        int
+	predictedLoads []float64
+	predictedMu    sync.RWMutex
 }
 
 func NewBackpressureController(predictor *LoadPredictor, threshold float64, horizon int) *BackpressureController {
@@ -27,7 +31,27 @@ func NewBackpressureController(predictor *LoadPredictor, threshold float64, hori
 	}
 }
 
+func (bp *BackpressureController) UpdatePredictions(predicted []float64) {
+	bp.predictedMu.Lock()
+	bp.predictedLoads = predicted
+	bp.predictedMu.Unlock()
+}
+
 func (bp *BackpressureController) Check(partitionID int) BackpressureState {
+	bp.predictedMu.RLock()
+	predicted := bp.predictedLoads
+	bp.predictedMu.RUnlock()
+
+	if partitionID < len(predicted) {
+		load := predicted[partitionID]
+		if load > bp.threshold {
+			return BPClosed
+		}
+		if load > bp.threshold*0.9 {
+			return BPWarn
+		}
+	}
+
 	if bp.predictor == nil {
 		return BPOpen
 	}
@@ -50,11 +74,11 @@ func (bp *BackpressureController) Check(partitionID int) BackpressureState {
 			return BPOpen
 		}
 
-		predicted := p.Predicted[idx]
-		if predicted > bp.threshold {
+		pv := p.Predicted[idx]
+		if pv > bp.threshold {
 			return BPClosed
 		}
-		if predicted > bp.threshold*0.9 {
+		if pv > bp.threshold*0.9 {
 			return BPWarn
 		}
 		return BPOpen

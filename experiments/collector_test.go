@@ -142,14 +142,15 @@ func TestEncodeDecodeLatency(t *testing.T) {
 	value := encodeValue(256)
 	require.Len(t, value, 256)
 
-	latency, ok := decodeLatency(value)
+	latency, ts, ok := decodeLatency(value)
 	require.True(t, ok)
+	require.Greater(t, ts, int64(0))
 	require.Less(t, latency, 1*time.Second,
 		"latency for in-process encode/decode should be sub-second")
 	require.GreaterOrEqual(t, latency, time.Duration(0))
 }
 
 func TestDecodeLatencyTooShort(t *testing.T) {
-	_, ok := decodeLatency([]byte{1, 2, 3})
+	_, _, ok := decodeLatency([]byte{1, 2, 3})
 	require.False(t, ok, "payload shorter than 8 bytes should fail")
 }
