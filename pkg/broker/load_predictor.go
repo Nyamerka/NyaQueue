@@ -13,7 +13,7 @@ type PartitionPrediction struct {
 }
 
 // LoadPredictor publishes partition load predictions via atomic.Value.
-// Uses moving-average as baseline; LSTM inference can replace predict().
+// Uses AR(p) autoregression with Yule-Walker coefficient estimation.
 type LoadPredictor struct {
 	predictions atomic.Value // stores []PartitionPrediction
 	mu          sync.Mutex
@@ -74,11 +74,7 @@ func (lp *LoadPredictor) predict() {
 			current = vals[len(vals)-1]
 		}
 
-		avg := movingAverage(vals)
-		predicted := make([]float64, lp.horizon)
-		for k := range predicted {
-			predicted[k] = avg
-		}
+		predicted := arPredict(vals, lp.horizon)
 
 		preds = append(preds, PartitionPrediction{
 			PartitionID: id,
@@ -108,15 +104,114 @@ func (lp *LoadPredictor) Stop() {
 	close(lp.stopCh)
 }
 
-func movingAverage(vals []float64) float64 {
-	if len(vals) == 0 {
-		return 0
+// arPredict forecasts `horizon` steps ahead using AR(p) autoregression.
+// The AR order p is automatically chosen as min(len(vals)/2, 8).
+// Coefficients are estimated via Yule-Walker equations solved with
+// Levinson-Durbin recursion (O(p²) time, no matrix inversion).
+// Falls back to simple mean when data is insufficient or constant.
+func arPredict(vals []float64, horizon int) []float64 {
+	predicted := make([]float64, horizon)
+	n := len(vals)
+	if n == 0 {
+		return predicted
 	}
-	sum := 0.0
+
+	mean := 0.0
 	for _, v := range vals {
-		sum += v
+		mean += v
 	}
-	return sum / float64(len(vals))
+	mean /= float64(n)
+
+	p := n / 2
+	if p > 8 {
+		p = 8
+	}
+	if p < 1 || n < 2*p {
+		for k := range predicted {
+			_ = k
+			predicted[k] = mean
+		}
+		return predicted
+	}
+
+	coeffs := yuleWalker(vals, mean, p)
+	if coeffs == nil {
+		for k := range predicted {
+			predicted[k] = mean
+		}
+		return predicted
+	}
+
+	centered := make([]float64, n)
+	for i, v := range vals {
+		centered[i] = v - mean
+	}
+
+	buf := make([]float64, n+horizon)
+	copy(buf, centered)
+
+	for k := 0; k < horizon; k++ {
+		idx := n + k
+		pred := 0.0
+		for j := 0; j < p; j++ {
+			pred += coeffs[j] * buf[idx-1-j]
+		}
+		buf[idx] = pred
+		predicted[k] = pred + mean
+		if predicted[k] < 0 {
+			predicted[k] = 0
+		}
+		if predicted[k] > 1 {
+			predicted[k] = 1
+		}
+	}
+
+	return predicted
+}
+
+// yuleWalker estimates AR(p) coefficients via Levinson-Durbin recursion.
+// Returns nil if the series has zero variance.
+func yuleWalker(vals []float64, mean float64, p int) []float64 {
+	n := len(vals)
+
+	r := make([]float64, p+1)
+	for lag := 0; lag <= p; lag++ {
+		sum := 0.0
+		for i := lag; i < n; i++ {
+			sum += (vals[i] - mean) * (vals[i-lag] - mean)
+		}
+		r[lag] = sum / float64(n)
+	}
+
+	if r[0] < 1e-15 {
+		return nil
+	}
+
+	a := make([]float64, p)
+	aOld := make([]float64, p)
+	a[0] = r[1] / r[0]
+	var e float64 = r[0] * (1 - a[0]*a[0])
+
+	for m := 1; m < p; m++ {
+		if e < 1e-15 {
+			return a[:m]
+		}
+
+		sum := r[m+1]
+		for j := 0; j < m; j++ {
+			sum -= a[j] * r[m-j]
+		}
+		k := sum / e
+
+		copy(aOld, a)
+		a[m] = k
+		for j := 0; j < m; j++ {
+			a[j] = aOld[j] - k*aOld[m-1-j]
+		}
+		e *= (1 - k*k)
+	}
+
+	return a
 }
 
 type RingBuffer struct {

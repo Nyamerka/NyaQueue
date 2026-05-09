@@ -13,11 +13,14 @@ import (
 
 // DQNScheduler uses a Deep Q-Network to adaptively set the priority threshold.
 //
+// Architecture mirrors DQN Balancer: inference uses RLock on model weights,
+// training runs in a separate goroutine fed via a non-blocking channel.
+//
 // State: [level_distribution(10), avg_wait_per_level(10), queue_depth, consumer_lag]
 // Action: threshold (0-9) — priorities >= threshold go by priority order, below by FIFO
 // Reward: weighted_latency_reduction - starvation_penalty
 type DQNScheduler struct {
-	mu sync.Mutex
+	weightsMu sync.RWMutex
 
 	hiddenSize int
 	stateSize  int
@@ -27,6 +30,7 @@ type DQNScheduler struct {
 	lr         float64
 	batchSize  int
 	minReplay  int
+	trainEvery int
 	weightInit float64
 
 	w1 *mat.Dense
@@ -35,13 +39,24 @@ type DQNScheduler struct {
 	b2 []float64
 
 	replayBuffer *nn.ReplayBuffer
-	lastState    []float64
-	lastAction   int
-	threshold    int
+
+	expCh  chan nn.Transition
+	stopCh chan struct{}
+	done   chan struct{}
+
+	stateMu    sync.Mutex
+	lastState  []float64
+	lastAction int
+	threshold  int
 
 	throttleOnLoad float64
 	fallbackFIFO   bool
 }
+
+const (
+	DefaultDQNSchedTrainEvery = 4
+	DefaultDQNSchedExpChSize  = 2048
+)
 
 type DQNSchedOption func(*DQNScheduler)
 
@@ -67,9 +82,13 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 		lr:           DefaultDQNSchedLearningRate,
 		batchSize:    DefaultDQNSchedBatchSize,
 		minReplay:    DefaultDQNSchedMinReplay,
+		trainEvery:   DefaultDQNSchedTrainEvery,
 		weightInit:   DefaultDQNSchedWeightInit,
 		replayBuffer: nn.NewReplayBuffer(DefaultDQNSchedReplayBufSize),
 		threshold:    DefaultDQNSchedThreshold,
+		expCh:        make(chan nn.Transition, DefaultDQNSchedExpChSize),
+		stopCh:       make(chan struct{}),
+		done:         make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -77,6 +96,9 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 	}
 
 	d.initWeights()
+
+	go d.trainLoop()
+
 	return d
 }
 
@@ -102,18 +124,28 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 		return nil, consumerOffset, oops.Errorf("partition %d has no PriorityIndex", partition.ID())
 	}
 
-	d.mu.Lock()
+	d.stateMu.Lock()
 	if d.fallbackFIFO {
-		d.mu.Unlock()
+		d.stateMu.Unlock()
 		return d.fifoFallback(partition, consumerOffset)
 	}
 
 	state := d.buildState(pi)
-	threshold := d.selectAction(state)
+
+	var threshold int
+	if rand.Float64() < d.epsilon {
+		threshold = rand.Intn(d.numActions)
+	} else {
+		d.weightsMu.RLock()
+		q, _ := d.forward(state)
+		d.weightsMu.RUnlock()
+		threshold = floats.MaxIdx(q)
+	}
+
 	d.threshold = threshold
 	d.lastState = state
 	d.lastAction = threshold
-	d.mu.Unlock()
+	d.stateMu.Unlock()
 
 	entry, ok := pi.PopWithThreshold(threshold)
 	if !ok {
@@ -131,31 +163,62 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 func (d *DQNScheduler) Enqueue(_ *broker.Message, _ int64) {}
 
 func (d *DQNScheduler) OnMetrics(m broker.Metrics) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
+	d.stateMu.Lock()
 	if d.lastState == nil {
+		d.stateMu.Unlock()
 		return
 	}
 
-	reward := -m.AvgLatency
-	nextState := d.lastState
-
-	d.replayBuffer.Push(nn.Transition{
+	t := nn.Transition{
 		State:     d.lastState,
 		Action:    []float64{float64(d.lastAction)},
-		Reward:    reward,
-		NextState: nextState,
+		Reward:    -m.AvgLatency,
+		NextState: d.lastState,
 		Done:      false,
-	})
+	}
+	d.stateMu.Unlock()
 
-	d.trainStep()
+	select {
+	case d.expCh <- t:
+	default:
+	}
 }
 
 func (d *DQNScheduler) SetFallbackFIFO(on bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	d.fallbackFIFO = on
+}
+
+// Stop terminates the background training goroutine.
+func (d *DQNScheduler) Stop() {
+	close(d.stopCh)
+	<-d.done
+}
+
+func (d *DQNScheduler) trainLoop() {
+	defer close(d.done)
+	steps := 0
+
+	for {
+		select {
+		case t := <-d.expCh:
+			d.replayBuffer.Push(t)
+			steps++
+			if steps%d.trainEvery == 0 {
+				d.trainStep()
+			}
+		case <-d.stopCh:
+			for {
+				select {
+				case t := <-d.expCh:
+					d.replayBuffer.Push(t)
+				default:
+					return
+				}
+			}
+		}
+	}
 }
 
 func (d *DQNScheduler) fifoFallback(partition *broker.Partition, consumerOffset uint64) (*broker.Message, uint64, error) {
@@ -191,14 +254,6 @@ func (d *DQNScheduler) buildState(pi *broker.PriorityIndex) []float64 {
 	}
 
 	return state
-}
-
-func (d *DQNScheduler) selectAction(state []float64) int {
-	if rand.Float64() < d.epsilon {
-		return rand.Intn(d.numActions)
-	}
-	q, _ := d.forward(state)
-	return floats.MaxIdx(q)
 }
 
 func (d *DQNScheduler) forward(state []float64) ([]float64, []float64) {
@@ -237,6 +292,10 @@ func (d *DQNScheduler) trainStep() {
 	}
 
 	batch := d.replayBuffer.Sample(d.batchSize)
+
+	d.weightsMu.Lock()
+	defer d.weightsMu.Unlock()
+
 	for _, t := range batch {
 		qValues, hidden := d.forward(t.State)
 		nextQ, _ := d.forward(t.NextState)

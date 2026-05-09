@@ -8,16 +8,17 @@ import (
 
 // Scenario defines a load pattern for benchmarking.
 type Scenario struct {
-	Name        string
-	Duration    time.Duration
-	Producers   int
-	Consumers   int
-	MsgSize     int           // bytes per message
-	RatePerSec  int           // target messages/second per producer
-	BurstEvery  time.Duration // inject burst at this interval (0 = no bursts)
-	BurstFactor int           // burst multiplier
-	SkewRatio   float64       // 0 = uniform, 1 = all traffic to one partition
-	Priorities  [10]float64   // probability distribution over priority levels
+	Name          string
+	Duration      time.Duration
+	NumPartitions int           // explicit partition count; 0 = use Producers
+	Producers     int
+	Consumers     int
+	MsgSize       int           // bytes per message
+	RatePerSec    int           // target messages/second per producer
+	BurstEvery    time.Duration // inject burst at this interval (0 = no bursts)
+	BurstFactor   int           // burst multiplier
+	SkewRatio     float64       // fraction of messages using a fixed hot key (0 = uniform)
+	Priorities    [10]float64   // probability distribution over priority levels
 }
 
 // Uniform generates steady, evenly distributed load at a rate both NyaQueue
@@ -102,6 +103,39 @@ func Overload() Scenario {
 	}
 }
 
+// SkewedK16 is Skewed with 16 partitions and proportionally higher load so
+// per-partition utilisation stays above 0.5 — the regime where DQN load
+// balancing is theoretically non-trivial (K ≥ 16, ρ > 0.5).
+func SkewedK16() Scenario {
+	return Scenario{
+		Name:          "skewed_k16",
+		Duration:      30 * time.Second,
+		NumPartitions: 16,
+		Producers:     16,
+		Consumers:     16,
+		MsgSize:       256,
+		RatePerSec:    4800, // 16×300 msg/s — same per-producer rate as Skewed
+		SkewRatio:     0.8,
+		Priorities:    uniformPriorities(),
+	}
+}
+
+// OverloadK16 sends at maximum throughput across 16 partitions with a skewed
+// priority distribution. At saturation queue depths diverge per partition,
+// giving the DQN balancer a meaningful signal to act on.
+func OverloadK16() Scenario {
+	return Scenario{
+		Name:          "overload_k16",
+		Duration:      30 * time.Second,
+		NumPartitions: 16,
+		Producers:     16,
+		Consumers:     16,
+		MsgSize:       256,
+		RatePerSec:    0, // unlimited
+		Priorities:    [10]float64{0.30, 0.25, 0.15, 0.10, 0.08, 0.05, 0.03, 0.02, 0.01, 0.01},
+	}
+}
+
 type Scenarios []Scenario
 
 // AllScenarios returns the full set of benchmark scenarios.
@@ -113,6 +147,8 @@ func AllScenarios() Scenarios {
 		GrowingLoad(),
 		MixedPriority(),
 		Overload(),
+		SkewedK16(),
+		OverloadK16(),
 	}
 }
 

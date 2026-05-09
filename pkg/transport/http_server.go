@@ -11,16 +11,25 @@ import (
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/samber/oops"
+	"golang.org/x/net/netutil"
 )
 
 type HTTPServer struct {
 	broker   *broker.Broker
 	server   *http.Server
 	listener net.Listener
+	reqSem   chan struct{}
 }
 
 func NewHTTPServer(b *broker.Broker) *HTTPServer {
-	s := &HTTPServer{broker: b}
+	cfg := b.Config()
+
+	var sem chan struct{}
+	if cfg.MaxQueuedRequests > 0 {
+		sem = make(chan struct{}, cfg.MaxQueuedRequests)
+	}
+
+	s := &HTTPServer{broker: b, reqSem: sem}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /topics", s.handleCreateTopic)
@@ -35,11 +44,40 @@ func NewHTTPServer(b *broker.Broker) *HTTPServer {
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	readTimeout := time.Duration(cfg.ReadTimeoutMs) * time.Millisecond
+	writeTimeout := time.Duration(cfg.WriteTimeoutMs) * time.Millisecond
+	if readTimeout == 0 {
+		readTimeout = 30 * time.Second
+	}
+	if writeTimeout == 0 {
+		writeTimeout = 30 * time.Second
+	}
+
+	var handler http.Handler = mux
+	if sem != nil {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+				mux.ServeHTTP(w, r)
+			default:
+				http.Error(w, `{"error":"server overloaded"}`, http.StatusServiceUnavailable)
+			}
+		})
+	}
+
 	s.server = &http.Server{
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		MaxHeaderBytes:    cfg.RecvBufferBytes,
 	}
 	return s
+}
+
+func (s *HTTPServer) MaxConnections() int {
+	return s.broker.Config().MaxConnections
 }
 
 func (s *HTTPServer) Start(addr string) error {
@@ -47,6 +85,12 @@ func (s *HTTPServer) Start(addr string) error {
 	if err != nil {
 		return oops.Wrapf(err, "http listen %s", addr)
 	}
+
+	maxConn := s.broker.Config().MaxConnections
+	if maxConn > 0 {
+		ln = netutil.LimitListener(ln, maxConn)
+	}
+
 	s.listener = ln
 	go s.server.Serve(ln)
 	return nil
@@ -162,11 +206,20 @@ func (s *HTTPServer) handleConsume(w http.ResponseWriter, r *http.Request) {
 	partitionStr := r.URL.Query().Get("partition")
 	maxBytesStr := r.URL.Query().Get("maxBytes")
 
+	cfg := s.broker.Config()
+
 	partition, _ := strconv.Atoi(partitionStr)
-	maxBytes := 1 << 20
+	maxBytes := cfg.MaxFetchBytes
 	if v, err := strconv.Atoi(maxBytesStr); err == nil && v > 0 {
 		maxBytes = v
 	}
+	if cfg.MaxFetchBytes > 0 && maxBytes > cfg.MaxFetchBytes {
+		maxBytes = cfg.MaxFetchBytes
+	}
+
+	fetchMinBytes := cfg.FetchMinBytes
+	fetchMaxWait := time.Duration(cfg.FetchMaxWaitMs) * time.Millisecond
+	deadline := time.Now().Add(fetchMaxWait)
 
 	var (
 		envelopes  []HTTPMessageEnvelope
@@ -177,6 +230,10 @@ func (s *HTTPServer) handleConsume(w http.ResponseWriter, r *http.Request) {
 		msg, nextOffset, err := s.broker.Consume(topic, group, partition)
 		if err != nil {
 			if errors.Is(err, broker.ErrNoMessages) {
+				if totalBytes < fetchMinBytes && time.Now().Before(deadline) {
+					time.Sleep(time.Millisecond)
+					continue
+				}
 				break
 			}
 			if len(envelopes) > 0 {

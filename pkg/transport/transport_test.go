@@ -330,3 +330,103 @@ func (s *TransportSuite) TestProduceBatchPreservesValues() {
 	require.Equal(s.T(), []byte("world"), consumed[1].Value)
 	require.Equal(s.T(), uint32(3), consumed[1].Priority)
 }
+
+type ConfigWiringSuite struct {
+	suite.Suite
+}
+
+func TestConfigWiringSuite(t *testing.T) { suite.Run(t, new(ConfigWiringSuite)) }
+
+func (s *ConfigWiringSuite) newBrokerWithConfig(cfg broker.Config) (*broker.Broker, *Server, *Client, func()) {
+	dir := s.T().TempDir()
+	offsetStore, err := broker.NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+
+	bal := balancer.NewRoundRobin()
+	b := broker.New(cfg, dir, bal, offsetStore)
+	b.Start()
+
+	srv := NewServer(b)
+	err = srv.Start(":0")
+	require.NoError(s.T(), err)
+
+	c, err := NewClient(srv.Addr())
+	require.NoError(s.T(), err)
+
+	cleanup := func() {
+		c.Close()
+		srv.Stop()
+		b.Stop()
+	}
+	return b, srv, c, cleanup
+}
+
+func (s *ConfigWiringSuite) TestMaxMessageBytesRejectsOversizedViaGRPC() {
+	cfg := broker.DefaultConfig()
+	cfg.MaxMessageBytes = 128
+	b, _, c, cleanup := s.newBrokerWithConfig(cfg)
+	defer cleanup()
+
+	ctx := context.Background()
+	require.NoError(s.T(), c.CreateTopic(ctx, "t", 1, pb.ScheduleMode_FIFO))
+	b.SetScheduler("t", scheduler.NewFIFO())
+
+	_, _, err := c.Produce(ctx, "t", []byte("k"), make([]byte, 50), 0)
+	require.NoError(s.T(), err)
+
+	_, _, err = c.Produce(ctx, "t", []byte("k"), make([]byte, 200), 0)
+	require.Error(s.T(), err)
+}
+
+func (s *ConfigWiringSuite) TestMaxFetchBytesClipsResponse() {
+	cfg := broker.DefaultConfig()
+	cfg.MaxFetchBytes = 64
+	cfg.FetchMinBytes = 1
+	cfg.FetchMaxWaitMs = 100
+	b, _, c, cleanup := s.newBrokerWithConfig(cfg)
+	defer cleanup()
+
+	ctx := context.Background()
+	require.NoError(s.T(), c.CreateTopic(ctx, "t", 1, pb.ScheduleMode_FIFO))
+	b.SetScheduler("t", scheduler.NewFIFO())
+
+	for i := 0; i < 10; i++ {
+		_, _, err := c.Produce(ctx, "t", []byte("k"), make([]byte, 20), 0)
+		require.NoError(s.T(), err)
+	}
+
+	msgs, err := c.Consume(ctx, "t", "g1", 0, 1<<20)
+	require.NoError(s.T(), err)
+	require.Less(s.T(), len(msgs), 10, "MaxFetchBytes should limit messages returned")
+	require.Greater(s.T(), len(msgs), 0)
+}
+
+func (s *ConfigWiringSuite) TestCompressionViaGRPC() {
+	cfg := broker.DefaultConfig()
+	cfg.CompressionType = broker.CompressionSnappy
+	b, _, c, cleanup := s.newBrokerWithConfig(cfg)
+	defer cleanup()
+
+	ctx := context.Background()
+	require.NoError(s.T(), c.CreateTopic(ctx, "t", 1, pb.ScheduleMode_FIFO))
+	b.SetScheduler("t", scheduler.NewFIFO())
+
+	payload := []byte("hello world compressed payload test data hello world")
+	_, _, err := c.Produce(ctx, "t", []byte("k"), payload, 0)
+	require.NoError(s.T(), err)
+
+	msgs, err := c.Consume(ctx, "t", "g1", 0, 1<<20)
+	require.NoError(s.T(), err)
+	require.Len(s.T(), msgs, 1)
+	require.Equal(s.T(), payload, msgs[0].Value, "decompressed value should match original")
+}
+
+func (s *ConfigWiringSuite) TestMaxQueuedRequestsSemaphore() {
+	cfg := broker.DefaultConfig()
+	cfg.MaxQueuedRequests = 1
+	_, srv, _, cleanup := s.newBrokerWithConfig(cfg)
+	defer cleanup()
+
+	require.NotNil(s.T(), srv.reqSem)
+	require.Equal(s.T(), 1, cap(srv.reqSem))
+}

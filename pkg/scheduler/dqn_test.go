@@ -26,6 +26,7 @@ func (s *DQNSchedSuite) TestSelectsFromPriorityIndex() {
 	}
 
 	dqn := NewDQNScheduler(WithDQNSchedEpsilon(0.0))
+	defer dqn.Stop()
 	msg, _, err := dqn.Next(p, 0)
 	require.NoError(s.T(), err)
 	require.NotNil(s.T(), msg)
@@ -41,6 +42,7 @@ func (s *DQNSchedSuite) TestFallbackFIFO() {
 	require.NoError(s.T(), err)
 
 	dqn := NewDQNScheduler()
+	defer dqn.Stop()
 	dqn.SetFallbackFIFO(true)
 
 	msg, nextOff, err := dqn.Next(p, 1)
@@ -65,6 +67,7 @@ func (s *DQNSchedSuite) TestFunctionalOptions() {
 	for _, tc := range tests {
 		s.Run(tc.name, func() {
 			dqn := NewDQNScheduler(tc.opts...)
+			defer dqn.Stop()
 			require.NotNil(s.T(), dqn)
 			require.NotNil(s.T(), dqn.w1)
 			require.NotNil(s.T(), dqn.w2)
@@ -84,17 +87,21 @@ func (s *DQNSchedSuite) TestOnMetrics() {
 	_, _, _ = dqn.Next(p, 0)
 
 	dqn.OnMetrics(broker.Metrics{AvgLatency: 10.0})
+
+	dqn.Stop()
 	require.Greater(s.T(), dqn.replayBuffer.Len(), 0)
 }
 
 func (s *DQNSchedSuite) TestOnMetricsWithoutPriorState() {
 	dqn := NewDQNScheduler()
 	dqn.OnMetrics(broker.Metrics{AvgLatency: 5.0})
+	dqn.Stop()
 	require.Equal(s.T(), 0, dqn.replayBuffer.Len(), "no push without prior state")
 }
 
 func (s *DQNSchedSuite) TestForwardOutputSize() {
 	dqn := NewDQNScheduler()
+	defer dqn.Stop()
 	state := make([]float64, dqn.stateSize)
 	q, hidden := dqn.forward(state)
 	require.Len(s.T(), q, dqn.numActions)
@@ -103,6 +110,7 @@ func (s *DQNSchedSuite) TestForwardOutputSize() {
 
 func (s *DQNSchedSuite) TestForwardDeterministic() {
 	dqn := NewDQNScheduler()
+	defer dqn.Stop()
 	state := make([]float64, dqn.stateSize)
 	for i := range state {
 		state[i] = float64(i) * 0.1
@@ -115,6 +123,7 @@ func (s *DQNSchedSuite) TestForwardDeterministic() {
 
 func (s *DQNSchedSuite) TestUpdateWeightsChangesWeights() {
 	dqn := NewDQNScheduler(WithDQNSchedLearningRate(0.1))
+	defer dqn.Stop()
 	state := make([]float64, dqn.stateSize)
 	for i := range state {
 		state[i] = 0.5
@@ -139,6 +148,7 @@ func (s *DQNSchedSuite) TestUpdateWeightsChangesWeights() {
 
 func (s *DQNSchedSuite) TestForwardShortState() {
 	dqn := NewDQNScheduler()
+	defer dqn.Stop()
 	state := []float64{0.1, 0.2}
 	q, hidden := dqn.forward(state)
 	require.Len(s.T(), q, dqn.numActions)
@@ -147,6 +157,7 @@ func (s *DQNSchedSuite) TestForwardShortState() {
 
 func (s *DQNSchedSuite) TestEnqueueNoop() {
 	dqn := NewDQNScheduler()
+	defer dqn.Stop()
 	require.NotPanics(s.T(), func() {
 		dqn.Enqueue(&broker.Message{}, 0)
 	})
@@ -154,6 +165,7 @@ func (s *DQNSchedSuite) TestEnqueueNoop() {
 
 func (s *DQNSchedSuite) TestSetFallbackFIFOToggle() {
 	dqn := NewDQNScheduler()
+	defer dqn.Stop()
 	require.False(s.T(), dqn.fallbackFIFO)
 	dqn.SetFallbackFIFO(true)
 	require.True(s.T(), dqn.fallbackFIFO)
@@ -163,11 +175,13 @@ func (s *DQNSchedSuite) TestSetFallbackFIFOToggle() {
 
 func (s *DQNSchedSuite) TestThrottleOnLoadOption() {
 	dqn := NewDQNScheduler(WithDQNSchedThrottleOnLoad(0.7))
+	defer dqn.Stop()
 	require.Equal(s.T(), 0.7, dqn.throttleOnLoad)
 }
 
 func (s *DQNSchedSuite) TestReplayBufSizeOption() {
 	dqn := NewDQNScheduler(WithDQNSchedReplayBufSize(500))
+	defer dqn.Stop()
 	require.NotNil(s.T(), dqn.replayBuffer)
 }
 
@@ -178,6 +192,30 @@ func (s *DQNSchedSuite) TestNoPriorityIndex() {
 	defer p.Close()
 
 	dqn := NewDQNScheduler()
+	defer dqn.Stop()
 	_, _, err = dqn.Next(p, 0)
 	require.Error(s.T(), err)
+}
+
+func (s *DQNSchedSuite) TestAsyncTrainingDoesNotBlockInference() {
+	dir := s.T().TempDir()
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone)
+	require.NoError(s.T(), err)
+	defer p.Close()
+
+	for i := 0; i < 200; i++ {
+		_, err := p.Append(broker.NewMessage(uint8(i%10), []byte("k"), []byte("v")))
+		require.NoError(s.T(), err)
+	}
+
+	dqn := NewDQNScheduler(WithDQNSchedEpsilon(0.5))
+	defer dqn.Stop()
+
+	for i := 0; i < 100; i++ {
+		_, _, _ = dqn.Next(p, 0)
+		dqn.OnMetrics(broker.Metrics{AvgLatency: float64(i)})
+	}
+
+	require.Greater(s.T(), dqn.replayBuffer.Len(), 0,
+		"experience should be collected via async channel")
 }

@@ -55,8 +55,8 @@ func WithHTTP(addr string) Option {
 	}
 }
 
-// WithLoadPredictor enables the LSTM-based load predictor that feeds
-// predicted partition loads into the DQN balancer and backpressure controller.
+// WithLoadPredictor enables the AR(p) load predictor that feeds predicted
+// partition loads into the DQN balancer and backpressure controller.
 func WithLoadPredictor(window, horizon int, interval time.Duration) Option {
 	return func(a *BrokerApp) {
 		a.loadPredictorCfg = &loadPredictorConfig{
@@ -86,6 +86,17 @@ func WithOptimizer(params []optimizer.TunableParam, interval time.Duration) Opti
 		a.optimizerCfg = &optimizerConfig{
 			params:   params,
 			interval: interval,
+		}
+	}
+}
+
+// WithLassoPilot provides pilot-run data for Lasso-based parameter selection.
+// When set, DDPG tunes only the subset of parameters that Lasso identifies as
+// significant at the given alpha. Must be called after WithOptimizer.
+func WithLassoPilot(pilot ...optimizer.PilotData) Option {
+	return func(a *BrokerApp) {
+		if a.optimizerCfg != nil {
+			a.optimizerCfg.pilot = pilot
 		}
 	}
 }

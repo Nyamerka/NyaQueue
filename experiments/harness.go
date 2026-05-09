@@ -56,22 +56,27 @@ type Harness struct {
 
 // HarnessConfig describes how to create a harness.
 type HarnessConfig struct {
-	Mode         Mode
-	BrokerConfig broker.Config
-	DataDir      string
-	Algorithm    AlgorithmConfig
-	KafkaBrokers []string
-	BrokerAddr   string
+	Mode          Mode
+	BrokerConfig  broker.Config
+	DataDir       string
+	Algorithm     AlgorithmConfig
+	NumPartitions int // passed to NewBalancer so partition-aware balancers use the correct K
+	KafkaBrokers  []string
+	BrokerAddr    string
 }
 
 // NewHarness creates and starts the target system.
 func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 	h := &Harness{mode: cfg.Mode}
 
+	// Wrap the partition-aware factory into the func() signature expected by app.
+	k := cfg.NumPartitions
+	balancerFactory := func() broker.Balancer { return cfg.Algorithm.NewBalancer(k) }
+
 	switch cfg.Mode {
 	case ModeInProcess:
 		a, err := app.New(cfg.BrokerConfig, cfg.DataDir,
-			app.WithBalancerFactory(cfg.Algorithm.NewBalancer),
+			app.WithBalancerFactory(balancerFactory),
 		)
 		if err != nil {
 			return nil, oops.Wrapf(err, "app new")
@@ -92,7 +97,7 @@ func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 		} else {
 			// Local broker with gRPC: loopback connection inside the same process.
 			a, err := app.New(cfg.BrokerConfig, cfg.DataDir,
-				app.WithBalancerFactory(cfg.Algorithm.NewBalancer),
+				app.WithBalancerFactory(balancerFactory),
 				app.WithGRPC(":0"),
 			)
 			if err != nil {
@@ -122,7 +127,7 @@ func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 			h.external = true
 		} else {
 			a, err := app.New(cfg.BrokerConfig, cfg.DataDir,
-				app.WithBalancerFactory(cfg.Algorithm.NewBalancer),
+				app.WithBalancerFactory(balancerFactory),
 				app.WithHTTP(":0"),
 			)
 			if err != nil {

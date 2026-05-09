@@ -81,12 +81,18 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		return ExperimentResult{}, oops.Wrapf(err, "create data dir")
 	}
 
+	// Determine partition count before creating the harness so that
+	// partition-aware balancers (PSA, DQN) are initialised with the correct K.
+	topicCfg := topicConfigFor(sc)
+	topicCfg.ScheduleMode = alg.Mode
+
 	h, err := NewHarness(ctx, HarnessConfig{
-		Mode:         mode,
-		BrokerConfig: broker.DefaultConfig(),
-		DataDir:      dataDir,
-		Algorithm:    alg,
-		BrokerAddr:   r.BrokerAddr,
+		Mode:          mode,
+		BrokerConfig:  broker.DefaultConfig(),
+		DataDir:       dataDir,
+		Algorithm:     alg,
+		NumPartitions: topicCfg.NumPartitions,
+		BrokerAddr:    r.BrokerAddr,
 	})
 	if err != nil {
 		return ExperimentResult{}, err
@@ -101,9 +107,6 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		}
 		cancel()
 	}
-
-	topicCfg := topicConfigFor(sc)
-	topicCfg.ScheduleMode = alg.Mode
 
 	if err := h.CreateTopic(ctx, expTopic, topicCfg); err != nil {
 		return ExperimentResult{}, oops.Wrapf(err, "create topic")
@@ -268,12 +271,8 @@ func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scena
 			return
 		}
 
-		key := make([]byte, 8)
-		binary.BigEndian.PutUint64(keyBuf, rand.Uint64())
-		copy(key, keyBuf)
-
 		batch = append(batch, BatchItem{
-			Key:      key,
+			Key:      generateKey(keyBuf, sc.SkewRatio),
 			Value:    encodeValue(msgSize),
 			Priority: sc.SamplePriority(),
 		})
@@ -324,12 +323,8 @@ func runUnlimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenari
 			return
 		}
 
-		key := make([]byte, 8)
-		binary.BigEndian.PutUint64(keyBuf, rand.Uint64())
-		copy(key, keyBuf)
-
 		batch = append(batch, BatchItem{
-			Key:      key,
+			Key:      generateKey(keyBuf, sc.SkewRatio),
 			Value:    encodeValue(msgSize),
 			Priority: sc.SamplePriority(),
 		})
@@ -408,9 +403,27 @@ func decodeLatency(value []byte) (time.Duration, bool) {
 
 func topicConfigFor(sc benchmarks.Scenario) broker.TopicConfig {
 	cfg := broker.DefaultTopicConfig()
-	cfg.NumPartitions = sc.Producers
-	if cfg.NumPartitions < 4 {
-		cfg.NumPartitions = 4
+	if sc.NumPartitions > 0 {
+		cfg.NumPartitions = sc.NumPartitions
+	} else {
+		cfg.NumPartitions = sc.Producers
+		if cfg.NumPartitions < 1 {
+			cfg.NumPartitions = 1
+		}
 	}
 	return cfg
+}
+
+// generateKey returns a message key respecting the scenario's SkewRatio.
+// With SkewRatio > 0, that fraction of messages get a fixed hot key (all-zeros)
+// which consistent-hashing balancers (PSA) will route to the same partition,
+// creating a realistic key-skew workload.
+func generateKey(buf []byte, skewRatio float64) []byte {
+	key := make([]byte, 8)
+	if skewRatio > 0 && rand.Float64() < skewRatio {
+		return key // hot key: all-zeros
+	}
+	binary.BigEndian.PutUint64(buf, rand.Uint64())
+	copy(key, buf)
+	return key
 }

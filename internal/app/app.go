@@ -26,6 +26,7 @@ type backpressureConfig struct {
 type optimizerConfig struct {
 	params   []optimizer.TunableParam
 	interval time.Duration
+	pilot    []optimizer.PilotData
 }
 
 // BrokerApp wires together the broker, offset store, transport, and pluggable
@@ -123,6 +124,7 @@ func New(cfg broker.Config, dataDir string, opts ...Option) (*BrokerApp, error) 
 			a.broker,
 			a.optimizerCfg.params,
 			a.optimizerCfg.interval,
+			a.optimizerCfg.pilot...,
 		)
 	}
 

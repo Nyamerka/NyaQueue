@@ -62,6 +62,86 @@ func (s *LoadPredictorSuite) TestEmptyPredictions() {
 	require.Empty(s.T(), preds)
 }
 
+func (s *LoadPredictorSuite) TestARPredictLinearTrend() {
+	vals := make([]float64, 30)
+	for i := range vals {
+		vals[i] = float64(i) * 0.01
+	}
+
+	predicted := arPredict(vals, 5)
+	require.Len(s.T(), predicted, 5)
+
+	lastVal := vals[len(vals)-1]
+	for _, p := range predicted {
+		require.Greater(s.T(), p, lastVal*0.5,
+			"AR should extrapolate upward trend, not collapse to mean")
+	}
+}
+
+func (s *LoadPredictorSuite) TestARPredictConstant() {
+	vals := make([]float64, 20)
+	for i := range vals {
+		vals[i] = 0.5
+	}
+
+	predicted := arPredict(vals, 3)
+	require.Len(s.T(), predicted, 3)
+	for _, p := range predicted {
+		require.InDelta(s.T(), 0.5, p, 0.01, "constant series should predict constant")
+	}
+}
+
+func (s *LoadPredictorSuite) TestARPredictEmptyInput() {
+	predicted := arPredict(nil, 5)
+	require.Len(s.T(), predicted, 5)
+	for _, p := range predicted {
+		require.Equal(s.T(), 0.0, p)
+	}
+}
+
+func (s *LoadPredictorSuite) TestARPredictShortSeries() {
+	predicted := arPredict([]float64{0.5}, 3)
+	require.Len(s.T(), predicted, 3)
+	for _, p := range predicted {
+		require.InDelta(s.T(), 0.5, p, 0.01)
+	}
+}
+
+func (s *LoadPredictorSuite) TestARPredictClampsBounds() {
+	vals := make([]float64, 30)
+	for i := range vals {
+		vals[i] = 0.99 + float64(i)*0.001
+	}
+
+	predicted := arPredict(vals, 5)
+	for _, p := range predicted {
+		require.GreaterOrEqual(s.T(), p, 0.0)
+		require.LessOrEqual(s.T(), p, 1.0)
+	}
+}
+
+func (s *LoadPredictorSuite) TestYuleWalkerCoefficients() {
+	vals := make([]float64, 50)
+	for i := range vals {
+		vals[i] = float64(i) * 0.1
+	}
+	mean := 0.0
+	for _, v := range vals {
+		mean += v
+	}
+	mean /= float64(len(vals))
+
+	coeffs := yuleWalker(vals, mean, 4)
+	require.NotNil(s.T(), coeffs)
+	require.Len(s.T(), coeffs, 4)
+}
+
+func (s *LoadPredictorSuite) TestYuleWalkerZeroVariance() {
+	vals := []float64{1, 1, 1, 1, 1}
+	coeffs := yuleWalker(vals, 1.0, 2)
+	require.Nil(s.T(), coeffs, "zero-variance series should return nil coefficients")
+}
+
 func (s *LoadPredictorSuite) TestConcurrentUpdateAndPredict() {
 	lp := NewLoadPredictor(10, 3, 1*time.Millisecond)
 	lp.Start()

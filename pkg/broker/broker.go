@@ -41,10 +41,17 @@ type Broker struct {
 	backpressure *BackpressureController
 	offsetStore  *OffsetStore
 
+	ioPool chan struct{}
+
 	stopCh chan struct{}
 }
 
 func New(cfg Config, dataDir string, bal Balancer, offsetStore *OffsetStore) *Broker {
+	ioPoolSize := cfg.NumIOGoroutines
+	if ioPoolSize <= 0 {
+		ioPoolSize = 4
+	}
+
 	b := &Broker{
 		config:      cfg,
 		dataDir:     dataDir,
@@ -52,6 +59,7 @@ func New(cfg Config, dataDir string, bal Balancer, offsetStore *OffsetStore) *Br
 		balancer:    bal,
 		schedulers:  make(map[string]Scheduler),
 		offsetStore: offsetStore,
+		ioPool:      make(chan struct{}, ioPoolSize),
 		stopCh:      make(chan struct{}),
 	}
 
@@ -154,7 +162,39 @@ func (b *Broker) ListTopics() []*Topic {
 	return topics
 }
 
+func (b *Broker) compressMessage(msg *Message) error {
+	if b.config.CompressionType == CompressionNone {
+		return nil
+	}
+	compressed, err := Compress(msg.Value, b.config.CompressionType)
+	if err != nil {
+		return oops.Wrapf(err, "compress message value")
+	}
+	msg.Value = compressed
+	return nil
+}
+
+func (b *Broker) decompressMessage(msg *Message) error {
+	if b.config.CompressionType == CompressionNone {
+		return nil
+	}
+	decompressed, err := Decompress(msg.Value, b.config.CompressionType)
+	if err != nil {
+		return oops.Wrapf(err, "decompress message value")
+	}
+	msg.Value = decompressed
+	return nil
+}
+
 func (b *Broker) Publish(topicName string, msg *Message) (partition int, offset uint64, err error) {
+	if err := b.checkMessageSize(msg); err != nil {
+		return 0, 0, err
+	}
+
+	if err := b.compressMessage(msg); err != nil {
+		return 0, 0, err
+	}
+
 	b.mu.RLock()
 	t, exists := b.topics[topicName]
 	bal := b.balancer
@@ -221,6 +261,15 @@ func (b *Broker) PublishBatch(topicName string, msgs []*Message) []PublishResult
 	groups := make(map[int][]indexed, numParts)
 
 	for i, msg := range msgs {
+		if err := b.checkMessageSize(msg); err != nil {
+			results[i].Err = err
+			continue
+		}
+		if err := b.compressMessage(msg); err != nil {
+			results[i].Err = err
+			continue
+		}
+
 		partIdx := bal.SelectPartition(topicName, msg.Key, numParts)
 		results[i].Partition = partIdx
 
@@ -231,31 +280,41 @@ func (b *Broker) PublishBatch(topicName string, msgs []*Message) []PublishResult
 		groups[partIdx] = append(groups[partIdx], indexed{msg, i})
 	}
 
+	var wg sync.WaitGroup
 	for partIdx, batch := range groups {
-		p, err := t.Partition(partIdx)
-		if err != nil {
-			for _, item := range batch {
-				results[item.idx].Err = err
-			}
-			continue
-		}
+		wg.Add(1)
+		go func(partIdx int, batch []indexed) {
+			defer wg.Done()
 
-		batchMsgs := make([]*Message, len(batch))
-		for j, item := range batch {
-			batchMsgs[j] = item.msg
-		}
+			b.ioPool <- struct{}{}
+			defer func() { <-b.ioPool }()
 
-		offsets, err := p.AppendBatch(batchMsgs)
-		for j, item := range batch {
+			p, err := t.Partition(partIdx)
 			if err != nil {
-				results[item.idx].Err = err
-			} else {
-				results[item.idx].Offset = offsets[j]
+				for _, item := range batch {
+					results[item.idx].Err = err
+				}
+				return
 			}
-		}
 
-		b.metrics.RecordProduceBatch(topicName, partIdx, len(batch))
+			batchMsgs := make([]*Message, len(batch))
+			for j, item := range batch {
+				batchMsgs[j] = item.msg
+			}
+
+			offsets, err := p.AppendBatch(batchMsgs)
+			for j, item := range batch {
+				if err != nil {
+					results[item.idx].Err = err
+				} else {
+					results[item.idx].Offset = offsets[j]
+				}
+			}
+
+			b.metrics.RecordProduceBatch(topicName, partIdx, len(batch))
+		}(partIdx, batch)
 	}
+	wg.Wait()
 
 	return results
 }
@@ -291,6 +350,10 @@ func (b *Broker) Consume(topicName, group string, partIdx int) (*Message, uint64
 
 	msg, nextOffset, err := sched.Next(p, consumerOffset)
 	if err != nil {
+		return nil, 0, err
+	}
+
+	if err := b.decompressMessage(msg); err != nil {
 		return nil, 0, err
 	}
 
@@ -338,11 +401,19 @@ func (b *Broker) metricsLoop() {
 	}
 }
 
+type Stopper interface {
+	Stop()
+}
+
 func (b *Broker) Stop() {
 	close(b.stopCh)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if s, ok := b.balancer.(Stopper); ok {
+		s.Stop()
+	}
 
 	for _, t := range b.topics {
 		if err := t.Close(); err != nil {
@@ -355,4 +426,15 @@ func (b *Broker) Stop() {
 	}
 }
 
-var ErrThrottled = errors.New("backpressure: partition overloaded, try again later")
+var (
+	ErrThrottled       = errors.New("backpressure: partition overloaded, try again later")
+	ErrMessageTooLarge = errors.New("message exceeds MaxMessageBytes")
+)
+
+func (b *Broker) checkMessageSize(msg *Message) error {
+	if b.config.MaxMessageBytes > 0 && len(msg.Key)+len(msg.Value) > b.config.MaxMessageBytes {
+		return oops.Wrapf(ErrMessageTooLarge, "size %d > limit %d",
+			len(msg.Key)+len(msg.Value), b.config.MaxMessageBytes)
+	}
+	return nil
+}

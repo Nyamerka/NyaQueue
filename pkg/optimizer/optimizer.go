@@ -8,6 +8,13 @@ import (
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 )
 
+// PilotData holds results from pilot runs used for Lasso calibration.
+type PilotData struct {
+	Configs     [][]float64 // each row: one config vector (len == NumTunableParams)
+	Throughputs []float64   // observed throughput per config
+	Alpha       float64     // L1 regularisation strength
+}
+
 // Optimizer runs the DDPG training loop on Lasso-selected broker parameters.
 type Optimizer struct {
 	mu sync.Mutex
@@ -23,8 +30,15 @@ type Optimizer struct {
 	stopCh      chan struct{}
 }
 
-func NewOptimizer(b *broker.Broker, params []TunableParam, interval time.Duration) *Optimizer {
-	active := ActiveParams(params)
+func NewOptimizer(b *broker.Broker, params []TunableParam, interval time.Duration, pilot ...PilotData) *Optimizer {
+	calibrated := params
+	if len(pilot) > 0 && len(pilot[0].Configs) > 0 {
+		calibrated = CalibrateWeights(params, pilot[0].Configs, pilot[0].Throughputs, pilot[0].Alpha)
+		log.Printf("[optimizer] Lasso calibration: %d/%d params active (alpha=%.4f)",
+			len(ActiveParams(calibrated)), len(params), pilot[0].Alpha)
+	}
+
+	active := ActiveParams(calibrated)
 	stateSize := len(active) + 3 // params + throughput + latency + success_rate
 	actionSize := len(active)
 

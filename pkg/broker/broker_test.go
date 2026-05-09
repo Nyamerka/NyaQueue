@@ -215,6 +215,129 @@ func (s *BrokerSuite) TestDeleteAndRecreateTopic() {
 	require.Equal(s.T(), []byte("new"), got.Value, "should see only the new message, not stale data")
 }
 
+func (s *BrokerSuite) TestPublishRejectsOversizedMessage() {
+	dir := s.T().TempDir()
+	store, err := NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+
+	cfg := DefaultConfig()
+	cfg.MaxMessageBytes = 100
+	b := New(cfg, dir, noopBalancer{}, store)
+	defer b.Stop()
+
+	tcfg := DefaultTopicConfig()
+	tcfg.NumPartitions = 1
+	require.NoError(s.T(), b.CreateTopic("t", tcfg))
+	b.SetScheduler("t", fifoScheduler{})
+
+	small := NewMessage(0, []byte("k"), make([]byte, 50))
+	_, _, err = b.Publish("t", small)
+	require.NoError(s.T(), err)
+
+	big := NewMessage(0, []byte("k"), make([]byte, 200))
+	_, _, err = b.Publish("t", big)
+	require.ErrorIs(s.T(), err, ErrMessageTooLarge)
+}
+
+func (s *BrokerSuite) TestPublishBatchRejectsOversizedMessage() {
+	dir := s.T().TempDir()
+	store, err := NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+
+	cfg := DefaultConfig()
+	cfg.MaxMessageBytes = 100
+	b := New(cfg, dir, noopBalancer{}, store)
+	defer b.Stop()
+
+	tcfg := DefaultTopicConfig()
+	tcfg.NumPartitions = 1
+	require.NoError(s.T(), b.CreateTopic("t", tcfg))
+	b.SetScheduler("t", fifoScheduler{})
+
+	msgs := []*Message{
+		NewMessage(0, []byte("k"), make([]byte, 50)),
+		NewMessage(0, []byte("k"), make([]byte, 200)),
+		NewMessage(0, []byte("k"), make([]byte, 30)),
+	}
+
+	results := b.PublishBatch("t", msgs)
+	require.Len(s.T(), results, 3)
+	require.NoError(s.T(), results[0].Err)
+	require.ErrorIs(s.T(), results[1].Err, ErrMessageTooLarge)
+	require.NoError(s.T(), results[2].Err)
+}
+
+func (s *BrokerSuite) TestCompressionRoundTrip() {
+	for _, codec := range []int{CompressionSnappy, CompressionGzip, CompressionLZ4} {
+		s.Run(compressionName(codec), func() {
+			dir := s.T().TempDir()
+			store, err := NewOffsetStore(dir)
+			require.NoError(s.T(), err)
+
+			cfg := DefaultConfig()
+			cfg.CompressionType = codec
+			b := New(cfg, dir, noopBalancer{}, store)
+			defer b.Stop()
+
+			tcfg := DefaultTopicConfig()
+			tcfg.NumPartitions = 1
+			require.NoError(s.T(), b.CreateTopic("t", tcfg))
+			b.SetScheduler("t", fifoScheduler{})
+
+			original := []byte("hello world this is a compression test payload")
+			msg := NewMessage(0, []byte("k"), original)
+			_, _, err = b.Publish("t", msg)
+			require.NoError(s.T(), err)
+
+			got, _, err := b.Consume("t", "grp", 0)
+			require.NoError(s.T(), err)
+			require.Equal(s.T(), original, got.Value)
+		})
+	}
+}
+
+func compressionName(codec int) string {
+	switch codec {
+	case CompressionSnappy:
+		return "snappy"
+	case CompressionGzip:
+		return "gzip"
+	case CompressionLZ4:
+		return "lz4"
+	default:
+		return "none"
+	}
+}
+
+func (s *BrokerSuite) TestIOPoolConcurrentBatchWrites() {
+	dir := s.T().TempDir()
+	store, err := NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+
+	cfg := DefaultConfig()
+	cfg.NumIOGoroutines = 2
+	b := New(cfg, dir, noopBalancer{}, store)
+	defer b.Stop()
+
+	tcfg := DefaultTopicConfig()
+	tcfg.NumPartitions = 4
+	require.NoError(s.T(), b.CreateTopic("t", tcfg))
+	b.SetScheduler("t", fifoScheduler{})
+
+	msgs := make([]*Message, 100)
+	for i := range msgs {
+		msgs[i] = NewMessage(0, []byte("k"), []byte("v"))
+	}
+
+	results := b.PublishBatch("t", msgs)
+	require.Len(s.T(), results, 100)
+
+	for _, r := range results {
+		require.NoError(s.T(), r.Err)
+		require.Greater(s.T(), r.Offset, uint64(0))
+	}
+}
+
 // fifoScheduler is a minimal in-package scheduler for testing.
 type fifoScheduler struct{}
 

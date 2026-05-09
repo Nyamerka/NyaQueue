@@ -1,7 +1,9 @@
 package balancer
 
 import (
+	"runtime"
 	"testing"
+	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/stretchr/testify/require"
@@ -29,6 +31,7 @@ func (s *DQNSuite) TestSelectPartition() {
 	for _, tc := range tests {
 		s.Run(tc.name, func() {
 			dqn := NewDQNBalancer(tc.partitions, tc.opts...)
+			defer dqn.Stop()
 			p := dqn.SelectPartition("t", []byte("k"), tc.partitions)
 			require.GreaterOrEqual(s.T(), p, 0)
 			require.Less(s.T(), p, tc.partitions)
@@ -38,18 +41,19 @@ func (s *DQNSuite) TestSelectPartition() {
 
 func (s *DQNSuite) TestFallbackWatchdog() {
 	dqn := NewDQNBalancer(4, WithDQNEpsilon(0.0), WithDQNLoadThreshold(0))
+	defer dqn.Stop()
 	dqn.SetBaseThroughput(1000)
 
 	dqn.OnMetrics(broker.Metrics{
 		PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5},
-		Throughput:     500, // below 0.8 * 1000
+		Throughput:     500,
 	})
 
 	require.True(s.T(), dqn.IsFallbackActive())
 
 	dqn.OnMetrics(broker.Metrics{
 		PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5},
-		Throughput:     900, // above threshold
+		Throughput:     900,
 	})
 
 	require.False(s.T(), dqn.IsFallbackActive())
@@ -57,6 +61,7 @@ func (s *DQNSuite) TestFallbackWatchdog() {
 
 func (s *DQNSuite) TestProactiveWatchdog() {
 	dqn := NewDQNBalancer(4, WithDQNLoadThreshold(0.7))
+	defer dqn.Stop()
 
 	dqn.OnMetrics(broker.Metrics{
 		PartitionLoads: []float64{0.3, 0.3, 0.3, 0.3},
@@ -75,33 +80,33 @@ func (s *DQNSuite) TestProactiveWatchdog() {
 }
 
 func (s *DQNSuite) TestOnMetricsTrains() {
-	dqn := NewDQNBalancer(4)
+	dqn := NewDQNBalancer(4, WithDQNTrainEvery(1))
+	defer dqn.Stop()
 
 	dqn.SelectPartition("t", []byte("k"), 4)
 	dqn.OnMetrics(broker.Metrics{
 		PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8},
 	})
 
-	require.Greater(s.T(), dqn.replayBuffer.Len(), 0)
+	require.Eventually(s.T(), func() bool {
+		return dqn.replayBuffer.Len() > 0
+	}, time.Second, 5*time.Millisecond)
 }
 
 func (s *DQNSuite) TestComputeRewardEmpty() {
-	dqn := NewDQNBalancer(4)
-	reward := dqn.computeReward(broker.Metrics{})
+	reward := computeReward(broker.Metrics{})
 	require.Equal(s.T(), 0.0, reward)
 }
 
 func (s *DQNSuite) TestComputeRewardPerfectBalance() {
-	dqn := NewDQNBalancer(4)
-	reward := dqn.computeReward(broker.Metrics{
+	reward := computeReward(broker.Metrics{
 		PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5},
 	})
 	require.Equal(s.T(), 0.0, reward)
 }
 
 func (s *DQNSuite) TestComputeRewardImbalance() {
-	dqn := NewDQNBalancer(4)
-	reward := dqn.computeReward(broker.Metrics{
+	reward := computeReward(broker.Metrics{
 		PartitionLoads: []float64{0.1, 0.9, 0.1, 0.9},
 	})
 	require.Less(s.T(), reward, 0.0, "imbalanced loads yield negative reward")
@@ -109,40 +114,66 @@ func (s *DQNSuite) TestComputeRewardImbalance() {
 
 func (s *DQNSuite) TestSetPredictedLoads() {
 	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
 	dqn.SetPredictedLoads([]float64{0.1, 0.2, 0.3, 0.4})
-	require.Equal(s.T(), []float64{0.1, 0.2, 0.3, 0.4}, dqn.predictedLoads)
+
+	dqn.stateMu.Lock()
+	loads := dqn.predictedLoads
+	dqn.stateMu.Unlock()
+	require.Equal(s.T(), []float64{0.1, 0.2, 0.3, 0.4}, loads)
 }
 
 func (s *DQNSuite) TestBuildStateSize() {
 	dqn := NewDQNBalancer(4)
-	state := dqn.buildState()
+	defer dqn.Stop()
+
+	dqn.stateMu.Lock()
+	state := dqn.buildStateLocked()
+	dqn.stateMu.Unlock()
 	require.Len(s.T(), state, 4*2+2)
 }
 
 func (s *DQNSuite) TestForwardOutputSize() {
 	dqn := NewDQNBalancer(4)
-	state := dqn.buildState()
+	defer dqn.Stop()
+
+	dqn.stateMu.Lock()
+	state := dqn.buildStateLocked()
+	dqn.stateMu.Unlock()
+
+	dqn.weightsMu.RLock()
 	q, hidden := dqn.forward(state)
+	dqn.weightsMu.RUnlock()
 	require.Len(s.T(), q, 4)
 	require.Len(s.T(), hidden, dqn.hiddenSize)
 }
 
 func (s *DQNSuite) TestForwardDeterministic() {
 	dqn := NewDQNBalancer(4, WithDQNEpsilon(0))
+	defer dqn.Stop()
 	state := []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.0, 0.0}
+
+	dqn.weightsMu.RLock()
 	q1, h1 := dqn.forward(state)
 	q2, h2 := dqn.forward(state)
+	dqn.weightsMu.RUnlock()
+
 	require.InDeltaSlice(s.T(), q1, q2, 1e-12)
 	require.InDeltaSlice(s.T(), h1, h2, 1e-12)
 }
 
 func (s *DQNSuite) TestUpdateWeightsChangesWeights() {
 	dqn := NewDQNBalancer(4, WithDQNLearningRate(0.1))
-	state := dqn.buildState()
+	defer dqn.Stop()
+
+	dqn.stateMu.Lock()
+	state := dqn.buildStateLocked()
+	dqn.stateMu.Unlock()
 	for i := range state {
 		state[i] = 0.5
 	}
 
+	dqn.weightsMu.Lock()
 	qBefore, hidden := dqn.forward(state)
 	beforeCopy := make([]float64, len(qBefore))
 	copy(beforeCopy, qBefore)
@@ -150,6 +181,8 @@ func (s *DQNSuite) TestUpdateWeightsChangesWeights() {
 	dqn.updateWeights(state, 0, 1.0, hidden)
 
 	qAfter, _ := dqn.forward(state)
+	dqn.weightsMu.Unlock()
+
 	changed := false
 	for i := range qBefore {
 		if qAfter[i] != beforeCopy[i] {
@@ -172,6 +205,7 @@ func (s *DQNSuite) TestAllOptions() {
 		WithDQNWeightInit(0.05),
 		WithDQNReplayBufSize(1000),
 	)
+	defer dqn.Stop()
 	require.Equal(s.T(), 0.1, dqn.epsilon)
 	require.Equal(s.T(), 0.9, dqn.gamma)
 	require.Equal(s.T(), 0.01, dqn.lr)
@@ -183,12 +217,37 @@ func (s *DQNSuite) TestAllOptions() {
 }
 
 func (s *DQNSuite) TestTrainStepWithEnoughData() {
-	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2))
+	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
+	defer dqn.Stop()
 	for i := 0; i < 5; i++ {
 		dqn.SelectPartition("t", []byte("k"), 4)
 		dqn.OnMetrics(broker.Metrics{
 			PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4},
 		})
 	}
-	require.GreaterOrEqual(s.T(), dqn.replayBuffer.Len(), 2)
+	require.Eventually(s.T(), func() bool {
+		return dqn.replayBuffer.Len() >= 2
+	}, time.Second, 5*time.Millisecond)
+}
+
+func (s *DQNSuite) TestAsyncTrainingDoesNotBlockInference() {
+	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
+	defer dqn.Stop()
+
+	for i := 0; i < 100; i++ {
+		dqn.SelectPartition("t", []byte("k"), 4)
+		dqn.OnMetrics(broker.Metrics{
+			PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4},
+		})
+	}
+
+	start := time.Now()
+	for i := 0; i < 1000; i++ {
+		dqn.SelectPartition("t", []byte("k"), 4)
+		runtime.Gosched()
+	}
+	elapsed := time.Since(start)
+
+	require.Less(s.T(), elapsed, 500*time.Millisecond,
+		"1000 inference calls should complete quickly without training contention")
 }

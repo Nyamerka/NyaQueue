@@ -7,19 +7,19 @@ import (
 	"math"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/dgraph-io/badger/v4"
+	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/samber/oops"
-
-	bbolt "go.etcd.io/bbolt"
 )
 
-var offsetsBucket = []byte("offsets")
+var offsetsPrefix = []byte("off/")
 
 // OffsetStore tracks consumer offsets. Hot-path reads and writes go through an
-// in-memory cache (sync.Map). A background goroutine periodically dumps dirty
-// entries to BoltDB for durability.
+// in-memory cache (xsync.MapOf — cache-line hash table, lock-free reads). A
+// background goroutine periodically flushes dirty entries to BadgerDB via
+// WriteBatch for durability.
 //
 // Trade-off: when dumpInterval > 0, offsets committed between the last
 // successful flush and a crash are lost. On restart consumers will re-receive
@@ -27,47 +27,68 @@ var offsetsBucket = []byte("offsets")
 // deliberate compromise to keep fsync off the hot path; set dumpInterval to 0
 // (or use SyncEveryWrite) for stronger guarantees at the cost of throughput.
 type OffsetStore struct {
-	db    *bbolt.DB
-	cache sync.Map // string -> int64
+	db    *badger.DB
+	cache *xsync.MapOf[string, int64]
 
 	dumpInterval time.Duration
 	stopCh       chan struct{}
 	stopped      chan struct{}
 }
 
-// NewOffsetStore opens the offset database. When dumpInterval > 0 the store
-// runs a background goroutine that flushes the in-memory cache to BoltDB at
-// that cadence, removing the fsync-per-commit overhead from the hot path.
+func badgerKey(cacheKey string) []byte {
+	return append(offsetsPrefix, []byte(cacheKey)...)
+}
+
+func badgerOpts(dir string) badger.Options {
+	return badger.DefaultOptions(dir).
+		WithLogger(nil).
+		WithNumVersionsToKeep(1).
+		WithCompactL0OnClose(true).
+		WithValueLogFileSize(16 << 20)
+}
+
+// NewOffsetStore opens the offset database backed by BadgerDB. When
+// dumpInterval > 0 the store runs a background goroutine that flushes the
+// in-memory cache to BadgerDB at that cadence via WriteBatch, removing the
+// fsync-per-commit overhead from the hot path.
 func NewOffsetStore(dataDir string, dumpInterval ...time.Duration) (*OffsetStore, error) {
-	path := filepath.Join(dataDir, "offsets.db")
-	db, err := bbolt.Open(path, 0600, nil)
+	dir := filepath.Join(dataDir, "offsets.badger")
+	db, err := badger.Open(badgerOpts(dir))
 	if err != nil {
 		return nil, oops.Wrapf(err, "open offset store")
 	}
 
-	err = db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(offsetsBucket)
-		return err
-	})
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
-
 	s := &OffsetStore{
 		db:      db,
+		cache:   xsync.NewMapOf[string, int64](),
 		stopCh:  make(chan struct{}),
 		stopped: make(chan struct{}),
 	}
 
-	// Warm cache from BoltDB.
-	_ = db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(offsetsBucket)
-		return b.ForEach(func(k, v []byte) error {
-			s.cache.Store(string(k), int64(binary.BigEndian.Uint64(v)))
-			return nil
-		})
+	err = db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = offsetsPrefix
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := string(item.Key()[len(offsetsPrefix):])
+			if err := item.Value(func(val []byte) error {
+				if len(val) == 8 {
+					s.cache.Store(key, int64(binary.BigEndian.Uint64(val)))
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
+	if err != nil {
+		db.Close()
+		return nil, oops.Wrapf(err, "warm offset cache")
+	}
 
 	if len(dumpInterval) > 0 && dumpInterval[0] > 0 {
 		s.dumpInterval = dumpInterval[0]
@@ -82,7 +103,7 @@ func (s *OffsetStore) bucketKey(topic string, partition int, group string) strin
 }
 
 // Commit stores the offset in the in-memory cache. The value is persisted to
-// BoltDB by the background dump goroutine (or synchronously when no dump
+// BadgerDB by the background dump goroutine (or synchronously when no dump
 // interval is configured).
 func (s *OffsetStore) Commit(group, topic string, partition int, offset int64) error {
 	key := s.bucketKey(topic, partition, group)
@@ -99,7 +120,7 @@ func (s *OffsetStore) Commit(group, topic string, partition int, offset int64) e
 func (s *OffsetStore) Load(group, topic string, partition int) (int64, error) {
 	key := s.bucketKey(topic, partition, group)
 	if v, ok := s.cache.Load(key); ok {
-		return v.(int64), nil
+		return v, nil
 	}
 	return 0, oops.Errorf("offset not found for %s/%d/%s", topic, partition, group)
 }
@@ -111,10 +132,8 @@ func (s *OffsetStore) CommitFloor(topic string, partition int) (int64, error) {
 	minOffset := int64(math.MaxInt64)
 	found := false
 
-	s.cache.Range(func(k, v any) bool {
-		key := k.(string)
+	s.cache.Range(func(key string, off int64) bool {
 		if strings.HasPrefix(key, prefix) {
-			off := v.(int64)
 			if off < minOffset {
 				minOffset = off
 			}
@@ -132,9 +151,9 @@ func (s *OffsetStore) CommitFloor(topic string, partition int) (int64, error) {
 func (s *OffsetStore) DeleteTopic(topic string) {
 	prefix := topic + "/"
 	var keys []string
-	s.cache.Range(func(k, _ any) bool {
-		if strings.HasPrefix(k.(string), prefix) {
-			keys = append(keys, k.(string))
+	s.cache.Range(func(key string, _ int64) bool {
+		if strings.HasPrefix(key, prefix) {
+			keys = append(keys, key)
 		}
 		return true
 	})
@@ -142,21 +161,20 @@ func (s *OffsetStore) DeleteTopic(topic string) {
 		s.cache.Delete(k)
 	}
 
-	_ = s.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(offsetsBucket)
-		for _, k := range keys {
-			_ = b.Delete([]byte(k))
-		}
-		return nil
-	})
+	wb := s.db.NewWriteBatch()
+	for _, k := range keys {
+		_ = wb.Delete(badgerKey(k))
+	}
+	if err := wb.Flush(); err != nil {
+		log.Printf("offset store: delete topic %q from BadgerDB failed: %v", topic, err)
+	}
 }
 
 func (s *OffsetStore) writeOne(key string, offset int64) error {
-	return s.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(offsetsBucket)
-		val := make([]byte, 8)
-		binary.BigEndian.PutUint64(val, uint64(offset))
-		return b.Put([]byte(key), val)
+	val := make([]byte, 8)
+	binary.BigEndian.PutUint64(val, uint64(offset))
+	return s.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(badgerKey(key), val)
 	})
 }
 
@@ -177,27 +195,26 @@ func (s *OffsetStore) dumpLoop() {
 }
 
 func (s *OffsetStore) dump() {
-	snapshot := make(map[string]int64)
-	s.cache.Range(func(k, v any) bool {
-		snapshot[k.(string)] = v.(int64)
+	wb := s.db.NewWriteBatch()
+	count := 0
+
+	s.cache.Range(func(key string, offset int64) bool {
+		val := make([]byte, 8)
+		binary.BigEndian.PutUint64(val, uint64(offset))
+		if err := wb.Set(badgerKey(key), val); err != nil {
+			log.Printf("offset store: WriteBatch.Set failed for key %q: %v", key, err)
+		}
+		count++
 		return true
 	})
-	if len(snapshot) == 0 {
+
+	if count == 0 {
+		wb.Cancel()
 		return
 	}
 
-	if err := s.db.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(offsetsBucket)
-		for key, offset := range snapshot {
-			val := make([]byte, 8)
-			binary.BigEndian.PutUint64(val, uint64(offset))
-			if err := b.Put([]byte(key), val); err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
-		log.Printf("offset store: flush to BoltDB failed (%d entries): %v", len(snapshot), err)
+	if err := wb.Flush(); err != nil {
+		log.Printf("offset store: flush to BadgerDB failed (%d entries): %v", count, err)
 	}
 }
 

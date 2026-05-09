@@ -12,7 +12,12 @@ import (
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	pb "github.com/Nyamerka/NyaQueue/pkg/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 )
+
+var ErrServerOverloaded = status.Error(codes.ResourceExhausted, "server overloaded: max queued requests reached")
 
 type Server struct {
 	pb.UnimplementedNyaQueueServer
@@ -20,12 +25,60 @@ type Server struct {
 	broker   *broker.Broker
 	grpc     *grpc.Server
 	listener net.Listener
+	reqSem   chan struct{}
 }
 
 func NewServer(b *broker.Broker) *Server {
+	cfg := b.Config()
+
+	var sem chan struct{}
+	if cfg.MaxQueuedRequests > 0 {
+		sem = make(chan struct{}, cfg.MaxQueuedRequests)
+	}
+
+	semaphoreInterceptor := func(
+		ctx context.Context,
+		req any,
+		_ *grpc.UnaryServerInfo,
+		handler grpc.UnaryHandler,
+	) (any, error) {
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			default:
+				return nil, ErrServerOverloaded
+			}
+		}
+		return handler(ctx, req)
+	}
+
+	opts := []grpc.ServerOption{
+		grpc.MaxConcurrentStreams(uint32(cfg.MaxConnections)),
+		grpc.NumStreamWorkers(uint32(cfg.NumNetworkGoroutines)),
+		grpc.MaxRecvMsgSize(cfg.MaxMessageBytes + 1024),
+		grpc.MaxSendMsgSize(cfg.MaxFetchBytes + 1024),
+		grpc.ReadBufferSize(cfg.RecvBufferBytes),
+		grpc.WriteBufferSize(cfg.SendBufferBytes),
+		grpc.UnaryInterceptor(semaphoreInterceptor),
+	}
+
+	if cfg.ReadTimeoutMs > 0 || cfg.WriteTimeoutMs > 0 {
+		timeout := time.Duration(cfg.ReadTimeoutMs) * time.Millisecond
+		if wt := time.Duration(cfg.WriteTimeoutMs) * time.Millisecond; wt > timeout {
+			timeout = wt
+		}
+		opts = append(opts, grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: timeout * 2,
+			Time:              timeout,
+			Timeout:           timeout,
+		}))
+	}
+
 	return &Server{
 		broker: b,
-		grpc:   grpc.NewServer(),
+		grpc:   grpc.NewServer(opts...),
+		reqSem: sem,
 	}
 }
 
@@ -129,10 +182,19 @@ func allFailed(results []broker.PublishResult) bool {
 // inside the loop so that Broker.Consume advances correctly. If the RPC fails
 // after a commit, the client won't receive the already-committed messages.
 func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.ConsumeResponse, error) {
+	cfg := s.broker.Config()
+
 	maxBytes := int(req.MaxBytes)
 	if maxBytes <= 0 {
-		maxBytes = 1 << 20
+		maxBytes = cfg.MaxFetchBytes
 	}
+	if cfg.MaxFetchBytes > 0 && maxBytes > cfg.MaxFetchBytes {
+		maxBytes = cfg.MaxFetchBytes
+	}
+
+	fetchMinBytes := cfg.FetchMinBytes
+	fetchMaxWait := time.Duration(cfg.FetchMaxWaitMs) * time.Millisecond
+	deadline := time.Now().Add(fetchMaxWait)
 
 	var (
 		envelopes  []*pb.MessageEnvelope
@@ -143,6 +205,10 @@ func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.Consume
 		msg, nextOffset, err := s.broker.Consume(req.Topic, req.Group, int(req.Partition))
 		if err != nil {
 			if errors.Is(err, broker.ErrNoMessages) {
+				if totalBytes < fetchMinBytes && time.Now().Before(deadline) {
+					time.Sleep(time.Millisecond)
+					continue
+				}
 				break
 			}
 			if len(envelopes) > 0 {

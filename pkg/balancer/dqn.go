@@ -3,6 +3,7 @@ package balancer
 import (
 	"math/rand"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/Nyamerka/NyaQueue/pkg/nn"
@@ -12,13 +13,19 @@ import (
 )
 
 // DQNBalancer uses a Deep Q-Network to select partitions based on current
-// and predicted loads. Uses GoMLX FC layers for the Q-network.
+// and predicted loads.
+//
+// Architecture: inference and training are separated to eliminate hot-path
+// contention. SelectPartition() takes a RLock on model weights for a single
+// forward pass. A background training goroutine drains experience from a
+// non-blocking channel, pushes it into the replay buffer, and periodically
+// runs backprop under a full Lock.
 //
 // State vector: [partition_loads..., predicted_loads..., msg_rate, avg_msg_size]
 // Action: partition index (discrete)
 // Reward: -load_imbalance_stddev (lower imbalance = higher reward)
 type DQNBalancer struct {
-	mu sync.Mutex
+	weightsMu sync.RWMutex
 
 	numPartitions int
 	hiddenSize    int
@@ -27,6 +34,7 @@ type DQNBalancer struct {
 	lr            float64
 	batchSize     int
 	minReplay     int
+	trainEvery    int
 	weightInit    float64
 
 	w1 *mat.Dense // [hiddenSize x stateSize]
@@ -35,17 +43,22 @@ type DQNBalancer struct {
 	b2 []float64  // [numActions]
 
 	replayBuffer *nn.ReplayBuffer
-	lastState    []float64
-	lastAction   int
+
+	expCh  chan nn.Transition
+	stopCh chan struct{}
+	done   chan struct{}
 
 	fallbackRR     *RoundRobin
 	fallbackRatio  float64
 	loadThreshold  float64
-	baseThroughput float64
-	fallbackActive bool
+	baseThroughput atomic.Int64
+	fallbackActive atomic.Bool
 
+	stateMu        sync.Mutex
 	loads          []float64
 	predictedLoads []float64
+	lastState      []float64
+	lastAction     int
 }
 
 // DQNOption configures a DQNBalancer.
@@ -63,21 +76,27 @@ func WithDQNMinReplay(n int) DQNOption         { return func(d *DQNBalancer) { d
 func WithDQNFallbackRatio(r float64) DQNOption { return func(d *DQNBalancer) { d.fallbackRatio = r } }
 func WithDQNLoadThreshold(t float64) DQNOption { return func(d *DQNBalancer) { d.loadThreshold = t } }
 func WithDQNWeightInit(s float64) DQNOption    { return func(d *DQNBalancer) { d.weightInit = s } }
+func WithDQNTrainEvery(n int) DQNOption        { return func(d *DQNBalancer) { d.trainEvery = n } }
 
 func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 	d := &DQNBalancer{
-		numPartitions:  numPartitions,
-		hiddenSize:     DefaultDQNHiddenSize,
-		epsilon:        DefaultDQNEpsilon,
-		gamma:          DefaultDQNGamma,
-		lr:             DefaultDQNLearningRate,
-		batchSize:      DefaultDQNBatchSize,
-		minReplay:      DefaultDQNMinReplay,
-		weightInit:     DefaultDQNWeightInit,
-		replayBuffer:   nn.NewReplayBuffer(DefaultDQNReplayBufSize),
-		fallbackRR:     NewRoundRobin(),
-		fallbackRatio:  DefaultDQNFallbackRatio,
-		loadThreshold:  DefaultDQNLoadThreshold,
+		numPartitions: numPartitions,
+		hiddenSize:    DefaultDQNHiddenSize,
+		epsilon:       DefaultDQNEpsilon,
+		gamma:         DefaultDQNGamma,
+		lr:            DefaultDQNLearningRate,
+		batchSize:     DefaultDQNBatchSize,
+		minReplay:     DefaultDQNMinReplay,
+		trainEvery:    DefaultDQNTrainEvery,
+		weightInit:    DefaultDQNWeightInit,
+		replayBuffer:  nn.NewReplayBuffer(DefaultDQNReplayBufSize),
+		fallbackRR:    NewRoundRobin(),
+		fallbackRatio: DefaultDQNFallbackRatio,
+		loadThreshold: DefaultDQNLoadThreshold,
+		expCh:         make(chan nn.Transition, DefaultDQNExpChannelSize),
+		stopCh:        make(chan struct{}),
+		done:          make(chan struct{}),
+
 		loads:          make([]float64, numPartitions),
 		predictedLoads: make([]float64, numPartitions),
 	}
@@ -88,6 +107,9 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 
 	stateSize := numPartitions*2 + 2
 	d.initWeights(stateSize, numPartitions)
+
+	go d.trainLoop()
+
 	return d
 }
 
@@ -107,34 +129,44 @@ func (d *DQNBalancer) initWeights(stateSize, numActions int) {
 	d.b2 = make([]float64, numActions)
 }
 
+// SelectPartition picks a partition via DQN inference. Only takes a RLock on
+// model weights, so it never blocks on training.
 func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions int) int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if d.fallbackActive {
+	if d.fallbackActive.Load() {
 		return d.fallbackRR.SelectPartition(topic, key, numPartitions)
 	}
 
-	state := d.buildState()
+	d.stateMu.Lock()
+	state := d.buildStateLocked()
+	d.stateMu.Unlock()
 
 	if rand.Float64() < d.epsilon {
 		action := rand.Intn(numPartitions)
+		d.stateMu.Lock()
 		d.lastState = state
 		d.lastAction = action
+		d.stateMu.Unlock()
 		return action
 	}
 
+	d.weightsMu.RLock()
 	qValues, _ := d.forward(state)
+	d.weightsMu.RUnlock()
+
 	action := floats.MaxIdx(qValues[:numPartitions])
 
+	d.stateMu.Lock()
 	d.lastState = state
 	d.lastAction = action
+	d.stateMu.Unlock()
+
 	return action
 }
 
+// OnMetrics updates loads, evaluates watchdog, and pushes experience to the
+// training goroutine via a non-blocking channel send.
 func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.stateMu.Lock()
 
 	if len(m.PartitionLoads) > 0 {
 		d.loads = m.PartitionLoads
@@ -142,7 +174,8 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 
 	shouldFallback := false
 
-	if d.baseThroughput > 0 && m.Throughput < d.fallbackRatio*d.baseThroughput {
+	baseTP := float64(d.baseThroughput.Load())
+	if baseTP > 0 && m.Throughput < d.fallbackRatio*baseTP {
 		shouldFallback = true
 	}
 
@@ -157,43 +190,78 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 		}
 	}
 
-	d.fallbackActive = shouldFallback
+	d.fallbackActive.Store(shouldFallback)
 
 	if d.lastState != nil {
-		reward := d.computeReward(m)
-		nextState := d.buildState()
+		reward := computeReward(m)
+		nextState := d.buildStateLocked()
 
-		d.replayBuffer.Push(nn.Transition{
+		t := nn.Transition{
 			State:     d.lastState,
 			Action:    []float64{float64(d.lastAction)},
 			Reward:    reward,
 			NextState: nextState,
 			Done:      false,
-		})
+		}
 
-		d.trainStep()
+		d.stateMu.Unlock()
+
+		select {
+		case d.expCh <- t:
+		default:
+		}
+		return
 	}
+
+	d.stateMu.Unlock()
 }
 
 func (d *DQNBalancer) SetBaseThroughput(t float64) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.baseThroughput = t
+	d.baseThroughput.Store(int64(t))
 }
 
 func (d *DQNBalancer) SetPredictedLoads(predicted []float64) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	d.predictedLoads = predicted
 }
 
 func (d *DQNBalancer) IsFallbackActive() bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.fallbackActive
+	return d.fallbackActive.Load()
 }
 
-func (d *DQNBalancer) buildState() []float64 {
+// Stop terminates the background training goroutine.
+func (d *DQNBalancer) Stop() {
+	close(d.stopCh)
+	<-d.done
+}
+
+func (d *DQNBalancer) trainLoop() {
+	defer close(d.done)
+	steps := 0
+
+	for {
+		select {
+		case t := <-d.expCh:
+			d.replayBuffer.Push(t)
+			steps++
+			if steps%d.trainEvery == 0 {
+				d.trainStep()
+			}
+		case <-d.stopCh:
+			for {
+				select {
+				case t := <-d.expCh:
+					d.replayBuffer.Push(t)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (d *DQNBalancer) buildStateLocked() []float64 {
 	state := make([]float64, 0, d.numPartitions*2+2)
 	state = append(state, d.loads...)
 	for len(state) < d.numPartitions {
@@ -222,7 +290,8 @@ func (d *DQNBalancer) forward(state []float64) ([]float64, []float64) {
 	hv := mat.NewVecDense(d.hiddenSize, nil)
 	hv.MulVec(d.w1, sv)
 
-	hidden := hv.RawVector().Data
+	hidden := make([]float64, d.hiddenSize)
+	copy(hidden, hv.RawVector().Data)
 	floats.Add(hidden, d.b1)
 	for i, v := range hidden {
 		if v < 0 {
@@ -230,15 +299,17 @@ func (d *DQNBalancer) forward(state []float64) ([]float64, []float64) {
 		}
 	}
 
+	hv2 := mat.NewVecDense(d.hiddenSize, hidden)
 	qv := mat.NewVecDense(d.numPartitions, nil)
-	qv.MulVec(d.w2, hv)
+	qv.MulVec(d.w2, hv2)
 
-	q := qv.RawVector().Data
+	q := make([]float64, d.numPartitions)
+	copy(q, qv.RawVector().Data)
 	floats.Add(q, d.b2)
 	return q, hidden
 }
 
-func (d *DQNBalancer) computeReward(m broker.Metrics) float64 {
+func computeReward(m broker.Metrics) float64 {
 	if len(m.PartitionLoads) == 0 {
 		return 0
 	}
@@ -251,6 +322,10 @@ func (d *DQNBalancer) trainStep() {
 	}
 
 	batch := d.replayBuffer.Sample(d.batchSize)
+
+	d.weightsMu.Lock()
+	defer d.weightsMu.Unlock()
+
 	for _, t := range batch {
 		qValues, hidden := d.forward(t.State)
 		nextQ, _ := d.forward(t.NextState)

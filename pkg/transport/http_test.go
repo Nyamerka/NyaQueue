@@ -173,3 +173,87 @@ func (s *HTTPTransportSuite) TestHealthz() {
 	defer resp.Body.Close()
 	require.Equal(s.T(), 200, resp.StatusCode)
 }
+
+type HTTPConfigWiringSuite struct {
+	suite.Suite
+}
+
+func TestHTTPConfigWiringSuite(t *testing.T) { suite.Run(t, new(HTTPConfigWiringSuite)) }
+
+func (s *HTTPConfigWiringSuite) newWithConfig(cfg broker.Config) (*broker.Broker, *HTTPServer, *HTTPClient, func()) {
+	dir := s.T().TempDir()
+	store, err := broker.NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+
+	bal := balancer.NewRoundRobin()
+	b := broker.New(cfg, dir, bal, store)
+	b.Start()
+
+	srv := NewHTTPServer(b)
+	err = srv.Start(":0")
+	require.NoError(s.T(), err)
+
+	c := NewHTTPClient(srv.Addr())
+	return b, srv, c, func() {
+		c.Close()
+		srv.Stop()
+		b.Stop()
+	}
+}
+
+func (s *HTTPConfigWiringSuite) TestMaxMessageBytesHTTP() {
+	cfg := broker.DefaultConfig()
+	cfg.MaxMessageBytes = 128
+	b, _, c, cleanup := s.newWithConfig(cfg)
+	defer cleanup()
+
+	ctx := context.Background()
+	require.NoError(s.T(), c.CreateTopic(ctx, "t", 1, "fifo"))
+	b.SetScheduler("t", scheduler.NewFIFO())
+
+	_, _, err := c.Produce(ctx, "t", []byte("k"), make([]byte, 50), 0)
+	require.NoError(s.T(), err)
+
+	_, _, err = c.Produce(ctx, "t", []byte("k"), make([]byte, 200), 0)
+	require.Error(s.T(), err)
+}
+
+func (s *HTTPConfigWiringSuite) TestCompressionHTTP() {
+	cfg := broker.DefaultConfig()
+	cfg.CompressionType = broker.CompressionLZ4
+	b, _, c, cleanup := s.newWithConfig(cfg)
+	defer cleanup()
+
+	ctx := context.Background()
+	require.NoError(s.T(), c.CreateTopic(ctx, "t", 1, "fifo"))
+	b.SetScheduler("t", scheduler.NewFIFO())
+
+	payload := []byte("lz4 compression test data for http transport")
+	_, _, err := c.Produce(ctx, "t", []byte("k"), payload, 0)
+	require.NoError(s.T(), err)
+
+	msgs, err := c.Consume(ctx, "t", "g1", 0, 1<<20)
+	require.NoError(s.T(), err)
+	require.Len(s.T(), msgs, 1)
+	require.Equal(s.T(), payload, msgs[0].Value)
+}
+
+func (s *HTTPConfigWiringSuite) TestHTTPServerUsesTimeouts() {
+	cfg := broker.DefaultConfig()
+	cfg.ReadTimeoutMs = 5000
+	cfg.WriteTimeoutMs = 10000
+	_, srv, _, cleanup := s.newWithConfig(cfg)
+	defer cleanup()
+
+	require.NotNil(s.T(), srv.server)
+}
+
+func (s *HTTPConfigWiringSuite) TestHTTPMaxQueuedRequests() {
+	cfg := broker.DefaultConfig()
+	cfg.MaxQueuedRequests = 2
+	_, srv, _, cleanup := s.newWithConfig(cfg)
+	defer cleanup()
+
+	require.NotNil(s.T(), srv.reqSem)
+	require.Equal(s.T(), 2, cap(srv.reqSem))
+}

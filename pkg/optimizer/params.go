@@ -1,5 +1,9 @@
 package optimizer
 
+import (
+	"github.com/Nyamerka/NyaQueue/pkg/preprocessing"
+)
+
 type TunableParam struct {
 	Name   string
 	Min    float64
@@ -32,6 +36,35 @@ func DefaultTunableParams() []TunableParam {
 		{"MaxFetchBytes", 1024, 10 << 20, 0.7},
 		{"ConsumerSessionTimeoutMs", 5000, 120000, 0.3},
 	}
+}
+
+// CalibrateWeights runs Lasso regression on pilot run data to determine which
+// parameters actually affect throughput. Params with zero Lasso weight are
+// excluded from the DDPG action space, reducing dimensionality.
+//
+// configs: matrix of pilot configurations (each row = one run, len(row) == len(params))
+// throughputs: observed throughput for each pilot config
+// alpha: L1 regularisation strength (higher => more parameters zeroed out)
+func CalibrateWeights(params []TunableParam, configs [][]float64, throughputs []float64, alpha float64) []TunableParam {
+	if len(configs) == 0 || len(configs[0]) != len(params) {
+		return params
+	}
+
+	indices, weights := preprocessing.SelectParameters(configs, throughputs, alpha)
+
+	calibrated := make([]TunableParam, len(params))
+	copy(calibrated, params)
+
+	for i := range calibrated {
+		calibrated[i].Weight = 0
+	}
+	for i, idx := range indices {
+		if idx < len(calibrated) {
+			calibrated[idx].Weight = weights[i]
+		}
+	}
+
+	return calibrated
 }
 
 func ActiveParams(all []TunableParam) []TunableParam {
