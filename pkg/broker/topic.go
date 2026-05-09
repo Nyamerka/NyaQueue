@@ -2,6 +2,7 @@ package broker
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/samber/oops"
 )
@@ -11,6 +12,7 @@ type Topic struct {
 	name       string
 	partitions []*Partition
 	config     TopicConfig
+	closed     atomic.Bool
 }
 
 func NewTopic(name, dataDir string, cfg TopicConfig, syncPolicy SyncPolicy) (*Topic, error) {
@@ -68,7 +70,12 @@ func (t *Topic) Partitions() []*Partition {
 	return out
 }
 
+func (t *Topic) IsClosed() bool {
+	return t.closed.Load()
+}
+
 func (t *Topic) Close() error {
+	t.closed.Store(true)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 

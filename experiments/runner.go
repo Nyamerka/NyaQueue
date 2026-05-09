@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	mrand "math/rand"
 	"math/rand/v2"
 	"net"
 	"os"
@@ -246,7 +247,7 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	result := runScenario(ctx, h, sc, alg.Name, "nyaqueue", mode, topicCfg.NumPartitions, dur, topic)
 
 	if mode != ModeInProcess {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(5 * time.Second)
 	}
 	return result, nil
 }
@@ -379,6 +380,13 @@ func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scena
 	}
 	interval := time.Second / time.Duration(perProducer)
 
+	seed := sc.Seed
+	if seed == 0 {
+		seed = 42
+	}
+	rng := rand.New(rand.NewPCG(uint64(seed), uint64(seed)^0xCAFE))
+	legacyRng := mrand.New(mrand.NewSource(int64(rng.Uint64())))
+
 	batch := make([]BatchItem, 0, produceBatchSize)
 	linger := time.NewTimer(produceLingerInterval)
 	linger.Stop()
@@ -408,9 +416,9 @@ func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scena
 		}
 
 		batch = append(batch, BatchItem{
-			Key:      generateKey(keyBuf, sc.SkewRatio),
+			Key:      generateKeySeeded(keyBuf, sc.SkewRatio, rng),
 			Value:    encodeValue(msgSize),
-			Priority: sc.SamplePriority(),
+			Priority: sc.SamplePrioritySeeded(legacyRng),
 		})
 
 		if len(batch) >= produceBatchSize {
@@ -434,6 +442,13 @@ func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scena
 // accumulates produceBatchSize messages and flushes them in a single call,
 // reducing WAL and RPC overhead per message.
 func runUnlimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenario, msgSize int, c *MetricsCollector, topic string) {
+	seed := sc.Seed
+	if seed == 0 {
+		seed = 42
+	}
+	rng := rand.New(rand.NewPCG(uint64(seed), uint64(seed)^0xBEEF))
+	legacyRng := mrand.New(mrand.NewSource(int64(rng.Uint64())))
+
 	batch := make([]BatchItem, 0, produceBatchSize)
 
 	flush := func() {
@@ -460,9 +475,9 @@ func runUnlimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenari
 		}
 
 		batch = append(batch, BatchItem{
-			Key:      generateKey(keyBuf, sc.SkewRatio),
+			Key:      generateKeySeeded(keyBuf, sc.SkewRatio, rng),
 			Value:    encodeValue(msgSize),
-			Priority: sc.SamplePriority(),
+			Priority: sc.SamplePrioritySeeded(legacyRng),
 		})
 
 		if len(batch) >= produceBatchSize {
@@ -517,9 +532,14 @@ func sampleLoadsFromHarness(ctx context.Context, h *Harness, c *MetricsCollector
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			loads, err := h.GetPartitionLoads(ctx)
-			if err == nil && len(loads) > 0 {
-				c.RecordLoadSample(loads)
+			snap, err := h.GetMetricsSnapshot(ctx)
+			if err != nil {
+				continue
+			}
+			if snap.HasStdDev {
+				c.RecordLoadStdDev(snap.LoadStdDev)
+			} else if len(snap.PartitionLoads) > 0 {
+				c.RecordLoadSample(snap.PartitionLoads)
 			}
 		}
 	}
@@ -563,9 +583,19 @@ func topicConfigFor(sc benchmarks.Scenario) broker.TopicConfig {
 func generateKey(buf []byte, skewRatio float64) []byte {
 	key := make([]byte, 8)
 	if skewRatio > 0 && rand.Float64() < skewRatio {
-		return key // hot key: all-zeros
+		return key
 	}
 	binary.BigEndian.PutUint64(buf, rand.Uint64())
+	copy(key, buf)
+	return key
+}
+
+func generateKeySeeded(buf []byte, skewRatio float64, rng *rand.Rand) []byte {
+	key := make([]byte, 8)
+	if skewRatio > 0 && rng.Float64() < skewRatio {
+		return key
+	}
+	binary.BigEndian.PutUint64(buf, rng.Uint64())
 	copy(key, buf)
 	return key
 }

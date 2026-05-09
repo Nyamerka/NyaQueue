@@ -1,10 +1,10 @@
 package optimizer
 
 import (
+	"sync"
 	"testing"
 
-	. "github.com/gomlx/gomlx/pkg/core/graph"
-	"github.com/gomlx/gomlx/pkg/ml/context"
+	"github.com/gomlx/gomlx/pkg/core/tensors"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
@@ -74,11 +74,7 @@ func (s *DDPGSuite) TestActorForwardOutputInRange() {
 	state := []float64{0.1, 0.2, 0.3, 0.4, 0.5}
 
 	d.mu.Lock()
-	exec := context.MustNewExec(d.backend, d.mainCtx.Reuse(),
-		func(ctx *context.Context, st *Node) *Node {
-			return d.actorGraph(ctx, st)
-		})
-	result := exec.MustExec1(state)
+	result := d.actorFwdExec.MustExec1(state)
 	d.mu.Unlock()
 
 	out := tensorToFloat64(result)
@@ -89,22 +85,23 @@ func (s *DDPGSuite) TestActorForwardOutputInRange() {
 	}
 }
 
-func (s *DDPGSuite) TestCriticForwardReturnsScalar() {
+func (s *DDPGSuite) TestCriticBatchedReturnsCorrectShape() {
 	d := NewDDPG(5, 3, 0.001)
-	state := []float64{0.1, 0.2, 0.3, 0.4, 0.5}
-	action := []float64{0.1, 0.2, 0.3}
+
+	states := tensors.FromFlatDataAndDimensions([]float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.5, 0.4, 0.3, 0.2, 0.1}, 2, 5)
+	actions := tensors.FromFlatDataAndDimensions([]float64{0.1, 0.2, 0.3, 0.3, 0.2, 0.1}, 2, 3)
 
 	d.mu.Lock()
-	q := d.criticForward(state, action)
+	result := d.targetCriticExec.MustExec1(states, actions)
 	d.mu.Unlock()
 
-	require.IsType(s.T(), float64(0), q)
+	out := tensorToFloat64(result)
+	require.Len(s.T(), out, 2, "batched critic should return one Q-value per sample")
 }
 
 func (s *DDPGSuite) TestTrainUpdatesActorWeights() {
 	d := NewDDPG(5, 3, 0.01)
 
-	// Get initial action for a fixed state.
 	state := []float64{0.5, 0.5, 0.5, 0.5, 0.5}
 	actionBefore := d.Act(state)
 
@@ -136,13 +133,9 @@ func (s *DDPGSuite) TestSoftUpdateChangesTarget() {
 
 	state := []float64{0.5, 0.5, 0.5, 0.5, 0.5}
 
-	// Target actor should initially produce same output as main actor.
-	d.mu.Lock()
-	mainAction := d.targetActorForward(state)
-	d.mu.Unlock()
+	mainAction := d.Act(state)
 	require.Len(s.T(), mainAction, 3)
 
-	// After training + soft update, target should change.
 	for i := 0; i < 200; i++ {
 		d.Store(
 			[]float64{float64(i) * 0.01, 0.1, 0.2, 0.3, 0.4},
@@ -152,18 +145,114 @@ func (s *DDPGSuite) TestSoftUpdateChangesTarget() {
 			false,
 		)
 	}
-	d.Train(64) // includes soft update
+	d.Train(64)
 
-	d.mu.Lock()
-	targetAction := d.targetActorForward(state)
-	d.mu.Unlock()
+	actionAfter := d.Act(state)
 
 	changed := false
 	for i := range mainAction {
-		if targetAction[i] != mainAction[i] {
+		if actionAfter[i] != mainAction[i] {
 			changed = true
 			break
 		}
 	}
 	require.True(s.T(), changed, "target network should update via soft update")
+}
+
+func (s *DDPGSuite) TestBatchedTrainMultipleSteps() {
+	d := NewDDPG(5, 3, 0.001)
+
+	for i := 0; i < 300; i++ {
+		d.Store(
+			[]float64{float64(i) * 0.01, 0.1, 0.2, 0.3, 0.4},
+			[]float64{0.1, -0.2, 0.3},
+			float64(i%10)*0.1,
+			[]float64{float64(i+1) * 0.01, 0.2, 0.3, 0.4, 0.5},
+			i%50 == 0,
+		)
+	}
+
+	require.NotPanics(s.T(), func() {
+		for step := 0; step < 5; step++ {
+			d.Train(64)
+		}
+	})
+}
+
+func (s *DDPGSuite) TestPrecompiledExecsNotNil() {
+	d := NewDDPG(5, 3, 0.001)
+	require.NotNil(s.T(), d.actorFwdExec, "actorFwdExec should be precompiled")
+	require.NotNil(s.T(), d.targetActorFwdExec, "targetActorFwdExec should be precompiled")
+	require.NotNil(s.T(), d.targetCriticExec, "targetCriticExec should be precompiled")
+	require.NotNil(s.T(), d.criticTrainExec, "criticTrainExec should be precompiled")
+	require.NotNil(s.T(), d.actorTrainExec, "actorTrainExec should be precompiled")
+}
+
+func (s *DDPGSuite) TestSoftUpdateDtypeRobust() {
+	d := NewDDPG(5, 3, 0.001)
+	require.NotPanics(s.T(), func() {
+		d.mu.Lock()
+		d.softUpdate()
+		d.mu.Unlock()
+	})
+	require.Greater(s.T(), len(d.varPairs), 0, "varPairs should be populated")
+}
+
+func (s *DDPGSuite) TestStoreDeepCopies() {
+	d := NewDDPG(5, 3, 0.001)
+	state := []float64{1, 2, 3, 4, 5}
+	action := []float64{0.1, 0.2, 0.3}
+	nextState := []float64{2, 3, 4, 5, 6}
+	d.Store(state, action, 1.0, nextState, false)
+
+	state[0] = 999
+	action[0] = 999
+	nextState[0] = 999
+
+	batch := d.replayBuffer.Sample(1)
+	require.Equal(s.T(), 1.0, batch[0].State[0], "Store must deep-copy state")
+	require.Equal(s.T(), 0.1, batch[0].Action[0], "Store must deep-copy action")
+	require.Equal(s.T(), 2.0, batch[0].NextState[0], "Store must deep-copy nextState")
+}
+
+func (s *DDPGSuite) TestPreAllocatedBuffers() {
+	d := NewDDPG(5, 3, 0.001)
+	require.Len(s.T(), d.statesBuf, 64*5)
+	require.Len(s.T(), d.actionsBuf, 64*3)
+	require.Len(s.T(), d.rewardsBuf, 64)
+	require.Len(s.T(), d.targetQBuf, 64)
+}
+
+func (s *DDPGSuite) TestConcurrentActAndTrain() {
+	d := NewDDPG(5, 3, 0.001)
+
+	for i := 0; i < 200; i++ {
+		d.Store(
+			[]float64{float64(i) * 0.01, 0.1, 0.2, 0.3, 0.4},
+			[]float64{0.1, -0.2, 0.3},
+			1.0,
+			[]float64{float64(i+1) * 0.01, 0.2, 0.3, 0.4, 0.5},
+			false,
+		)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			state := []float64{0.5, 0.5, 0.5, 0.5, 0.5}
+			for j := 0; j < 20; j++ {
+				_ = d.Act(state)
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 10; j++ {
+			d.Train(64)
+		}
+	}()
+	wg.Wait()
 }

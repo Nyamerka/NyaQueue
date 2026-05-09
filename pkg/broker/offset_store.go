@@ -16,10 +16,10 @@ import (
 
 var offsetsPrefix = []byte("off/")
 
-// OffsetStore tracks consumer offsets. Hot-path reads and writes go through an
-// in-memory cache (xsync.MapOf — cache-line hash table, lock-free reads). A
-// background goroutine periodically flushes dirty entries to BadgerDB via
-// WriteBatch for durability.
+// OffsetStore tracks consumer offsets with session TTL support. Hot-path reads
+// and writes go through an in-memory cache (xsync.MapOf — cache-line hash
+// table, lock-free reads). A background goroutine periodically flushes dirty
+// entries to BadgerDB via WriteBatch for durability.
 //
 // Trade-off: when dumpInterval > 0, offsets committed between the last
 // successful flush and a crash are lost. On restart consumers will re-receive
@@ -27,8 +27,9 @@ var offsetsPrefix = []byte("off/")
 // deliberate compromise to keep fsync off the hot path; set dumpInterval to 0
 // (or use SyncEveryWrite) for stronger guarantees at the cost of throughput.
 type OffsetStore struct {
-	db    *badger.DB
-	cache *xsync.MapOf[string, int64]
+	db         *badger.DB
+	cache      *xsync.MapOf[string, int64]
+	lastCommit *xsync.MapOf[string, time.Time]
 
 	dumpInterval time.Duration
 	stopCh       chan struct{}
@@ -59,10 +60,11 @@ func NewOffsetStore(dataDir string, dumpInterval ...time.Duration) (*OffsetStore
 	}
 
 	s := &OffsetStore{
-		db:      db,
-		cache:   xsync.NewMapOf[string, int64](),
-		stopCh:  make(chan struct{}),
-		stopped: make(chan struct{}),
+		db:         db,
+		cache:      xsync.NewMapOf[string, int64](),
+		lastCommit: xsync.NewMapOf[string, time.Time](),
+		stopCh:     make(chan struct{}),
+		stopped:    make(chan struct{}),
 	}
 
 	err = db.View(func(txn *badger.Txn) error {
@@ -108,6 +110,7 @@ func (s *OffsetStore) bucketKey(topic string, partition int, group string) strin
 func (s *OffsetStore) Commit(group, topic string, partition int, offset int64) error {
 	key := s.bucketKey(topic, partition, group)
 	s.cache.Store(key, offset)
+	s.lastCommit.Store(key, time.Now())
 
 	if s.dumpInterval > 0 {
 		return nil
@@ -215,6 +218,23 @@ func (s *OffsetStore) dump() {
 
 	if err := wb.Flush(); err != nil {
 		log.Printf("offset store: flush to BadgerDB failed (%d entries): %v", count, err)
+	}
+}
+
+// ExpireSessions removes consumer group offsets that haven't been committed
+// within the given timeout, implementing ConsumerSessionTimeoutMs.
+func (s *OffsetStore) ExpireSessions(timeout time.Duration) {
+	cutoff := time.Now().Add(-timeout)
+	var expired []string
+	s.lastCommit.Range(func(key string, lastTime time.Time) bool {
+		if lastTime.Before(cutoff) {
+			expired = append(expired, key)
+		}
+		return true
+	})
+	for _, k := range expired {
+		s.cache.Delete(k)
+		s.lastCommit.Delete(k)
 	}
 }
 

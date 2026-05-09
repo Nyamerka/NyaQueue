@@ -13,7 +13,7 @@ type PendingEntry struct {
 }
 
 type PriorityIndex struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	levels [MaxPriority][]PendingEntry // 0=lowest, 9=highest
 	count  int
 }
@@ -92,14 +92,14 @@ func (pi *PriorityIndex) PopWithThreshold(threshold int) (PendingEntry, bool) {
 }
 
 func (pi *PriorityIndex) Len() int {
-	pi.mu.Lock()
-	defer pi.mu.Unlock()
+	pi.mu.RLock()
+	defer pi.mu.RUnlock()
 	return pi.count
 }
 
 func (pi *PriorityIndex) LevelDistribution() [MaxPriority]int {
-	pi.mu.Lock()
-	defer pi.mu.Unlock()
+	pi.mu.RLock()
+	defer pi.mu.RUnlock()
 
 	var dist [MaxPriority]int
 	for i := range pi.levels {

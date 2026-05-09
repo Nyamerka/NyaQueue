@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"errors"
 	"log"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/samber/oops"
+	"golang.org/x/sync/semaphore"
 )
 
 var (
@@ -50,13 +52,18 @@ type Broker struct {
 	offsetStore  *OffsetStore
 
 	codec  atomic.Pointer[Codec]
-	ioPool chan struct{}
+	ioPool atomic.Pointer[ioGate]
 
 	stopCh chan struct{}
 }
 
+type ioGate struct {
+	sem *semaphore.Weighted
+	cap int64
+}
+
 func New(cfg Config, dataDir string, bal Balancer, offsetStore *OffsetStore) *Broker {
-	ioPoolSize := cfg.NumIOGoroutines
+	ioPoolSize := int64(cfg.NumIOGoroutines)
 	if ioPoolSize <= 0 {
 		ioPoolSize = 4
 	}
@@ -67,9 +74,9 @@ func New(cfg Config, dataDir string, bal Balancer, offsetStore *OffsetStore) *Br
 		balancer:    bal,
 		schedulers:  make(map[string]Scheduler),
 		offsetStore: offsetStore,
-		ioPool:      make(chan struct{}, ioPoolSize),
 		stopCh:      make(chan struct{}),
 	}
+	b.ioPool.Store(&ioGate{sem: semaphore.NewWeighted(ioPoolSize), cap: ioPoolSize})
 	b.config.Store(&cfg)
 
 	codec := NewCodec(cfg.CompressionType)
@@ -77,7 +84,7 @@ func New(cfg Config, dataDir string, bal Balancer, offsetStore *OffsetStore) *Br
 
 	b.predictor = NewLoadPredictor(100, 8, 100*time.Millisecond)
 	b.metrics = NewMetricsCollector(b)
-	b.backpressure = NewBackpressureController(b.predictor, 0.85, 3)
+	b.backpressure = NewBackpressureController(0.85)
 
 	return b
 }
@@ -119,6 +126,12 @@ func (b *Broker) CreateTopic(name string, cfg TopicConfig) error {
 	t, err := NewTopic(name, b.dataDir, cfg, brokerCfg.SyncPolicy)
 	if err != nil {
 		return err
+	}
+	if brokerCfg.CompressionType != CompressionNone {
+		codec := NewCodec(brokerCfg.CompressionType)
+		for _, p := range t.Partitions() {
+			p.SetBatchCodec(codec)
+		}
 	}
 	b.topics[name] = t
 
@@ -199,6 +212,9 @@ func (b *Broker) compressMessage(msg *Message) error {
 }
 
 func (b *Broker) decompressMessage(msg *Message) error {
+	if msg.BatchDecoded {
+		return nil
+	}
 	codec := *b.codec.Load()
 	decompressed, err := codec.Decode(msg.Value)
 	if err != nil {
@@ -209,8 +225,10 @@ func (b *Broker) decompressMessage(msg *Message) error {
 }
 
 func (b *Broker) Publish(topicName string, msg *Message) (partition int, offset uint64, err error) {
-	if err := b.checkMessageSize(msg); err != nil {
-		return 0, 0, err
+	cfg := b.config.Load()
+	if cfg.MaxMessageBytes > 0 && len(msg.Key)+len(msg.Value) > cfg.MaxMessageBytes {
+		return 0, 0, oops.Wrapf(ErrMessageTooLarge, "size %d > limit %d",
+			len(msg.Key)+len(msg.Value), cfg.MaxMessageBytes)
 	}
 
 	if err := b.compressMessage(msg); err != nil {
@@ -283,14 +301,15 @@ func (b *Broker) PublishBatch(topicName string, msgs []*Message) []PublishResult
 	}
 	groups := make(map[int][]indexed, numParts)
 
+	cfg := b.config.Load()
+	codec := *b.codec.Load()
+	useBatchCompression := cfg.CompressionType != CompressionNone
+
 	now := time.Now().UnixNano()
 	for i, msg := range msgs {
-		if err := b.checkMessageSize(msg); err != nil {
-			results[i].Err = err
-			continue
-		}
-		if err := b.compressMessage(msg); err != nil {
-			results[i].Err = err
+		if cfg.MaxMessageBytes > 0 && len(msg.Key)+len(msg.Value) > cfg.MaxMessageBytes {
+			results[i].Err = oops.Wrapf(ErrMessageTooLarge, "size %d > limit %d",
+				len(msg.Key)+len(msg.Value), cfg.MaxMessageBytes)
 			continue
 		}
 
@@ -305,31 +324,55 @@ func (b *Broker) PublishBatch(topicName string, msgs []*Message) []PublishResult
 		groups[partIdx] = append(groups[partIdx], indexed{msg, i})
 	}
 
+	appendPartitionBatch := func(partIdx int, batch []indexed) {
+		p, err := t.Partition(partIdx)
+		if err != nil {
+			for _, item := range batch {
+				results[item.idx].Err = err
+			}
+			return
+		}
+
+		batchMsgs := make([]*Message, len(batch))
+		for j, item := range batch {
+			batchMsgs[j] = item.msg
+		}
+
+		var offsets []uint64
+		if useBatchCompression && len(batchMsgs) > 1 {
+			// Batch compression: the entire batch is compressed as a single block.
+			// Individual message Values remain uncompressed in the WAL payload;
+			// ReadFromBatchData decompresses the whole block on read.
+			offsets, err = p.AppendBatchCompressed(batchMsgs, codec)
+		} else {
+			if cfg.CompressionType != CompressionNone {
+				for _, msg := range batchMsgs {
+					compressed, cErr := codec.Encode(msg.Value)
+					if cErr != nil {
+						err = oops.Wrapf(cErr, "compress message value")
+						break
+					}
+					msg.Value = compressed
+				}
+			}
+			if err == nil {
+				offsets, err = p.AppendBatch(batchMsgs)
+			}
+		}
+
+		for j, item := range batch {
+			if err != nil {
+				results[item.idx].Err = err
+			} else {
+				results[item.idx].Offset = offsets[j]
+			}
+		}
+		b.metrics.RecordProduceBatch(topicName, partIdx, len(batch))
+	}
+
 	if len(groups) == 1 {
 		for partIdx, batch := range groups {
-			p, err := t.Partition(partIdx)
-			if err != nil {
-				for _, item := range batch {
-					results[item.idx].Err = err
-				}
-				return results
-			}
-
-			batchMsgs := make([]*Message, len(batch))
-			for j, item := range batch {
-				batchMsgs[j] = item.msg
-			}
-
-			offsets, err := p.AppendBatch(batchMsgs)
-			for j, item := range batch {
-				if err != nil {
-					results[item.idx].Err = err
-				} else {
-					results[item.idx].Offset = offsets[j]
-				}
-			}
-
-			b.metrics.RecordProduceBatch(topicName, partIdx, len(batch))
+			appendPartitionBatch(partIdx, batch)
 		}
 		return results
 	}
@@ -340,32 +383,16 @@ func (b *Broker) PublishBatch(topicName string, msgs []*Message) []PublishResult
 		go func(partIdx int, batch []indexed) {
 			defer wg.Done()
 
-			b.ioPool <- struct{}{}
-			defer func() { <-b.ioPool }()
-
-			p, err := t.Partition(partIdx)
-			if err != nil {
+			gate := b.ioPool.Load()
+			if err := gate.sem.Acquire(context.Background(), 1); err != nil {
 				for _, item := range batch {
 					results[item.idx].Err = err
 				}
 				return
 			}
+			defer gate.sem.Release(1)
 
-			batchMsgs := make([]*Message, len(batch))
-			for j, item := range batch {
-				batchMsgs[j] = item.msg
-			}
-
-			offsets, err := p.AppendBatch(batchMsgs)
-			for j, item := range batch {
-				if err != nil {
-					results[item.idx].Err = err
-				} else {
-					results[item.idx].Offset = offsets[j]
-				}
-			}
-
-			b.metrics.RecordProduceBatch(topicName, partIdx, len(batch))
+			appendPartitionBatch(partIdx, batch)
 		}(partIdx, batch)
 	}
 	wg.Wait()
@@ -374,6 +401,22 @@ func (b *Broker) PublishBatch(topicName string, msgs []*Message) []PublishResult
 }
 
 func (b *Broker) Consume(topicName, group string, partIdx int) (*Message, uint64, error) {
+	var consumerOffset uint64
+	if b.offsetStore != nil {
+		off, err := b.offsetStore.Load(group, topicName, partIdx)
+		if err != nil {
+			consumerOffset = 1
+		} else {
+			consumerOffset = uint64(off)
+		}
+	}
+	return b.ConsumeFrom(topicName, group, partIdx, consumerOffset)
+}
+
+// ConsumeFrom reads a message starting from the given offset. Used by the
+// transport layer's batch-consume loop which tracks offsets locally and commits
+// once at the end of the batch, rather than after every message.
+func (b *Broker) ConsumeFrom(topicName, group string, partIdx int, offset uint64) (*Message, uint64, error) {
 	b.mu.RLock()
 	t, exists := b.topics[topicName]
 	sched := b.schedulers[topicName]
@@ -388,21 +431,11 @@ func (b *Broker) Consume(topicName, group string, partIdx int) (*Message, uint64
 		return nil, 0, err
 	}
 
-	var consumerOffset uint64
-	if b.offsetStore != nil {
-		off, err := b.offsetStore.Load(group, topicName, partIdx)
-		if err != nil {
-			consumerOffset = 1
-		} else {
-			consumerOffset = uint64(off)
-		}
-	}
-
 	if sched == nil {
 		return nil, 0, oops.Errorf("no scheduler configured for topic %q", topicName)
 	}
 
-	msg, nextOffset, err := sched.Next(p, consumerOffset)
+	msg, nextOffset, err := sched.Next(p, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -411,7 +444,7 @@ func (b *Broker) Consume(topicName, group string, partIdx int) (*Message, uint64
 		return nil, 0, err
 	}
 
-	b.metrics.RecordConsume(topicName, partIdx)
+	b.metrics.RecordConsume(topicName, partIdx, group)
 
 	return msg, nextOffset, nil
 }
@@ -420,8 +453,19 @@ func (b *Broker) ConsumeBatch(topicName, group string, partIdx int, maxMessages 
 	var msgs []*Message
 	var lastOffset uint64
 
+	// Load offset once; advance locally in the loop.
+	var currentOffset uint64
+	if b.offsetStore != nil {
+		off, err := b.offsetStore.Load(group, topicName, partIdx)
+		if err != nil {
+			currentOffset = 1
+		} else {
+			currentOffset = uint64(off)
+		}
+	}
+
 	for i := 0; i < maxMessages; i++ {
-		msg, off, err := b.Consume(topicName, group, partIdx)
+		msg, nextOff, err := b.ConsumeFrom(topicName, group, partIdx, currentOffset)
 		if err != nil {
 			if errors.Is(err, ErrNoMessages) {
 				break
@@ -432,16 +476,30 @@ func (b *Broker) ConsumeBatch(topicName, group string, partIdx int, maxMessages 
 			return nil, 0, err
 		}
 		msgs = append(msgs, msg)
-		lastOffset = off
-		if err := b.Commit(group, topicName, partIdx, int64(off)); err != nil {
-			return msgs, lastOffset, err
-		}
+		lastOffset = nextOff
+		currentOffset = nextOff
 	}
 
 	if len(msgs) == 0 {
 		return nil, 0, ErrNoMessages
 	}
+
+	if err := b.Commit(group, topicName, partIdx, int64(lastOffset)); err != nil {
+		return msgs, lastOffset, err
+	}
 	return msgs, lastOffset, nil
+}
+
+// LoadOffset returns the committed offset for the given consumer group.
+func (b *Broker) LoadOffset(group, topicName string, partIdx int) (uint64, error) {
+	if b.offsetStore == nil {
+		return 1, nil
+	}
+	off, err := b.offsetStore.Load(group, topicName, partIdx)
+	if err != nil {
+		return 1, err
+	}
+	return uint64(off), nil
 }
 
 func (b *Broker) Commit(group, topicName string, partIdx int, offset int64) error {
@@ -473,14 +531,11 @@ func (b *Broker) ApplyConfig(cfg Config) error {
 	}
 
 	if cfg.NumIOGoroutines != old.NumIOGoroutines {
-		newSize := cfg.NumIOGoroutines
+		newSize := int64(cfg.NumIOGoroutines)
 		if newSize <= 0 {
 			newSize = 4
 		}
-		newPool := make(chan struct{}, newSize)
-		b.mu.Lock()
-		b.ioPool = newPool
-		b.mu.Unlock()
+		b.ioPool.Store(&ioGate{sem: semaphore.NewWeighted(newSize), cap: newSize})
 	}
 
 	return nil
@@ -488,6 +543,8 @@ func (b *Broker) ApplyConfig(cfg Config) error {
 
 func (b *Broker) Start() {
 	go b.metricsLoop()
+	go b.retentionLoop()
+	go b.sessionTimeoutLoop()
 }
 
 func (b *Broker) metricsLoop() {
@@ -505,6 +562,9 @@ func (b *Broker) metricsLoop() {
 			if b.predictor != nil && len(snap.PartitionLoads) > 0 {
 				b.predictor.Update(snap.PartitionLoads)
 				snap.PredictedLoads = b.predictor.PredictAll(8)
+				b.metrics.mu.Lock()
+				b.metrics.lastSnap = snap
+				b.metrics.mu.Unlock()
 			}
 
 			b.mu.RLock()
@@ -517,15 +577,36 @@ func (b *Broker) metricsLoop() {
 			}
 			if bp != nil {
 				bp.UpdatePredictions(snap.PredictedLoads)
+
+				var avgPred float64
+				if len(snap.PredictedLoads) > 0 {
+					for _, pl := range snap.PredictedLoads {
+						avgPred += pl
+					}
+					avgPred /= float64(len(snap.PredictedLoads))
+				}
+
+				var maxFlushMs float64
+				b.mu.RLock()
+				for _, t := range b.topics {
+					for _, p := range t.Partitions() {
+						flushMs := float64(p.LastFlushLatency()) / float64(time.Millisecond)
+						if flushMs > maxFlushMs {
+							maxFlushMs = flushMs
+						}
+					}
+				}
+				b.mu.RUnlock()
+				bp.UpdateSystem(SystemSignal{AvgPredictedLoad: avgPred, WALFlushLatencyMs: maxFlushMs})
 			}
 
-			b.metrics.mu.Lock()
+			b.metrics.historyMu.Lock()
 			b.metrics.throughputHistory = append(b.metrics.throughputHistory, snap.Throughput)
 			if len(b.metrics.throughputHistory) > historyCapacity {
 				b.metrics.throughputHistory = b.metrics.throughputHistory[1:]
 			}
 			th := b.metrics.throughputHistory
-			b.metrics.mu.Unlock()
+			b.metrics.historyMu.Unlock()
 
 			if len(th) >= warmupTicks {
 				if setter, ok := bal.(BaseThroughputSetter); ok {
@@ -538,6 +619,77 @@ func (b *Broker) metricsLoop() {
 					setter.SetBaseThroughput(baseTP)
 				}
 			}
+		case <-b.stopCh:
+			return
+		}
+	}
+}
+
+// retentionLoop implements dual-threshold retention (like Kafka log.retention.ms + log.retention.bytes).
+// Time-based and size-based retention have priority; commit-floor is fallback when neither is configured.
+func (b *Broker) retentionLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			cfg := b.config.Load()
+
+			b.mu.RLock()
+			topics := make([]*Topic, 0, len(b.topics))
+			for _, t := range b.topics {
+				topics = append(topics, t)
+			}
+			b.mu.RUnlock()
+
+			for _, t := range topics {
+				if t.IsClosed() {
+					continue
+				}
+				for _, p := range t.Partitions() {
+					if cfg.RetentionMaxAge > 0 {
+						cutoff := time.Now().Add(-cfg.RetentionMaxAge)
+						segs, bytes, _ := p.TruncateBefore(cutoff)
+						if segs > 0 {
+							b.metrics.RecordRetention(segs, bytes)
+						}
+					}
+
+					if cfg.RetentionMaxBytes > 0 {
+						entries, bytes, _ := p.TruncateOldestUntilSize(cfg.RetentionMaxBytes)
+						if entries > 0 {
+							b.metrics.RecordRetention(entries, bytes)
+						}
+					}
+
+					// Commit-floor fallback: only when no time/size policy is set.
+					if cfg.RetentionMaxAge == 0 && cfg.RetentionMaxBytes == 0 && b.offsetStore != nil {
+						floor, err := b.offsetStore.CommitFloor(t.Name(), p.ID())
+						if err == nil && floor > 1 {
+							_ = p.TruncateFront(uint64(floor))
+						}
+					}
+				}
+			}
+		case <-b.stopCh:
+			return
+		}
+	}
+}
+
+func (b *Broker) sessionTimeoutLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			cfg := b.config.Load()
+			if cfg.ConsumerSessionTimeoutMs <= 0 || b.offsetStore == nil {
+				continue
+			}
+			b.offsetStore.ExpireSessions(time.Duration(cfg.ConsumerSessionTimeoutMs) * time.Millisecond)
 		case <-b.stopCh:
 			return
 		}
@@ -577,12 +729,3 @@ var (
 	ErrThrottled       = errors.New("backpressure: partition overloaded, try again later")
 	ErrMessageTooLarge = errors.New("message exceeds MaxMessageBytes")
 )
-
-func (b *Broker) checkMessageSize(msg *Message) error {
-	cfg := b.config.Load()
-	if cfg.MaxMessageBytes > 0 && len(msg.Key)+len(msg.Value) > cfg.MaxMessageBytes {
-		return oops.Wrapf(ErrMessageTooLarge, "size %d > limit %d",
-			len(msg.Key)+len(msg.Value), cfg.MaxMessageBytes)
-	}
-	return nil
-}

@@ -409,31 +409,59 @@ func (h *Harness) ConsumeBatch(ctx context.Context, topic, group string, partiti
 	return nil, oops.Errorf("unsupported mode")
 }
 
-// GetPartitionLoads retrieves partition loads from the broker regardless of mode.
-// For Kafka, returns nil (Kafka doesn't expose NyaQueue-style partition loads).
-func (h *Harness) GetPartitionLoads(ctx context.Context) ([]float64, error) {
+// MetricsSnapshot holds partition loads and pre-computed load stddev from the broker.
+type MetricsSnapshot struct {
+	PartitionLoads []float64
+	LoadStdDev     float64
+	HasStdDev      bool
+}
+
+// GetMetricsSnapshot retrieves partition loads and load stddev from the broker.
+func (h *Harness) GetMetricsSnapshot(ctx context.Context) (*MetricsSnapshot, error) {
 	switch h.mode {
 	case ModeInProcess:
 		if brk := h.Broker(); brk != nil {
-			return brk.Metrics().PartitionLoads, nil
+			m := brk.Metrics()
+			return &MetricsSnapshot{
+				PartitionLoads: m.PartitionLoads,
+				LoadStdDev:     m.LoadStdDev,
+				HasStdDev:      m.LoadStdDev > 0,
+			}, nil
 		}
-		return nil, nil
+		return &MetricsSnapshot{}, nil
 	case ModeGRPC:
 		resp, err := h.grpc.GetMetrics(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return resp.PartitionLoads, nil
+		return &MetricsSnapshot{
+			PartitionLoads: resp.PartitionLoads,
+			LoadStdDev:     resp.LoadStddev,
+			HasStdDev:      resp.LoadStddev > 0,
+		}, nil
 	case ModeHTTP:
 		resp, err := h.httpClient.GetMetrics(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return resp.PartitionLoads, nil
+		return &MetricsSnapshot{
+			PartitionLoads: resp.PartitionLoads,
+			LoadStdDev:     resp.LoadStdDev,
+			HasStdDev:      resp.LoadStdDev > 0,
+		}, nil
 	case ModeKafka:
-		return nil, nil
+		return &MetricsSnapshot{}, nil
 	}
-	return nil, nil
+	return &MetricsSnapshot{}, nil
+}
+
+// GetPartitionLoads retrieves partition loads from the broker regardless of mode.
+func (h *Harness) GetPartitionLoads(ctx context.Context) ([]float64, error) {
+	snap, err := h.GetMetricsSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return snap.PartitionLoads, nil
 }
 
 func waitForHTTPReady(ctx context.Context, c *transport.HTTPClient) error {

@@ -47,7 +47,7 @@ func (s *RoundRobinSuite) TestDistribution() {
 
 func (s *RoundRobinSuite) TestOnMetricsNoop() {
 	rr := NewRoundRobin()
-	rr.OnMetrics(broker.Metrics{Throughput: 100})
+	rr.OnMetrics(broker.Metrics{BusinessMetrics: broker.BusinessMetrics{Throughput: 100}})
 	p := rr.SelectPartition("t", nil, 4)
 	require.GreaterOrEqual(s.T(), p, 0)
 }
@@ -77,7 +77,7 @@ func (s *WRRSuite) TestDefaultWeights() {
 func (s *WRRSuite) TestSkewedWeights() {
 	wrr := NewWeightedRoundRobin()
 	wrr.OnMetrics(broker.Metrics{
-		PartitionLoads: []float64{0.01, 0.5, 0.5, 0.5},
+		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.01, 0.5, 0.5, 0.5}},
 	})
 
 	counts := make([]int, 4)
@@ -93,7 +93,7 @@ func (s *WRRSuite) TestSkewedWeights() {
 func (s *WRRSuite) TestWithMinLoadOption() {
 	wrr := NewWeightedRoundRobin(WithWRRMinLoad(0.1))
 	wrr.OnMetrics(broker.Metrics{
-		PartitionLoads: []float64{0.001, 0.5},
+		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.001, 0.5}},
 	})
 
 	p := wrr.SelectPartition("t", nil, 2)

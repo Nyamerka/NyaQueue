@@ -1,6 +1,7 @@
 package nn
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -105,4 +106,82 @@ func (s *ReplayBufferSuite) TestRingOverwrite() {
 	for _, t := range batch {
 		require.GreaterOrEqual(s.T(), t.Reward, 2.0, "oldest entries should be overwritten")
 	}
+}
+
+func (s *ReplayBufferSuite) TestSampleInto() {
+	rb := NewReplayBuffer(100)
+	for i := 0; i < 50; i++ {
+		rb.Push(Transition{
+			State:  []float64{float64(i)},
+			Action: []float64{0},
+			Reward: 1.0,
+		})
+	}
+
+	dst := make([]Transition, 10)
+	n := rb.SampleInto(dst)
+	require.Equal(s.T(), 10, n)
+	for _, t := range dst[:n] {
+		require.NotEmpty(s.T(), t.State)
+	}
+}
+
+func (s *ReplayBufferSuite) TestDeepCopyOnPush() {
+	rb := NewReplayBuffer(10)
+	state := []float64{1.0, 2.0, 3.0}
+	rb.Push(Transition{State: state, Action: []float64{0}, Reward: 1.0, NextState: []float64{4.0}})
+
+	state[0] = 999.0
+	batch := rb.Sample(1)
+	require.Equal(s.T(), 1.0, batch[0].State[0], "push must deep-copy to prevent aliasing")
+}
+
+func (s *ReplayBufferSuite) TestDeterministicWithSeed() {
+	rb1 := NewReplayBufferWithSeed(100, 12345)
+	rb2 := NewReplayBufferWithSeed(100, 12345)
+	for i := 0; i < 50; i++ {
+		t := Transition{State: []float64{float64(i)}, Action: []float64{0}, Reward: float64(i)}
+		rb1.Push(t)
+		rb2.Push(t)
+	}
+
+	b1 := rb1.Sample(10)
+	b2 := rb2.Sample(10)
+	require.Equal(s.T(), len(b1), len(b2))
+	for i := range b1 {
+		require.Equal(s.T(), b1[i].Reward, b2[i].Reward)
+	}
+}
+
+func (s *ReplayBufferSuite) TestConcurrentPushAndSample() {
+	rb := NewReplayBuffer(1000)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				rb.Push(Transition{
+					State:     []float64{float64(id), float64(j)},
+					Action:    []float64{0},
+					Reward:    float64(j),
+					NextState: []float64{float64(id), float64(j + 1)},
+				})
+			}
+		}(i)
+	}
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				rb.Sample(32)
+			}
+		}()
+	}
+
+	wg.Wait()
+	require.Equal(s.T(), 1000, rb.Len())
 }

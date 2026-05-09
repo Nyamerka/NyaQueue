@@ -20,10 +20,18 @@ type HTTPClient struct {
 }
 
 func NewHTTPClient(addr string) *HTTPClient {
+	transport := &http.Transport{
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        256,
+		MaxIdleConnsPerHost: 256,
+		IdleConnTimeout:     90 * time.Second,
+		MaxConnsPerHost:     0,
+	}
 	return &HTTPClient{
 		base: "http://" + addr,
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Transport: transport,
+			Timeout:   30 * time.Second,
 		},
 	}
 }
@@ -38,6 +46,9 @@ type HTTPMetricsResponse struct {
 	PartitionLoads []float64 `json:"PartitionLoads"`
 	PredictedLoads []float64 `json:"PredictedLoads"`
 	SuccessRate    float64   `json:"SuccessRate"`
+	LoadStdDev     float64   `json:"LoadStdDev"`
+	MsgRate        float64   `json:"MsgRate"`
+	AvgMsgSize     float64   `json:"AvgMsgSize"`
 }
 
 func (c *HTTPClient) GetMetrics(ctx context.Context) (*HTTPMetricsResponse, error) {

@@ -25,7 +25,7 @@ func (s *MetricsSuite) TestRecordAndCollect() {
 	mc := b.metrics
 	mc.RecordProduce("t", 0)
 	mc.RecordProduce("t", 1)
-	mc.RecordConsume("t", 0)
+	mc.RecordConsume("t", 0, "g")
 
 	snap := mc.Collect()
 	require.Greater(s.T(), snap.Throughput, 0.0)
@@ -58,16 +58,16 @@ func (s *MetricsSuite) TestDeltaBasedPartitionLoads() {
 
 	mc.RecordProduceBatch("t", 0, 100)
 	mc.RecordProduceBatch("t", 1, 100)
-	mc.RecordConsume("t", 0)
-	mc.RecordConsume("t", 1)
+	mc.RecordConsume("t", 0, "g")
+	mc.RecordConsume("t", 1, "g")
 
 	snap1 := mc.Collect()
 	require.Len(s.T(), snap1.PartitionLoads, 2)
 
 	mc.RecordProduceBatch("t", 0, 50)
 	mc.RecordProduceBatch("t", 1, 10)
-	mc.RecordConsume("t", 0)
-	mc.RecordConsume("t", 1)
+	mc.RecordConsume("t", 0, "g")
+	mc.RecordConsume("t", 1, "g")
 
 	snap2 := mc.Collect()
 	require.Len(s.T(), snap2.PartitionLoads, 2)
@@ -93,15 +93,15 @@ func (s *MetricsSuite) TestDeltaLoadsReflectRecentActivity() {
 	for i := 0; i < 1000; i++ {
 		mc.RecordProduce("t", 0)
 		mc.RecordProduce("t", 1)
-		mc.RecordConsume("t", 0)
-		mc.RecordConsume("t", 1)
+		mc.RecordConsume("t", 0, "g")
+		mc.RecordConsume("t", 1, "g")
 	}
 	_ = mc.Collect()
 
 	for i := 0; i < 100; i++ {
 		mc.RecordProduce("t", 0)
-		mc.RecordConsume("t", 0)
-		mc.RecordConsume("t", 1)
+		mc.RecordConsume("t", 0, "g")
+		mc.RecordConsume("t", 1, "g")
 	}
 	snap := mc.Collect()
 

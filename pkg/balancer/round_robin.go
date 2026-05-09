@@ -5,6 +5,7 @@ import (
 	"math/bits"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"gonum.org/v1/gonum/floats"
@@ -31,11 +32,12 @@ func (rr *RoundRobin) OnMetrics(_ broker.Metrics) {}
 
 // WeightedRoundRobin distributes messages inversely proportional to partition load.
 type WeightedRoundRobin struct {
-	mu      sync.RWMutex
-	weights []float64
-	idx     int
-	cw      float64
-	minLoad float64
+	mu         sync.RWMutex
+	weights    []float64
+	idx        int
+	cw         float64
+	minLoad    float64
+	lastUpdate time.Time
 }
 
 type WRROption func(*WeightedRoundRobin)
@@ -83,13 +85,22 @@ func (w *WeightedRoundRobin) SelectPartition(_ string, _ []byte, numPartitions i
 	}
 }
 
+const wrrUpdateThrottle = 500 * time.Millisecond
+
 func (w *WeightedRoundRobin) OnMetrics(m broker.Metrics) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if time.Since(w.lastUpdate) < wrrUpdateThrottle {
+		return
+	}
+	w.lastUpdate = time.Now()
+
 	resized := len(m.PartitionLoads) != len(w.weights)
 
-	w.weights = make([]float64, len(m.PartitionLoads))
+	if resized {
+		w.weights = make([]float64, len(m.PartitionLoads))
+	}
 	for i, load := range m.PartitionLoads {
 		if load < w.minLoad {
 			load = w.minLoad

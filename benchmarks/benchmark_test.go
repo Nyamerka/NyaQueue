@@ -74,7 +74,9 @@ func BenchmarkRoundRobinSelect(b *testing.B) {
 func BenchmarkWRRSelect(b *testing.B) {
 	wrr := balancer.NewWeightedRoundRobin()
 	wrr.OnMetrics(broker.Metrics{
-		PartitionLoads: []float64{0.1, 0.5, 0.3, 0.8, 0.2, 0.6, 0.4, 0.7},
+		DerivedMetrics: broker.DerivedMetrics{
+			PartitionLoads: []float64{0.1, 0.5, 0.3, 0.8, 0.2, 0.6, 0.4, 0.7},
+		},
 	})
 	key := []byte("test-key")
 

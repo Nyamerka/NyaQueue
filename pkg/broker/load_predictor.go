@@ -9,11 +9,12 @@ import (
 type PartitionPrediction struct {
 	PartitionID int
 	Current     float64
-	Predicted   []float64 // predictions K steps ahead
+	Predicted   []float64
 }
 
 // LoadPredictor publishes partition load predictions via atomic.Value.
 // Uses AR(p) autoregression with Yule-Walker coefficient estimation.
+// Pre-allocated buffers eliminate per-predict allocations on the hot path.
 type LoadPredictor struct {
 	predictions atomic.Value // stores []PartitionPrediction
 	mu          sync.Mutex
@@ -22,15 +23,30 @@ type LoadPredictor struct {
 	horizon     int
 	interval    time.Duration
 	stopCh      chan struct{}
+
+	predBuf   []float64
+	centerBuf []float64
+	arBuf     []float64
+	coeffBuf  []float64
+	valsBuf   []float64
+	rBuf      []float64 // autocorrelation buffer for yuleWalker
+	aOldBuf   []float64 // Levinson-Durbin scratch for yuleWalker
 }
 
 func NewLoadPredictor(window, horizon int, interval time.Duration) *LoadPredictor {
 	lp := &LoadPredictor{
-		history:  make(map[int]*RingBuffer),
-		window:   window,
-		horizon:  horizon,
-		interval: interval,
-		stopCh:   make(chan struct{}),
+		history:   make(map[int]*RingBuffer),
+		window:    window,
+		horizon:   horizon,
+		interval:  interval,
+		stopCh:    make(chan struct{}),
+		predBuf:   make([]float64, horizon),
+		centerBuf: make([]float64, window),
+		arBuf:     make([]float64, window+horizon),
+		coeffBuf:  make([]float64, 16),
+		valsBuf:   make([]float64, window),
+		rBuf:      make([]float64, 16+1),
+		aOldBuf:   make([]float64, 16),
 	}
 	lp.predictions.Store([]PartitionPrediction{})
 	return lp
@@ -59,29 +75,33 @@ func (lp *LoadPredictor) Update(loads []float64) {
 }
 
 func (lp *LoadPredictor) predict() {
+	// RingBuffer is lock-free, so we can iterate history under lp.mu without
+	// creating a map snapshot — eliminates per-predict allocation.
 	lp.mu.Lock()
-	snapshot := make(map[int]*RingBuffer, len(lp.history))
-	for id, buf := range lp.history {
-		snapshot[id] = buf
-	}
-	lp.mu.Unlock()
 
-	preds := make([]PartitionPrediction, 0, len(snapshot))
-	for id, buf := range snapshot {
-		vals := buf.Values()
+	preds := make([]PartitionPrediction, 0, len(lp.history))
+	for id, buf := range lp.history {
+		n := buf.ValuesInto(lp.valsBuf)
+		vals := lp.valsBuf[:n]
+
 		current := 0.0
-		if len(vals) > 0 {
-			current = vals[len(vals)-1]
+		if n > 0 {
+			current = vals[n-1]
 		}
 
-		predicted := arPredict(vals, lp.horizon)
+		predicted := lp.arPredictInto(vals, lp.horizon)
+
+		predCopy := make([]float64, len(predicted))
+		copy(predCopy, predicted)
 
 		preds = append(preds, PartitionPrediction{
 			PartitionID: id,
 			Current:     current,
-			Predicted:   predicted,
+			Predicted:   predCopy,
 		})
 	}
+	lp.mu.Unlock()
+
 	lp.predictions.Store(preds)
 }
 
@@ -120,13 +140,17 @@ func (lp *LoadPredictor) Stop() {
 	close(lp.stopCh)
 }
 
-// arPredict forecasts `horizon` steps ahead using AR(p) autoregression.
-// The AR order p is automatically chosen as min(len(vals)/2, 8).
-// Coefficients are estimated via Yule-Walker equations solved with
-// Levinson-Durbin recursion (O(p²) time, no matrix inversion).
-// Falls back to simple mean when data is insufficient or constant.
-func arPredict(vals []float64, horizon int) []float64 {
-	predicted := make([]float64, horizon)
+// arPredictInto forecasts `horizon` steps ahead using AR(p) autoregression.
+// Uses pre-allocated buffers to avoid per-call allocations.
+func (lp *LoadPredictor) arPredictInto(vals []float64, horizon int) []float64 {
+	if len(lp.predBuf) < horizon {
+		lp.predBuf = make([]float64, horizon)
+	}
+	predicted := lp.predBuf[:horizon]
+	for i := range predicted {
+		predicted[i] = 0
+	}
+
 	n := len(vals)
 	if n == 0 {
 		return predicted
@@ -144,13 +168,12 @@ func arPredict(vals []float64, horizon int) []float64 {
 	}
 	if p < 1 || n < 2*p {
 		for k := range predicted {
-			_ = k
 			predicted[k] = mean
 		}
 		return predicted
 	}
 
-	coeffs := yuleWalker(vals, mean, p)
+	coeffs := yuleWalker(vals, mean, p, lp.coeffBuf, lp.rBuf, lp.aOldBuf)
 	if coeffs == nil {
 		for k := range predicted {
 			predicted[k] = mean
@@ -158,12 +181,19 @@ func arPredict(vals []float64, horizon int) []float64 {
 		return predicted
 	}
 
-	centered := make([]float64, n)
+	if len(lp.centerBuf) < n {
+		lp.centerBuf = make([]float64, n)
+	}
+	centered := lp.centerBuf[:n]
 	for i, v := range vals {
 		centered[i] = v - mean
 	}
 
-	buf := make([]float64, n+horizon)
+	needed := n + horizon
+	if len(lp.arBuf) < needed {
+		lp.arBuf = make([]float64, needed)
+	}
+	buf := lp.arBuf[:needed]
 	copy(buf, centered)
 
 	for k := 0; k < horizon; k++ {
@@ -186,11 +216,15 @@ func arPredict(vals []float64, horizon int) []float64 {
 }
 
 // yuleWalker estimates AR(p) coefficients via Levinson-Durbin recursion.
-// Returns nil if the series has zero variance.
-func yuleWalker(vals []float64, mean float64, p int) []float64 {
+// All buffers (coeffBuf, rBuf, aOldBuf) are pre-allocated to eliminate per-call allocations.
+// Returns nil if zero variance.
+func yuleWalker(vals []float64, mean float64, p int, coeffBuf, rBuf, aOldBuf []float64) []float64 {
 	n := len(vals)
 
-	r := make([]float64, p+1)
+	if len(rBuf) < p+1 {
+		rBuf = make([]float64, p+1)
+	}
+	r := rBuf[:p+1]
 	for lag := 0; lag <= p; lag++ {
 		sum := 0.0
 		for i := lag; i < n; i++ {
@@ -203,8 +237,15 @@ func yuleWalker(vals []float64, mean float64, p int) []float64 {
 		return nil
 	}
 
-	a := make([]float64, p)
-	aOld := make([]float64, p)
+	if len(coeffBuf) < p {
+		coeffBuf = make([]float64, p)
+	}
+	a := coeffBuf[:p]
+	if len(aOldBuf) < p {
+		aOldBuf = make([]float64, p)
+	}
+	aOld := aOldBuf[:p]
+
 	a[0] = r[1] / r[0]
 	var e float64 = r[0] * (1 - a[0]*a[0])
 
@@ -230,11 +271,11 @@ func yuleWalker(vals []float64, mean float64, p int) []float64 {
 	return a
 }
 
+// RingBuffer is a lock-free circular buffer for time-series data.
+// Push uses an atomic monotonic counter, enabling concurrent writes without mutex.
 type RingBuffer struct {
-	mu   sync.Mutex
-	data []float64
-	pos  int
-	full bool
+	data     []float64
+	writeIdx atomic.Int64
 }
 
 func NewRingBuffer(size int) *RingBuffer {
@@ -242,29 +283,59 @@ func NewRingBuffer(size int) *RingBuffer {
 }
 
 func (rb *RingBuffer) Push(v float64) {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-
-	rb.data[rb.pos] = v
-	rb.pos++
-	if rb.pos >= len(rb.data) {
-		rb.pos = 0
-		rb.full = true
-	}
+	idx := rb.writeIdx.Add(1) - 1
+	rb.data[idx%int64(len(rb.data))] = v
 }
 
+// Values allocates and returns a copy of the buffer contents in chronological order.
 func (rb *RingBuffer) Values() []float64 {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-
-	if !rb.full {
-		out := make([]float64, rb.pos)
-		copy(out, rb.data[:rb.pos])
-		return out
+	w := rb.writeIdx.Load()
+	size := int64(len(rb.data))
+	if w == 0 {
+		return nil
 	}
 
-	out := make([]float64, len(rb.data))
-	copy(out, rb.data[rb.pos:])
-	copy(out[len(rb.data)-rb.pos:], rb.data[:rb.pos])
+	n := w
+	if n > size {
+		n = size
+	}
+	out := make([]float64, n)
+	rb.copyInto(out, w, size, int(n))
 	return out
+}
+
+// ValuesInto copies buffer contents into dst without allocating. Returns the
+// number of values written. dst must be at least as large as the ring size.
+func (rb *RingBuffer) ValuesInto(dst []float64) int {
+	w := rb.writeIdx.Load()
+	size := int64(len(rb.data))
+	if w == 0 {
+		return 0
+	}
+
+	n := int(w)
+	if int64(n) > size {
+		n = int(size)
+	}
+	if n > len(dst) {
+		n = len(dst)
+	}
+	rb.copyInto(dst[:n], w, size, n)
+	return n
+}
+
+func (rb *RingBuffer) copyInto(dst []float64, w, size int64, n int) {
+	if w <= size {
+		copy(dst, rb.data[:n])
+	} else {
+		start := w % size
+		tail := int(size - start)
+		if tail > n {
+			tail = n
+		}
+		copy(dst, rb.data[start:start+int64(tail)])
+		if tail < n {
+			copy(dst[tail:], rb.data[:n-tail])
+		}
+	}
 }

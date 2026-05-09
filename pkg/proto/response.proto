@@ -32,4 +32,8 @@ message MetricsResponse {
   repeated double partition_loads = 3;
   double          success_rate    = 4;
   repeated int64  queue_depth     = 5;
+  double          load_stddev     = 6;
+  double          msg_rate        = 7;
+  double          avg_msg_size    = 8;
+  repeated double predicted_loads = 9;
 }

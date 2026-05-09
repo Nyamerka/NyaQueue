@@ -1,6 +1,7 @@
 package balancer
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
@@ -42,11 +43,13 @@ func (s *PSASuite) TestReleaseBindingsOnEmptyQueue() {
 	psa.SelectPartition("t", []byte("k2"), 4)
 
 	psa.OnMetrics(broker.Metrics{
-		PartitionLoads: []float64{0, 0, 0, 0},
-		QueueDepth:     []int{0, 0, 0, 0},
+		DerivedMetrics: broker.DerivedMetrics{
+			PartitionLoads: []float64{0, 0, 0, 0},
+			QueueDepth:     []int{0, 0, 0, 0},
+		},
 	})
 
-	require.Len(s.T(), psa.bindings, 0, "bindings should be released for empty partitions")
+	require.Equal(s.T(), 0, psa.bindings.Len(), "bindings should be released for empty partitions")
 	require.Len(s.T(), psa.free, 4, "all partitions should be free")
 }
 
@@ -65,4 +68,57 @@ func (s *PSASuite) TestHashKeyDeterministic() {
 	h1 := hashKey([]byte("test-key"))
 	h2 := hashKey([]byte("test-key"))
 	require.Equal(s.T(), h1, h2)
+}
+
+func (s *PSASuite) TestConcurrentSelectAndOnMetrics() {
+	psa := NewPSA(4)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				psa.SelectPartition("t", []byte{byte(i), byte(j)}, 4)
+			}
+		}(i)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 100; j++ {
+			psa.OnMetrics(broker.Metrics{
+				DerivedMetrics: broker.DerivedMetrics{
+					PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4},
+					QueueDepth:     []int{10, 20, 30, 40},
+				},
+			})
+		}
+	}()
+
+	wg.Wait()
+}
+
+func (s *PSASuite) TestEvictionCountIncrementsOnOverflow() {
+	numParts := 128
+	psa := NewPSA(numParts)
+
+	total := defaultPSAMaxBindings + 500
+	batchSize := numParts
+	for i := 0; i < total; i += batchSize {
+		for j := 0; j < batchSize && i+j < total; j++ {
+			k := i + j
+			psa.SelectPartition("t", []byte{byte(k >> 24), byte(k >> 16), byte(k >> 8), byte(k)}, numParts)
+		}
+		depths := make([]int, numParts)
+		psa.OnMetrics(broker.Metrics{
+			DerivedMetrics: broker.DerivedMetrics{
+				PartitionLoads: make([]float64, numParts),
+				QueueDepth:     depths,
+			},
+		})
+	}
+
+	require.Greater(s.T(), psa.EvictionCount(), int64(0))
 }

@@ -284,6 +284,10 @@ type MetricsResponse struct {
 	PartitionLoads []float64              `protobuf:"fixed64,3,rep,packed,name=partition_loads,json=partitionLoads,proto3" json:"partition_loads,omitempty"`
 	SuccessRate    float64                `protobuf:"fixed64,4,opt,name=success_rate,json=successRate,proto3" json:"success_rate,omitempty"`
 	QueueDepth     []int64                `protobuf:"varint,5,rep,packed,name=queue_depth,json=queueDepth,proto3" json:"queue_depth,omitempty"`
+	LoadStddev     float64                `protobuf:"fixed64,6,opt,name=load_stddev,json=loadStddev,proto3" json:"load_stddev,omitempty"`
+	MsgRate        float64                `protobuf:"fixed64,7,opt,name=msg_rate,json=msgRate,proto3" json:"msg_rate,omitempty"`
+	AvgMsgSize     float64                `protobuf:"fixed64,8,opt,name=avg_msg_size,json=avgMsgSize,proto3" json:"avg_msg_size,omitempty"`
+	PredictedLoads []float64              `protobuf:"fixed64,9,rep,packed,name=predicted_loads,json=predictedLoads,proto3" json:"predicted_loads,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -353,6 +357,34 @@ func (x *MetricsResponse) GetQueueDepth() []int64 {
 	return nil
 }
 
+func (x *MetricsResponse) GetLoadStddev() float64 {
+	if x != nil {
+		return x.LoadStddev
+	}
+	return 0
+}
+
+func (x *MetricsResponse) GetMsgRate() float64 {
+	if x != nil {
+		return x.MsgRate
+	}
+	return 0
+}
+
+func (x *MetricsResponse) GetAvgMsgSize() float64 {
+	if x != nil {
+		return x.AvgMsgSize
+	}
+	return 0
+}
+
+func (x *MetricsResponse) GetPredictedLoads() []float64 {
+	if x != nil {
+		return x.PredictedLoads
+	}
+	return nil
+}
+
 var File_response_proto protoreflect.FileDescriptor
 
 const file_response_proto_rawDesc = "" +
@@ -368,7 +400,7 @@ const file_response_proto_rawDesc = "" +
 	"\x13CreateTopicResponse\"\x15\n" +
 	"\x13DeleteTopicResponse\"A\n" +
 	"\x12ListTopicsResponse\x12+\n" +
-	"\x06topics\x18\x01 \x03(\v2\x13.nyaqueue.TopicInfoR\x06topics\"\xbf\x01\n" +
+	"\x06topics\x18\x01 \x03(\v2\x13.nyaqueue.TopicInfoR\x06topics\"\xc6\x02\n" +
 	"\x0fMetricsResponse\x12\x1e\n" +
 	"\n" +
 	"throughput\x18\x01 \x01(\x01R\n" +
@@ -378,7 +410,13 @@ const file_response_proto_rawDesc = "" +
 	"\x0fpartition_loads\x18\x03 \x03(\x01R\x0epartitionLoads\x12!\n" +
 	"\fsuccess_rate\x18\x04 \x01(\x01R\vsuccessRate\x12\x1f\n" +
 	"\vqueue_depth\x18\x05 \x03(\x03R\n" +
-	"queueDepthB(Z&github.com/Nyamerka/NyaQueue/pkg/protob\x06proto3"
+	"queueDepth\x12\x1f\n" +
+	"\vload_stddev\x18\x06 \x01(\x01R\n" +
+	"loadStddev\x12\x19\n" +
+	"\bmsg_rate\x18\a \x01(\x01R\amsgRate\x12 \n" +
+	"\favg_msg_size\x18\b \x01(\x01R\n" +
+	"avgMsgSize\x12'\n" +
+	"\x0fpredicted_loads\x18\t \x03(\x01R\x0epredictedLoadsB(Z&github.com/Nyamerka/NyaQueue/pkg/protob\x06proto3"
 
 var (
 	file_response_proto_rawDescOnce sync.Once

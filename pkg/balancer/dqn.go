@@ -43,12 +43,12 @@ type DQNBalancer struct {
 	trainEvery    int
 	weightInit    float64
 
-	backend    backends.Backend
-	ctx        *context.Context
-	fwdExec    *context.Exec
-	nextQExec  *context.Exec
-	trainExec  *context.Exec
-	stateSize  int
+	backend   backends.Backend
+	ctx       *context.Context
+	fwdExec   *context.Exec
+	nextQExec *context.Exec
+	trainExec *context.Exec
+	stateSize int
 
 	replayBuffer *nn.ReplayBuffer
 
@@ -65,8 +65,12 @@ type DQNBalancer struct {
 	stateMu        sync.Mutex
 	loads          []float64
 	predictedLoads []float64
+	msgRate        float64
+	avgMsgSize     float64
 	lastState      []float64
 	lastAction     int
+
+	droppedExperience atomic.Int64
 }
 
 // DQNOption configures a DQNBalancer.
@@ -216,15 +220,28 @@ func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions in
 
 // OnMetrics updates loads, evaluates watchdog, and pushes experience to the
 // training goroutine via a non-blocking channel send.
+// computeReward runs outside the lock to avoid blocking SelectPartition.
 func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
+	reward := computeReward(m)
+
 	d.stateMu.Lock()
 
 	if len(m.PartitionLoads) > 0 {
-		d.loads = m.PartitionLoads
+		if cap(d.loads) < len(m.PartitionLoads) {
+			d.loads = make([]float64, len(m.PartitionLoads))
+		}
+		d.loads = d.loads[:len(m.PartitionLoads)]
+		copy(d.loads, m.PartitionLoads)
 	}
 	if len(m.PredictedLoads) > 0 {
-		d.predictedLoads = m.PredictedLoads
+		if cap(d.predictedLoads) < len(m.PredictedLoads) {
+			d.predictedLoads = make([]float64, len(m.PredictedLoads))
+		}
+		d.predictedLoads = d.predictedLoads[:len(m.PredictedLoads)]
+		copy(d.predictedLoads, m.PredictedLoads)
 	}
+	d.msgRate = m.MsgRate
+	d.avgMsgSize = m.AvgMsgSize
 
 	shouldFallback := false
 
@@ -246,28 +263,27 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 
 	d.fallbackActive.Store(shouldFallback)
 
+	var t *nn.Transition
 	if d.lastState != nil {
-		reward := computeReward(m)
 		nextState := d.buildStateLocked()
-
-		t := nn.Transition{
-			State:     d.lastState,
+		t = &nn.Transition{
+			State:     append([]float64(nil), d.lastState...),
 			Action:    []float64{float64(d.lastAction)},
 			Reward:    reward,
 			NextState: nextState,
 			Done:      false,
 		}
-
-		d.stateMu.Unlock()
-
-		select {
-		case d.expCh <- t:
-		default:
-		}
-		return
 	}
 
 	d.stateMu.Unlock()
+
+	if t != nil {
+		select {
+		case d.expCh <- *t:
+		default:
+			d.droppedExperience.Add(1)
+		}
+	}
 }
 
 func (d *DQNBalancer) SetBaseThroughput(t float64) {
@@ -277,11 +293,19 @@ func (d *DQNBalancer) SetBaseThroughput(t float64) {
 func (d *DQNBalancer) SetPredictedLoads(predicted []float64) {
 	d.stateMu.Lock()
 	defer d.stateMu.Unlock()
-	d.predictedLoads = predicted
+	if cap(d.predictedLoads) < len(predicted) {
+		d.predictedLoads = make([]float64, len(predicted))
+	}
+	d.predictedLoads = d.predictedLoads[:len(predicted)]
+	copy(d.predictedLoads, predicted)
 }
 
 func (d *DQNBalancer) IsFallbackActive() bool {
 	return d.fallbackActive.Load()
+}
+
+func (d *DQNBalancer) DroppedExperience() int64 {
+	return d.droppedExperience.Load()
 }
 
 // Stop terminates the background training goroutine.
@@ -325,7 +349,7 @@ func (d *DQNBalancer) buildStateLocked() []float64 {
 	for len(state) < d.numPartitions*2 {
 		state = append(state, 0)
 	}
-	state = append(state, 0, 0)
+	state = append(state, d.msgRate/100000, d.avgMsgSize/1024)
 	return state
 }
 
@@ -344,6 +368,9 @@ func (d *DQNBalancer) trainStep() {
 
 	batch := d.replayBuffer.Sample(d.batchSize)
 	bs := len(batch)
+	if bs < d.batchSize {
+		return
+	}
 
 	statesBuf := make([]float64, bs*d.stateSize)
 	nextStatesBuf := make([]float64, bs*d.stateSize)

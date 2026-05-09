@@ -63,17 +63,13 @@ func NewServer(b *broker.Broker) *Server {
 		grpc.UnaryInterceptor(semaphoreInterceptor),
 	}
 
-	if cfg.ReadTimeoutMs > 0 || cfg.WriteTimeoutMs > 0 {
-		timeout := time.Duration(cfg.ReadTimeoutMs) * time.Millisecond
-		if wt := time.Duration(cfg.WriteTimeoutMs) * time.Millisecond; wt > timeout {
-			timeout = wt
-		}
-		opts = append(opts, grpc.KeepaliveParams(keepalive.ServerParameters{
-			MaxConnectionIdle: timeout * 2,
-			Time:              timeout,
-			Timeout:           timeout,
-		}))
-	}
+	opts = append(opts, grpc.KeepaliveParams(keepalive.ServerParameters{
+		MaxConnectionAge:      4 * time.Minute,
+		MaxConnectionAgeGrace: 30 * time.Second,
+		MaxConnectionIdle:     5 * time.Minute,
+		Time:                  10 * time.Second,
+		Timeout:               1 * time.Second,
+	}))
 
 	return &Server{
 		broker: b,
@@ -178,9 +174,8 @@ func allFailed(results []broker.PublishResult) bool {
 	return true
 }
 
-// Consume implements at-most-once delivery: offsets are committed per message
-// inside the loop so that Broker.Consume advances correctly. If the RPC fails
-// after a commit, the client won't receive the already-committed messages.
+// Consume fetches messages up to maxBytes, tracking the offset locally within
+// the batch. A single Commit at the end avoids per-message offset store writes.
 func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.ConsumeResponse, error) {
 	cfg := s.broker.Config()
 
@@ -196,13 +191,20 @@ func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.Consume
 	fetchMaxWait := time.Duration(cfg.FetchMaxWaitMs) * time.Millisecond
 	deadline := time.Now().Add(fetchMaxWait)
 
+	// Load offset once; advance locally in the loop.
+	currentOffset, err := s.broker.LoadOffset(req.Group, req.Topic, int(req.Partition))
+	if err != nil {
+		currentOffset = 1
+	}
+
 	var (
 		envelopes  []*pb.MessageEnvelope
 		totalBytes int
+		lastOffset int64 = -1
 	)
 
 	for totalBytes < maxBytes {
-		msg, nextOffset, err := s.broker.Consume(req.Topic, req.Group, int(req.Partition))
+		msg, nextOffset, err := s.broker.ConsumeFrom(req.Topic, req.Group, int(req.Partition), currentOffset)
 		if err != nil {
 			if errors.Is(err, broker.ErrNoMessages) {
 				if totalBytes < fetchMinBytes && time.Now().Before(deadline) {
@@ -226,10 +228,14 @@ func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.Consume
 		}
 		envelopes = append(envelopes, env)
 		totalBytes += len(msg.Key) + len(msg.Value)
+		lastOffset = int64(nextOffset)
+		currentOffset = nextOffset
+	}
 
-		if err := s.broker.Commit(req.Group, req.Topic, int(req.Partition), int64(nextOffset)); err != nil {
+	if lastOffset >= 0 {
+		if err := s.broker.Commit(req.Group, req.Topic, int(req.Partition), lastOffset); err != nil {
 			log.Printf("auto-commit failed (topic=%s group=%s partition=%d offset=%d): %v",
-				req.Topic, req.Group, req.Partition, nextOffset, err)
+				req.Topic, req.Group, req.Partition, lastOffset, err)
 		}
 	}
 
@@ -315,5 +321,9 @@ func (s *Server) GetMetrics(_ context.Context, _ *pb.MetricsRequest) (*pb.Metric
 		PartitionLoads: m.PartitionLoads,
 		SuccessRate:    m.SuccessRate,
 		QueueDepth:     depths,
+		LoadStddev:     m.LoadStdDev,
+		MsgRate:        m.MsgRate,
+		AvgMsgSize:     m.AvgMsgSize,
+		PredictedLoads: m.PredictedLoads,
 	}, nil
 }

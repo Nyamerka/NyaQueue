@@ -2,6 +2,7 @@ package balancer
 
 import (
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,15 +46,15 @@ func (s *DQNSuite) TestFallbackWatchdog() {
 	dqn.SetBaseThroughput(1000)
 
 	dqn.OnMetrics(broker.Metrics{
-		PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5},
-		Throughput:     500,
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 500},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
 	})
 
 	require.True(s.T(), dqn.IsFallbackActive())
 
 	dqn.OnMetrics(broker.Metrics{
-		PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5},
-		Throughput:     900,
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 900},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
 	})
 
 	require.False(s.T(), dqn.IsFallbackActive())
@@ -64,17 +65,17 @@ func (s *DQNSuite) TestProactiveWatchdog() {
 	defer dqn.Stop()
 
 	dqn.OnMetrics(broker.Metrics{
-		PartitionLoads: []float64{0.3, 0.3, 0.3, 0.3},
+		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.3, 0.3, 0.3, 0.3}},
 	})
 	require.False(s.T(), dqn.IsFallbackActive(), "low load should not trigger fallback")
 
 	dqn.OnMetrics(broker.Metrics{
-		PartitionLoads: []float64{0.8, 0.9, 0.7, 0.85},
+		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.8, 0.9, 0.7, 0.85}},
 	})
 	require.True(s.T(), dqn.IsFallbackActive(), "high mean load should trigger proactive fallback")
 
 	dqn.OnMetrics(broker.Metrics{
-		PartitionLoads: []float64{0.3, 0.3, 0.3, 0.3},
+		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.3, 0.3, 0.3, 0.3}},
 	})
 	require.False(s.T(), dqn.IsFallbackActive(), "load recovery should deactivate fallback")
 }
@@ -85,7 +86,7 @@ func (s *DQNSuite) TestOnMetricsTrains() {
 
 	dqn.SelectPartition("t", []byte("k"), 4)
 	dqn.OnMetrics(broker.Metrics{
-		PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8},
+		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8}},
 	})
 
 	require.Eventually(s.T(), func() bool {
@@ -100,14 +101,14 @@ func (s *DQNSuite) TestComputeRewardEmpty() {
 
 func (s *DQNSuite) TestComputeRewardPerfectBalance() {
 	reward := computeReward(broker.Metrics{
-		PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5},
+		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
 	})
 	require.Equal(s.T(), 0.0, reward)
 }
 
 func (s *DQNSuite) TestComputeRewardImbalance() {
 	reward := computeReward(broker.Metrics{
-		PartitionLoads: []float64{0.1, 0.9, 0.1, 0.9},
+		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.9, 0.1, 0.9}},
 	})
 	require.Less(s.T(), reward, 0.0, "imbalanced loads yield negative reward")
 }
@@ -189,7 +190,7 @@ func (s *DQNSuite) TestTrainStepWithEnoughData() {
 	for i := 0; i < 5; i++ {
 		dqn.SelectPartition("t", []byte("k"), 4)
 		dqn.OnMetrics(broker.Metrics{
-			PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4},
+			DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4}},
 		})
 	}
 	require.Eventually(s.T(), func() bool {
@@ -201,17 +202,15 @@ func (s *DQNSuite) TestTrainStepChangesWeights() {
 	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNLearningRate(0.1))
 	defer dqn.Stop()
 
-	// Get initial forward output.
 	state := []float64{0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.0, 0.0}
 	dqn.weightsMu.RLock()
 	qBefore := dqn.forward(state)
 	dqn.weightsMu.RUnlock()
 
-	// Fill replay buffer and train.
 	for i := 0; i < 10; i++ {
 		dqn.SelectPartition("t", []byte("k"), 4)
 		dqn.OnMetrics(broker.Metrics{
-			PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4},
+			DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4}},
 		})
 	}
 
@@ -239,7 +238,7 @@ func (s *DQNSuite) TestAsyncTrainingDoesNotBlockInference() {
 	for i := 0; i < 100; i++ {
 		dqn.SelectPartition("t", []byte("k"), 4)
 		dqn.OnMetrics(broker.Metrics{
-			PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4},
+			DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4}},
 		})
 	}
 
@@ -252,4 +251,39 @@ func (s *DQNSuite) TestAsyncTrainingDoesNotBlockInference() {
 
 	require.Less(s.T(), elapsed, 5*time.Second,
 		"1000 inference calls should complete without excessive contention")
+}
+
+func (s *DQNSuite) TestConcurrentSelectAndOnMetrics() {
+	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				dqn.SelectPartition("t", []byte{1}, 4)
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 100; j++ {
+			dqn.OnMetrics(broker.Metrics{
+				DerivedMetrics: broker.DerivedMetrics{
+					PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4},
+				},
+			})
+		}
+	}()
+	wg.Wait()
+}
+
+func (s *DQNSuite) TestDroppedExperienceCounter() {
+	dqn := NewDQNBalancer(4, WithDQNEpsilon(1.0))
+	defer dqn.Stop()
+
+	require.Equal(s.T(), int64(0), dqn.DroppedExperience())
 }

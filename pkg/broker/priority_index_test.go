@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -140,4 +141,67 @@ func (s *PriorityIndexSuite) TestClampPriority() {
 	entry, ok = pi.PopHighest()
 	require.True(s.T(), ok)
 	require.Equal(s.T(), int64(1), entry.WalOffset) // clamped to 0
+}
+
+func (s *PriorityIndexSuite) TestConcurrentAddAndPop() {
+	pi := NewPriorityIndex()
+	var wg sync.WaitGroup
+	now := time.Now()
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				pi.Add(id%MaxPriority, int64(id*1000+j), now)
+			}
+		}(i)
+	}
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				pi.PopHighest()
+			}
+		}()
+	}
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				pi.LevelDistribution()
+				pi.Len()
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+func (s *PriorityIndexSuite) TestConcurrentPopWithThresholdAndAdd() {
+	pi := NewPriorityIndex()
+	var wg sync.WaitGroup
+	now := time.Now()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 1000; j++ {
+			pi.Add(j%MaxPriority, int64(j), now)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 500; j++ {
+			pi.PopWithThreshold(j % MaxPriority)
+		}
+	}()
+
+	wg.Wait()
 }

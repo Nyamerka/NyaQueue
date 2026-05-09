@@ -28,7 +28,8 @@ func ExportCSV(results []ExperimentResult, dir string) error {
 	header := []string{
 		"scenario", "algorithm", "system", "mode",
 		"throughput_msg_sec", "latency_p50_us", "latency_p95_us", "latency_p99_us",
-		"enqueue_to_flush_p50_us", "flush_to_append_p50_us", "append_to_consume_p50_us",
+		"enqueue_to_flush_p50_us", "flush_to_append_p50_us",
+		"append_to_consume_p50_us", "append_to_consume_p95_us",
 		"load_stddev", "produced", "consumed",
 		"publish_errors", "consume_errors", "duration_sec",
 		"high_prio_p50_us", "high_prio_p99_us",
@@ -54,6 +55,7 @@ func ExportCSV(results []ExperimentResult, dir string) error {
 			fmt.Sprintf("%.2f", float64(r.LatencyEnqueueToFlushP50)/float64(time.Microsecond)),
 			fmt.Sprintf("%.2f", float64(r.LatencyFlushToAppendP50)/float64(time.Microsecond)),
 			fmt.Sprintf("%.2f", float64(r.LatencyAppendToConsumeP50)/float64(time.Microsecond)),
+			fmt.Sprintf("%.2f", float64(r.LatencyAppendToConsumeP95)/float64(time.Microsecond)),
 			fmt.Sprintf("%.6f", r.LoadStdDev),
 			fmt.Sprintf("%d", r.Produced),
 			fmt.Sprintf("%d", r.Consumed),

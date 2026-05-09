@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -70,8 +71,8 @@ func (s *DQNSchedSuite) TestFunctionalOptions() {
 			dqn := NewDQNScheduler(tc.opts...)
 			defer dqn.Stop()
 			require.NotNil(s.T(), dqn)
-			require.NotNil(s.T(), dqn.w1)
-			require.NotNil(s.T(), dqn.w2)
+			require.NotNil(s.T(), dqn.fwdExec, "GoMLX fwdExec should be initialized")
+			require.NotNil(s.T(), dqn.trainExec, "GoMLX trainExec should be initialized")
 		})
 	}
 }
@@ -84,10 +85,14 @@ func (s *DQNSchedSuite) TestOnMetrics() {
 	require.NoError(s.T(), err)
 	defer p.Close()
 
-	_, _ = p.Append(broker.NewMessage(5, []byte("k"), []byte("v")))
+	for i := 0; i < 3; i++ {
+		_, _ = p.Append(broker.NewMessage(5, []byte("k"), []byte("v")))
+	}
+
+	_, _, _ = dqn.Next(p, 0)
 	_, _, _ = dqn.Next(p, 0)
 
-	dqn.OnMetrics(broker.Metrics{AvgLatency: 10.0})
+	dqn.OnMetrics(broker.Metrics{BusinessMetrics: broker.BusinessMetrics{AvgLatency: 10.0}})
 
 	dqn.Stop()
 	require.Greater(s.T(), dqn.replayBuffer.Len(), 0)
@@ -95,7 +100,7 @@ func (s *DQNSchedSuite) TestOnMetrics() {
 
 func (s *DQNSchedSuite) TestOnMetricsWithoutPriorState() {
 	dqn := NewDQNScheduler()
-	dqn.OnMetrics(broker.Metrics{AvgLatency: 5.0})
+	dqn.OnMetrics(broker.Metrics{BusinessMetrics: broker.BusinessMetrics{AvgLatency: 5.0}})
 	dqn.Stop()
 	require.Equal(s.T(), 0, dqn.replayBuffer.Len(), "no push without prior state")
 }
@@ -104,9 +109,10 @@ func (s *DQNSchedSuite) TestForwardOutputSize() {
 	dqn := NewDQNScheduler()
 	defer dqn.Stop()
 	state := make([]float64, dqn.stateSize)
-	q, hidden := dqn.forward(state)
+	dqn.weightsMu.RLock()
+	q := dqn.forward(state)
+	dqn.weightsMu.RUnlock()
 	require.Len(s.T(), q, dqn.numActions)
-	require.Len(s.T(), hidden, dqn.hiddenSize)
 }
 
 func (s *DQNSchedSuite) TestForwardDeterministic() {
@@ -116,44 +122,21 @@ func (s *DQNSchedSuite) TestForwardDeterministic() {
 	for i := range state {
 		state[i] = float64(i) * 0.1
 	}
-	q1, h1 := dqn.forward(state)
-	q2, h2 := dqn.forward(state)
+	dqn.weightsMu.RLock()
+	q1 := dqn.forward(state)
+	q2 := dqn.forward(state)
+	dqn.weightsMu.RUnlock()
 	require.InDeltaSlice(s.T(), q1, q2, 1e-12)
-	require.InDeltaSlice(s.T(), h1, h2, 1e-12)
-}
-
-func (s *DQNSchedSuite) TestUpdateWeightsChangesWeights() {
-	dqn := NewDQNScheduler(WithDQNSchedLearningRate(0.1))
-	defer dqn.Stop()
-	state := make([]float64, dqn.stateSize)
-	for i := range state {
-		state[i] = 0.5
-	}
-
-	qBefore, hidden := dqn.forward(state)
-	beforeCopy := make([]float64, len(qBefore))
-	copy(beforeCopy, qBefore)
-
-	dqn.updateWeights(state, 0, 1.0, hidden)
-
-	qAfter, _ := dqn.forward(state)
-	changed := false
-	for i := range qBefore {
-		if qAfter[i] != beforeCopy[i] {
-			changed = true
-			break
-		}
-	}
-	require.True(s.T(), changed, "weights should change after update")
 }
 
 func (s *DQNSchedSuite) TestForwardShortState() {
 	dqn := NewDQNScheduler()
 	defer dqn.Stop()
-	state := []float64{0.1, 0.2}
-	q, hidden := dqn.forward(state)
+	state := padOrTruncSched([]float64{0.1, 0.2}, dqn.stateSize)
+	dqn.weightsMu.RLock()
+	q := dqn.forward(state)
+	dqn.weightsMu.RUnlock()
 	require.Len(s.T(), q, dqn.numActions)
-	require.Len(s.T(), hidden, dqn.hiddenSize)
 }
 
 func (s *DQNSchedSuite) TestEnqueueNoop() {
@@ -214,10 +197,79 @@ func (s *DQNSchedSuite) TestAsyncTrainingDoesNotBlockInference() {
 
 	for i := 0; i < 100; i++ {
 		_, _, _ = dqn.Next(p, 0)
-		dqn.OnMetrics(broker.Metrics{AvgLatency: float64(i)})
+		dqn.OnMetrics(broker.Metrics{BusinessMetrics: broker.BusinessMetrics{AvgLatency: float64(i)}})
 	}
 
 	require.Eventually(s.T(), func() bool {
 		return dqn.replayBuffer.Len() > 0
 	}, time.Second, 5*time.Millisecond, "experience should be collected via async channel")
+}
+
+func (s *DQNSchedSuite) TestBellmanUsesCorrectNextState() {
+	dqn := NewDQNScheduler()
+
+	dir := s.T().TempDir()
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone)
+	require.NoError(s.T(), err)
+	defer p.Close()
+
+	for i := 0; i < 10; i++ {
+		_, _ = p.Append(broker.NewMessage(uint8(i%10), []byte("k"), []byte("v")))
+	}
+
+	_, _, _ = dqn.Next(p, 0)
+	_, _, _ = dqn.Next(p, 0)
+
+	dqn.stateMu.Lock()
+	prevState := dqn.prevState
+	lastState := dqn.lastState
+	dqn.stateMu.Unlock()
+
+	require.NotNil(s.T(), prevState, "prevState should be set after two Next calls")
+	require.NotNil(s.T(), lastState, "lastState should be set")
+
+	dqn.OnMetrics(broker.Metrics{BusinessMetrics: broker.BusinessMetrics{AvgLatency: 5.0}})
+	dqn.Stop()
+
+	require.Greater(s.T(), dqn.replayBuffer.Len(), 0)
+}
+
+func (s *DQNSchedSuite) TestGoMLXExecsPrecompiled() {
+	dqn := NewDQNScheduler()
+	defer dqn.Stop()
+	require.NotNil(s.T(), dqn.fwdExec, "fwdExec should be precompiled")
+	require.NotNil(s.T(), dqn.nextQExec, "nextQExec should be precompiled")
+	require.NotNil(s.T(), dqn.trainExec, "trainExec should be precompiled")
+}
+
+func (s *DQNSchedSuite) TestConcurrentNextAndOnMetrics() {
+	dir := s.T().TempDir()
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone)
+	require.NoError(s.T(), err)
+	defer p.Close()
+
+	for i := 0; i < 500; i++ {
+		_, err := p.Append(broker.NewMessage(uint8(i%10), []byte("k"), []byte("v")))
+		require.NoError(s.T(), err)
+	}
+
+	dqn := NewDQNScheduler(WithDQNSchedEpsilon(0.5))
+	defer dqn.Stop()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				_, _, _ = dqn.Next(p, 0)
+			}
+		}()
+	}
+	go func() {
+		for j := 0; j < 100; j++ {
+			dqn.OnMetrics(broker.Metrics{BusinessMetrics: broker.BusinessMetrics{AvgLatency: float64(j)}})
+		}
+	}()
+	wg.Wait()
 }

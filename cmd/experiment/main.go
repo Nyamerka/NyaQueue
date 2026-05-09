@@ -172,14 +172,18 @@ func parseAlgorithms(s string) []experiments.AlgorithmConfig {
 
 func printSummary(results []experiments.ExperimentResult) {
 	fmt.Println()
-	fmt.Printf("%-20s %-15s %-10s %12s %10s %10s %10s %10s\n",
-		"SCENARIO", "ALGORITHM", "MODE", "THROUGHPUT", "P50(us)", "P95(us)", "P99(us)", "STDDEV")
-	fmt.Println(strings.Repeat("-", 107))
+	fmt.Printf("%-20s %-15s %-10s %12s %17s %17s %10s %10s\n",
+		"SCENARIO", "ALGORITHM", "MODE", "THROUGHPUT",
+		"P50_TOTAL/INBR", "P95_TOTAL/INBR", "P99(us)", "STDDEV")
+	fmt.Println(strings.Repeat("-", 131))
 
 	for _, r := range results {
-		fmt.Printf("%-20s %-15s %-10s %12.0f %10.1f %10.1f %10.1f %10.6f\n",
+		p50inbr := float64(r.LatencyAppendToConsumeP50) / 1000
+		p95inbr := float64(r.LatencyAppendToConsumeP95) / 1000
+		fmt.Printf("%-20s %-15s %-10s %12.0f %8.1f|%-7.1f %8.1f|%-7.1f %10.1f %10.6f\n",
 			r.Scenario, r.Algorithm, r.Mode, r.Throughput,
-			float64(r.LatencyP50)/1000, float64(r.LatencyP95)/1000,
+			float64(r.LatencyP50)/1000, p50inbr,
+			float64(r.LatencyP95)/1000, p95inbr,
 			float64(r.LatencyP99)/1000, r.LoadStdDev,
 		)
 	}

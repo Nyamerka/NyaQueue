@@ -1,16 +1,19 @@
 package transport
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"strconv"
 	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/samber/oops"
+	"golang.org/x/net/http2"
 	"golang.org/x/net/netutil"
 )
 
@@ -43,6 +46,9 @@ func NewHTTPServer(b *broker.Broker) *HTTPServer {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
+	mux.Handle("GET /debug/pprof/", http.DefaultServeMux)
+	mux.Handle("GET /debug/pprof/{cmd}", http.DefaultServeMux)
 
 	readTimeout := time.Duration(cfg.ReadTimeoutMs) * time.Millisecond
 	writeTimeout := time.Duration(cfg.WriteTimeoutMs) * time.Millisecond
@@ -71,8 +77,10 @@ func NewHTTPServer(b *broker.Broker) *HTTPServer {
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
-		MaxHeaderBytes:    cfg.RecvBufferBytes,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
+	http2.ConfigureServer(s.server, &http2.Server{})
 	return s
 }
 
@@ -98,7 +106,9 @@ func (s *HTTPServer) Start(addr string) error {
 
 func (s *HTTPServer) Stop() {
 	if s.server != nil {
-		s.server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = s.server.Shutdown(ctx)
 	}
 }
 
@@ -162,8 +172,21 @@ type HTTPErrorResponse struct {
 	Error string `json:"error"`
 }
 
+func (s *HTTPServer) handleReadyz(w http.ResponseWriter, _ *http.Request) {
+	topics := s.broker.ListTopics()
+	if len(topics) == 0 {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("no topics loaded"))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ready"))
+}
+
 func (s *HTTPServer) handleProduce(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
+	cfg := s.broker.Config()
+	r.Body = http.MaxBytesReader(w, r.Body, int64(cfg.MaxMessageBytes))
 
 	var req HTTPProduceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -221,13 +244,20 @@ func (s *HTTPServer) handleConsume(w http.ResponseWriter, r *http.Request) {
 	fetchMaxWait := time.Duration(cfg.FetchMaxWaitMs) * time.Millisecond
 	deadline := time.Now().Add(fetchMaxWait)
 
+	// Load offset once; advance locally in the loop.
+	currentOffset, err := s.broker.LoadOffset(group, topic, partition)
+	if err != nil {
+		currentOffset = 1
+	}
+
 	var (
 		envelopes  []HTTPMessageEnvelope
 		totalBytes int
+		lastOffset int64 = -1
 	)
 
 	for totalBytes < maxBytes {
-		msg, nextOffset, err := s.broker.Consume(topic, group, partition)
+		msg, nextOffset, err := s.broker.ConsumeFrom(topic, group, partition, currentOffset)
 		if err != nil {
 			if errors.Is(err, broker.ErrNoMessages) {
 				if totalBytes < fetchMinBytes && time.Now().Before(deadline) {
@@ -251,10 +281,14 @@ func (s *HTTPServer) handleConsume(w http.ResponseWriter, r *http.Request) {
 			Timestamp: msg.Header.Timestamp,
 		})
 		totalBytes += len(msg.Key) + len(msg.Value)
+		lastOffset = int64(nextOffset)
+		currentOffset = nextOffset
+	}
 
-		if err := s.broker.Commit(group, topic, partition, int64(nextOffset)); err != nil {
+	if lastOffset >= 0 {
+		if err := s.broker.Commit(group, topic, partition, lastOffset); err != nil {
 			log.Printf("auto-commit failed (topic=%s group=%s partition=%d offset=%d): %v",
-				topic, group, partition, nextOffset, err)
+				topic, group, partition, lastOffset, err)
 		}
 	}
 
@@ -350,13 +384,13 @@ func (s *HTTPServer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func writeHTTPError(w http.ResponseWriter, code int, err error) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(HTTPErrorResponse{Error: err.Error()})
+	_ = json.NewEncoder(w).Encode(HTTPErrorResponse{Error: err.Error()})
 }

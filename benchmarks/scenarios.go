@@ -3,6 +3,7 @@ package benchmarks
 import (
 	"crypto/rand"
 	"math/big"
+	mrand "math/rand"
 	"time"
 )
 
@@ -10,7 +11,7 @@ import (
 type Scenario struct {
 	Name          string
 	Duration      time.Duration
-	NumPartitions int           // explicit partition count; 0 = use Producers
+	NumPartitions int // explicit partition count; 0 = use Producers
 	Producers     int
 	Consumers     int
 	MsgSize       int           // bytes per message
@@ -19,6 +20,7 @@ type Scenario struct {
 	BurstFactor   int           // burst multiplier
 	SkewRatio     float64       // fraction of messages using a fixed hot key (0 = uniform)
 	Priorities    [10]float64   // probability distribution over priority levels
+	Seed          int64         // RNG seed for deterministic replay; default 42
 }
 
 // Uniform generates steady, evenly distributed load at a rate both NyaQueue
@@ -32,6 +34,7 @@ func Uniform() Scenario {
 		MsgSize:    256,
 		RatePerSec: 1200,
 		Priorities: uniformPriorities(),
+		Seed:       42,
 	}
 }
 
@@ -46,6 +49,7 @@ func Skewed() Scenario {
 		RatePerSec: 1200,
 		SkewRatio:  0.8,
 		Priorities: uniformPriorities(),
+		Seed:       42,
 	}
 }
 
@@ -61,6 +65,7 @@ func Bursty() Scenario {
 		BurstEvery:  10 * time.Second,
 		BurstFactor: 5,
 		Priorities:  uniformPriorities(),
+		Seed:        42,
 	}
 }
 
@@ -74,6 +79,7 @@ func GrowingLoad() Scenario {
 		MsgSize:    256,
 		RatePerSec: 600,
 		Priorities: uniformPriorities(),
+		Seed:       42,
 	}
 }
 
@@ -87,6 +93,7 @@ func MixedPriority() Scenario {
 		MsgSize:    256,
 		RatePerSec: 1200,
 		Priorities: [10]float64{0.30, 0.25, 0.15, 0.10, 0.08, 0.05, 0.03, 0.02, 0.01, 0.01},
+		Seed:       42,
 	}
 }
 
@@ -100,6 +107,7 @@ func Overload() Scenario {
 		MsgSize:    256,
 		RatePerSec: 0, // unlimited
 		Priorities: [10]float64{0.30, 0.25, 0.15, 0.10, 0.08, 0.05, 0.03, 0.02, 0.01, 0.01},
+		Seed:       42,
 	}
 }
 
@@ -114,9 +122,10 @@ func SkewedK16() Scenario {
 		Producers:     16,
 		Consumers:     16,
 		MsgSize:       256,
-		RatePerSec:    4800, // 16×300 msg/s — same per-producer rate as Skewed
+		RatePerSec:    4800,
 		SkewRatio:     0.8,
 		Priorities:    uniformPriorities(),
+		Seed:          42,
 	}
 }
 
@@ -131,8 +140,9 @@ func OverloadK16() Scenario {
 		Producers:     16,
 		Consumers:     16,
 		MsgSize:       256,
-		RatePerSec:    0, // unlimited
+		RatePerSec:    0,
 		Priorities:    [10]float64{0.30, 0.25, 0.15, 0.10, 0.08, 0.05, 0.03, 0.02, 0.01, 0.01},
+		Seed:          42,
 	}
 }
 
@@ -172,6 +182,19 @@ func GenerateMessage(size int) []byte {
 func (s *Scenario) SamplePriority() uint8 {
 	n, _ := rand.Int(rand.Reader, big.NewInt(1_000_000))
 	r := float64(n.Int64()) / 1_000_000.0
+	cumulative := 0.0
+	for i, p := range s.Priorities {
+		cumulative += p
+		if r <= cumulative {
+			return uint8(i)
+		}
+	}
+	return 0
+}
+
+// SamplePrioritySeeded uses the provided RNG (seeded per-producer) for deterministic priority sampling.
+func (s *Scenario) SamplePrioritySeeded(rng *mrand.Rand) uint8 {
+	r := rng.Float64()
 	cumulative := 0.0
 	for i, p := range s.Priorities {
 		cumulative += p

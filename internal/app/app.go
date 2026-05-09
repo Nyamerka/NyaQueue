@@ -110,12 +110,10 @@ func New(cfg broker.Config, dataDir string, opts ...Option) (*BrokerApp, error) 
 
 		bpCfg := a.backpressureCfg
 		threshold := 0.85
-		horizon := 3
 		if bpCfg != nil {
 			threshold = bpCfg.threshold
-			horizon = bpCfg.horizon
 		}
-		bp := broker.NewBackpressureController(lp, threshold, horizon)
+		bp := broker.NewBackpressureController(threshold)
 		a.broker.SetBackpressure(bp)
 	}
 
