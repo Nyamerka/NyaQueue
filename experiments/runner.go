@@ -20,6 +20,8 @@ import (
 	"github.com/alitto/pond/v2"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/samber/oops"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -243,7 +245,7 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		brk.SetScheduler(topic, alg.NewScheduler())
 	}
 
-	log.Printf("  running %s / %s / %s for %v ...", sc.Name, alg.Name, mode, dur)
+	log.Printf("  running %s / %s / %s for %v (seed=%d) ...", sc.Name, alg.Name, mode, dur, sc.Seed)
 	result := runScenario(ctx, h, sc, alg.Name, "nyaqueue", mode, topicCfg.NumPartitions, dur, topic)
 
 	if mode != ModeInProcess {
@@ -361,7 +363,10 @@ func runScenario(
 	return collector.Snapshot(sc.Name, algName, system, mode.String())
 }
 
-const produceBatchSize = 16
+const (
+	produceBatchSize  = 64
+	defaultBatchBytes = 16 * 1024 // 16KB, matching Kafka's batch.size default
+)
 
 func runProducer(ctx context.Context, h *Harness, sc benchmarks.Scenario, msgSize int, c *MetricsCollector, topic string) {
 	if sc.RatePerSec > 0 {
@@ -387,7 +392,13 @@ func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scena
 	rng := rand.New(rand.NewPCG(uint64(seed), uint64(seed)^0xCAFE))
 	legacyRng := mrand.New(mrand.NewSource(int64(rng.Uint64())))
 
+	targetBytes := sc.BatchBytes
+	if targetBytes <= 0 {
+		targetBytes = defaultBatchBytes
+	}
+
 	batch := make([]BatchItem, 0, produceBatchSize)
+	accumulatedBytes := 0
 	linger := time.NewTimer(produceLingerInterval)
 	linger.Stop()
 
@@ -400,11 +411,19 @@ func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scena
 			c.RecordProduce()
 		}
 		if err != nil && n < len(batch) {
-			for range batch[n:] {
-				c.RecordPublishError()
+			failed := len(batch) - n
+			if isThrottleError(err) {
+				for range failed {
+					c.RecordPublishThrottled()
+				}
+			} else {
+				for range failed {
+					c.RecordPublishError()
+				}
 			}
 		}
 		batch = batch[:0]
+		accumulatedBytes = 0
 		linger.Stop()
 	}
 
@@ -415,13 +434,15 @@ func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scena
 			return
 		}
 
-		batch = append(batch, BatchItem{
+		item := BatchItem{
 			Key:      generateKeySeeded(keyBuf, sc.SkewRatio, rng),
 			Value:    encodeValue(msgSize),
 			Priority: sc.SamplePrioritySeeded(legacyRng),
-		})
+		}
+		batch = append(batch, item)
+		accumulatedBytes += len(item.Key) + len(item.Value)
 
-		if len(batch) >= produceBatchSize {
+		if accumulatedBytes >= targetBytes {
 			flush()
 		} else if len(batch) == 1 {
 			linger.Reset(produceLingerInterval)
@@ -438,9 +459,9 @@ func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scena
 	}
 }
 
-// runUnlimitedProducer batches messages for maximum throughput. Each goroutine
-// accumulates produceBatchSize messages and flushes them in a single call,
-// reducing WAL and RPC overhead per message.
+// runUnlimitedProducer batches messages by bytes for maximum throughput.
+// Flushes when accumulated bytes reach the target (default 16KB, matching
+// Kafka's batch.size). This gives realistic WAL and compression ratios.
 func runUnlimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenario, msgSize int, c *MetricsCollector, topic string) {
 	seed := sc.Seed
 	if seed == 0 {
@@ -449,7 +470,13 @@ func runUnlimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenari
 	rng := rand.New(rand.NewPCG(uint64(seed), uint64(seed)^0xBEEF))
 	legacyRng := mrand.New(mrand.NewSource(int64(rng.Uint64())))
 
+	targetBytes := sc.BatchBytes
+	if targetBytes <= 0 {
+		targetBytes = defaultBatchBytes
+	}
+
 	batch := make([]BatchItem, 0, produceBatchSize)
+	accumulatedBytes := 0
 
 	flush := func() {
 		if len(batch) == 0 {
@@ -460,11 +487,19 @@ func runUnlimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenari
 			c.RecordProduce()
 		}
 		if err != nil && n < len(batch) {
-			for range batch[n:] {
-				c.RecordPublishError()
+			failed := len(batch) - n
+			if isThrottleError(err) {
+				for range failed {
+					c.RecordPublishThrottled()
+				}
+			} else {
+				for range failed {
+					c.RecordPublishError()
+				}
 			}
 		}
 		batch = batch[:0]
+		accumulatedBytes = 0
 	}
 
 	keyBuf := make([]byte, 8)
@@ -474,13 +509,15 @@ func runUnlimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenari
 			return
 		}
 
-		batch = append(batch, BatchItem{
+		item := BatchItem{
 			Key:      generateKeySeeded(keyBuf, sc.SkewRatio, rng),
 			Value:    encodeValue(msgSize),
 			Priority: sc.SamplePrioritySeeded(legacyRng),
-		})
+		}
+		batch = append(batch, item)
+		accumulatedBytes += len(item.Key) + len(item.Value)
 
-		if len(batch) >= produceBatchSize {
+		if accumulatedBytes >= targetBytes {
 			flush()
 		}
 	}
@@ -605,6 +642,16 @@ func newExpBackoff() *backoff.ExponentialBackOff {
 	bo.InitialInterval = 200 * time.Millisecond
 	bo.MaxElapsedTime = 10 * time.Second
 	return bo
+}
+
+func isThrottleError(err error) bool {
+	if errors.Is(err, broker.ErrThrottled) {
+		return true
+	}
+	if st, ok := status.FromError(err); ok && st.Code() == codes.ResourceExhausted {
+		return true
+	}
+	return false
 }
 
 func isRetryableError(err error) bool {

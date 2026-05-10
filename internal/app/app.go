@@ -1,8 +1,10 @@
 package app
 
 import (
+	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samber/oops"
 
 	"github.com/Nyamerka/NyaQueue/pkg/balancer"
@@ -24,9 +26,9 @@ type backpressureConfig struct {
 }
 
 type optimizerConfig struct {
-	params   []optimizer.TunableParam
-	interval time.Duration
-	pilot    []optimizer.PilotData
+	params []optimizer.TunableParam
+	optCfg optimizer.OptimizerConfig
+	pilot  []optimizer.PilotData
 }
 
 // BrokerApp wires together the broker, offset store, transport, and pluggable
@@ -46,12 +48,17 @@ type BrokerApp struct {
 	backpressureCfg  *backpressureConfig
 	optimizerCfg     *optimizerConfig
 
+	adminAddr string
+
 	broker        *broker.Broker
 	offsetStore   *broker.OffsetStore
 	server        *transport.Server
 	httpServer    *transport.HTTPServer
+	adminServer   *transport.AdminServer
 	loadPredictor *broker.LoadPredictor
 	opt           *optimizer.Optimizer
+	ready         atomic.Bool
+	promRegistry  *prometheus.Registry
 }
 
 // New creates a BrokerApp. Call Start() to begin serving.
@@ -121,7 +128,7 @@ func New(cfg broker.Config, dataDir string, opts ...Option) (*BrokerApp, error) 
 		a.opt = optimizer.NewOptimizer(
 			a.broker,
 			a.optimizerCfg.params,
-			a.optimizerCfg.interval,
+			a.optimizerCfg.optCfg,
 			a.optimizerCfg.pilot...,
 		)
 	}
@@ -132,6 +139,9 @@ func New(cfg broker.Config, dataDir string, opts ...Option) (*BrokerApp, error) 
 // Start begins the broker loops and optionally starts the gRPC server.
 func (a *BrokerApp) Start() error {
 	a.broker.Start()
+	a.promRegistry = prometheus.NewRegistry()
+	a.promRegistry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	a.broker.MetricsCollector().RegisterPrometheus(a.promRegistry)
 
 	if a.loadPredictor != nil {
 		a.loadPredictor.Start()
@@ -155,11 +165,23 @@ func (a *BrokerApp) Start() error {
 		}
 	}
 
+	if a.adminAddr != "" {
+		a.adminServer = transport.NewAdminServer(&a.ready, a.promRegistry)
+		if err := a.adminServer.Start(a.adminAddr); err != nil {
+			return oops.Wrapf(err, "admin start")
+		}
+	}
+
+	a.ready.Store(true)
 	return nil
 }
 
 // Stop gracefully shuts down all components.
 func (a *BrokerApp) Stop() {
+	a.ready.Store(false)
+	if a.adminServer != nil {
+		a.adminServer.Stop()
+	}
 	if a.httpServer != nil {
 		a.httpServer.Stop()
 	}

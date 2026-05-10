@@ -1,10 +1,9 @@
 package nn
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 type Transition struct {
@@ -16,40 +15,38 @@ type Transition struct {
 }
 
 // ReplayBuffer stores experience transitions for DQN/DDPG training.
-// Uses an atomic monotonic counter for lock-free Len() and slot assignment.
-// A mutex protects concurrent buf reads/writes (Push vs Sample) and the
-// per-instance RNG. Deep copies are made on Push to prevent slice aliasing.
 type ReplayBuffer struct {
-	mu       sync.Mutex
-	buf      []Transition
+	slots    []atomic.Pointer[Transition]
 	capacity int64
 	writeIdx atomic.Int64
-	rng      *rand.Rand
+
+	rngMu sync.Mutex
+	rng   *rand.Rand
 }
 
 func NewReplayBuffer(capacity int) *ReplayBuffer {
-	return &ReplayBuffer{
-		buf:      make([]Transition, capacity),
+	rb := &ReplayBuffer{
+		slots:    make([]atomic.Pointer[Transition], capacity),
 		capacity: int64(capacity),
-		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
+		rng:      rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 	}
+	return rb
 }
 
 func NewReplayBufferWithSeed(capacity int, seed int64) *ReplayBuffer {
-	return &ReplayBuffer{
-		buf:      make([]Transition, capacity),
+	rb := &ReplayBuffer{
+		slots:    make([]atomic.Pointer[Transition], capacity),
 		capacity: int64(capacity),
-		rng:      rand.New(rand.NewSource(seed)),
+		rng:      rand.New(rand.NewPCG(uint64(seed), uint64(seed)^0xDEAD)),
 	}
+	return rb
 }
 
-// Push stores a transition with deep-copied slices to prevent aliasing.
-// The deep copy is done before acquiring the lock to minimize hold time.
 func (rb *ReplayBuffer) Push(t Transition) {
 	idx := rb.writeIdx.Add(1) - 1
 	slot := idx % rb.capacity
 
-	cp := Transition{
+	cp := &Transition{
 		State:     append([]float64(nil), t.State...),
 		Action:    append([]float64(nil), t.Action...),
 		Reward:    t.Reward,
@@ -57,9 +54,7 @@ func (rb *ReplayBuffer) Push(t Transition) {
 		Done:      t.Done,
 	}
 
-	rb.mu.Lock()
-	rb.buf[slot] = cp
-	rb.mu.Unlock()
+	rb.slots[slot].Store(cp)
 }
 
 // Sample returns up to batchSize random transitions.
@@ -77,8 +72,6 @@ func (rb *ReplayBuffer) Sample(batchSize int) []Transition {
 	return batch[:batchSize]
 }
 
-// SampleInto fills dst with random transitions from the buffer without
-// allocating a new slice. Returns the number of transitions written.
 func (rb *ReplayBuffer) SampleInto(dst []Transition) int {
 	n := rb.Len()
 	if n == 0 {
@@ -89,16 +82,18 @@ func (rb *ReplayBuffer) SampleInto(dst []Transition) int {
 		count = n
 	}
 
-	rb.mu.Lock()
+	rb.rngMu.Lock()
 	for i := 0; i < count; i++ {
-		idx := rb.rng.Intn(n)
-		dst[i] = rb.buf[idx]
+		idx := rb.rng.IntN(n)
+		ptr := rb.slots[idx].Load()
+		if ptr != nil {
+			dst[i] = *ptr
+		}
 	}
-	rb.mu.Unlock()
+	rb.rngMu.Unlock()
 	return count
 }
 
-// Len returns the number of stored transitions (lock-free via atomic).
 func (rb *ReplayBuffer) Len() int {
 	w := rb.writeIdx.Load()
 	if w >= rb.capacity {

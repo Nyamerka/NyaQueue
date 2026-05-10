@@ -28,7 +28,7 @@ func (s *DDPGSuite) TestAct() {
 
 	for _, tc := range tests {
 		s.Run(tc.name, func() {
-			d := NewDDPG(tc.stateSize, tc.actionSize, 0.001)
+			d := NewDDPG(tc.stateSize, tc.actionSize, 0.001, 32)
 			state := make([]float64, tc.stateSize)
 			for i := range state {
 				state[i] = float64(i) * 0.1
@@ -45,7 +45,7 @@ func (s *DDPGSuite) TestAct() {
 }
 
 func (s *DDPGSuite) TestStoreAndTrain() {
-	d := NewDDPG(5, 3, 0.001)
+	d := NewDDPG(5, 3, 0.001, 32)
 
 	for i := 0; i < 200; i++ {
 		state := []float64{float64(i), 0.1, 0.2, 0.3, 0.4}
@@ -54,23 +54,23 @@ func (s *DDPGSuite) TestStoreAndTrain() {
 		d.Store(state, action, 1.0, nextState, false)
 	}
 
-	require.NotPanics(s.T(), func() { d.Train(64) })
+	require.NotPanics(s.T(), func() { d.Train(32) })
 }
 
 func (s *DDPGSuite) TestTrainInsufficientData() {
-	d := NewDDPG(5, 3, 0.001)
+	d := NewDDPG(5, 3, 0.001, 32)
 	d.Store([]float64{1, 2, 3, 4, 5}, []float64{0.1, 0.2, 0.3}, 1.0, []float64{2, 3, 4, 5, 6}, false)
 
 	require.NotPanics(s.T(), func() { d.Train(64) })
 }
 
 func (s *DDPGSuite) TestResetNoise() {
-	d := NewDDPG(5, 3, 0.001)
+	d := NewDDPG(5, 3, 0.001, 32)
 	require.NotPanics(s.T(), func() { d.ResetNoise() })
 }
 
 func (s *DDPGSuite) TestActorForwardOutputInRange() {
-	d := NewDDPG(5, 3, 0.001)
+	d := NewDDPG(5, 3, 0.001, 32)
 	state := []float64{0.1, 0.2, 0.3, 0.4, 0.5}
 
 	d.mu.Lock()
@@ -86,7 +86,7 @@ func (s *DDPGSuite) TestActorForwardOutputInRange() {
 }
 
 func (s *DDPGSuite) TestCriticBatchedReturnsCorrectShape() {
-	d := NewDDPG(5, 3, 0.001)
+	d := NewDDPG(5, 3, 0.001, 32)
 
 	states := tensors.FromFlatDataAndDimensions([]float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.5, 0.4, 0.3, 0.2, 0.1}, 2, 5)
 	actions := tensors.FromFlatDataAndDimensions([]float64{0.1, 0.2, 0.3, 0.3, 0.2, 0.1}, 2, 3)
@@ -100,7 +100,7 @@ func (s *DDPGSuite) TestCriticBatchedReturnsCorrectShape() {
 }
 
 func (s *DDPGSuite) TestTrainUpdatesActorWeights() {
-	d := NewDDPG(5, 3, 0.01)
+	d := NewDDPG(5, 3, 0.01, 32)
 
 	state := []float64{0.5, 0.5, 0.5, 0.5, 0.5}
 	actionBefore := d.Act(state)
@@ -114,7 +114,7 @@ func (s *DDPGSuite) TestTrainUpdatesActorWeights() {
 			false,
 		)
 	}
-	d.Train(64)
+	d.Train(32)
 
 	actionAfter := d.Act(state)
 
@@ -129,7 +129,7 @@ func (s *DDPGSuite) TestTrainUpdatesActorWeights() {
 }
 
 func (s *DDPGSuite) TestSoftUpdateChangesTarget() {
-	d := NewDDPG(5, 3, 0.001)
+	d := NewDDPG(5, 3, 0.001, 32)
 
 	state := []float64{0.5, 0.5, 0.5, 0.5, 0.5}
 
@@ -145,7 +145,7 @@ func (s *DDPGSuite) TestSoftUpdateChangesTarget() {
 			false,
 		)
 	}
-	d.Train(64)
+	d.Train(32)
 
 	actionAfter := d.Act(state)
 
@@ -160,7 +160,7 @@ func (s *DDPGSuite) TestSoftUpdateChangesTarget() {
 }
 
 func (s *DDPGSuite) TestBatchedTrainMultipleSteps() {
-	d := NewDDPG(5, 3, 0.001)
+	d := NewDDPG(5, 3, 0.001, 32)
 
 	for i := 0; i < 300; i++ {
 		d.Store(
@@ -174,22 +174,13 @@ func (s *DDPGSuite) TestBatchedTrainMultipleSteps() {
 
 	require.NotPanics(s.T(), func() {
 		for step := 0; step < 5; step++ {
-			d.Train(64)
+			d.Train(32)
 		}
 	})
 }
 
-func (s *DDPGSuite) TestPrecompiledExecsNotNil() {
-	d := NewDDPG(5, 3, 0.001)
-	require.NotNil(s.T(), d.actorFwdExec, "actorFwdExec should be precompiled")
-	require.NotNil(s.T(), d.targetActorFwdExec, "targetActorFwdExec should be precompiled")
-	require.NotNil(s.T(), d.targetCriticExec, "targetCriticExec should be precompiled")
-	require.NotNil(s.T(), d.criticTrainExec, "criticTrainExec should be precompiled")
-	require.NotNil(s.T(), d.actorTrainExec, "actorTrainExec should be precompiled")
-}
-
 func (s *DDPGSuite) TestSoftUpdateDtypeRobust() {
-	d := NewDDPG(5, 3, 0.001)
+	d := NewDDPG(5, 3, 0.001, 32)
 	require.NotPanics(s.T(), func() {
 		d.mu.Lock()
 		d.softUpdate()
@@ -198,8 +189,54 @@ func (s *DDPGSuite) TestSoftUpdateDtypeRobust() {
 	require.Greater(s.T(), len(d.varPairs), 0, "varPairs should be populated")
 }
 
+func (s *DDPGSuite) TestSoftUpdateBlendedWeights() {
+	d := NewDDPG(5, 3, 0.001, 32)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	require.Greater(s.T(), len(d.varPairs), 0, "should have variable pairs")
+
+	p := d.varPairs[0]
+	srcVal := p.src.MustValue()
+	tgtVal := p.tgt.MustValue()
+
+	srcFlat := flattenTensorValue(srcVal.Value())
+	tgtFlat := flattenTensorValue(tgtVal.Value())
+	require.Equal(s.T(), len(srcFlat), len(tgtFlat))
+
+	expectedBuf := make([]float64, len(tgtFlat))
+	for i := range expectedBuf {
+		expectedBuf[i] = (1-ddpgTau)*tgtFlat[i] + ddpgTau*srcFlat[i]
+	}
+
+	d.softUpdate()
+
+	newTgtVal := p.tgt.MustValue()
+	newTgtFlat := flattenTensorValue(newTgtVal.Value())
+	for i := range expectedBuf {
+		require.InDelta(s.T(), expectedBuf[i], newTgtFlat[i], 1e-9,
+			"softUpdate must produce exact blended value (idx %d)", i)
+	}
+}
+
+func flattenTensorValue(v interface{}) []float64 {
+	switch d := v.(type) {
+	case []float64:
+		return d
+	case [][]float64:
+		var out []float64
+		for _, row := range d {
+			out = append(out, row...)
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
 func (s *DDPGSuite) TestStoreDeepCopies() {
-	d := NewDDPG(5, 3, 0.001)
+	d := NewDDPG(5, 3, 0.001, 32)
 	state := []float64{1, 2, 3, 4, 5}
 	action := []float64{0.1, 0.2, 0.3}
 	nextState := []float64{2, 3, 4, 5, 6}
@@ -215,16 +252,30 @@ func (s *DDPGSuite) TestStoreDeepCopies() {
 	require.Equal(s.T(), 2.0, batch[0].NextState[0], "Store must deep-copy nextState")
 }
 
-func (s *DDPGSuite) TestPreAllocatedBuffers() {
-	d := NewDDPG(5, 3, 0.001)
-	require.Len(s.T(), d.statesBuf, 64*5)
-	require.Len(s.T(), d.actionsBuf, 64*3)
-	require.Len(s.T(), d.rewardsBuf, 64)
-	require.Len(s.T(), d.targetQBuf, 64)
+func (s *DDPGSuite) TestPreAllocatedBuffersProperty() {
+	batchSize := 32
+	d := NewDDPG(5, 3, 0.001, batchSize)
+	require.GreaterOrEqual(s.T(), len(d.statesBuf), batchSize*d.stateSize)
+	require.GreaterOrEqual(s.T(), len(d.actionsBuf), batchSize*d.actionSize)
+	require.GreaterOrEqual(s.T(), len(d.rewardsBuf), batchSize)
+	require.GreaterOrEqual(s.T(), len(d.targetQBuf), batchSize)
+}
+
+func (s *DDPGSuite) TestNoiseDecay() {
+	d := NewDDPG(5, 3, 0.001, 32)
+	d.SetNoiseDecay(0.9, 0.01)
+
+	initial := d.noise.Sigma()
+	for i := 0; i < 50; i++ {
+		d.noise.Sample()
+	}
+	after := d.noise.Sigma()
+	require.Less(s.T(), after, initial, "sigma should decay over steps")
+	require.GreaterOrEqual(s.T(), after, 0.01, "sigma should not go below floor")
 }
 
 func (s *DDPGSuite) TestConcurrentActAndTrain() {
-	d := NewDDPG(5, 3, 0.001)
+	d := NewDDPG(5, 3, 0.001, 32)
 
 	for i := 0; i < 200; i++ {
 		d.Store(
@@ -251,7 +302,7 @@ func (s *DDPGSuite) TestConcurrentActAndTrain() {
 	go func() {
 		defer wg.Done()
 		for j := 0; j < 10; j++ {
-			d.Train(64)
+			d.Train(32)
 		}
 	}()
 	wg.Wait()

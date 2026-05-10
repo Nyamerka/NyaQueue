@@ -121,7 +121,7 @@ func (s *Server) produceSingle(req *pb.ProduceRequest) (*pb.ProduceResponse, err
 
 	partition, offset, err := s.broker.Publish(req.Topic, msg)
 	if err != nil {
-		return nil, err
+		return nil, mapBrokerError(err)
 	}
 
 	return &pb.ProduceResponse{
@@ -159,7 +159,7 @@ func (s *Server) produceBatch(req *pb.ProduceRequest) (*pb.ProduceResponse, erro
 	}
 
 	if firstErr != nil && allFailed(batchResults) {
-		return nil, firstErr
+		return nil, mapBrokerError(firstErr)
 	}
 
 	return &pb.ProduceResponse{Results: results}, nil

@@ -21,6 +21,7 @@ type Scenario struct {
 	SkewRatio     float64       // fraction of messages using a fixed hot key (0 = uniform)
 	Priorities    [10]float64   // probability distribution over priority levels
 	Seed          int64         // RNG seed for deterministic replay; default 42
+	BatchBytes    int           // target batch size in bytes (0 = default 16KB)
 }
 
 // Uniform generates steady, evenly distributed load at a rate both NyaQueue

@@ -31,7 +31,7 @@ func ExportCSV(results []ExperimentResult, dir string) error {
 		"enqueue_to_flush_p50_us", "flush_to_append_p50_us",
 		"append_to_consume_p50_us", "append_to_consume_p95_us",
 		"load_stddev", "produced", "consumed",
-		"publish_errors", "consume_errors", "duration_sec",
+		"publish_errors", "messages_throttled", "consume_errors", "duration_sec",
 		"high_prio_p50_us", "high_prio_p99_us",
 		"low_prio_p50_us", "low_prio_p99_us",
 	}
@@ -60,6 +60,7 @@ func ExportCSV(results []ExperimentResult, dir string) error {
 			fmt.Sprintf("%d", r.Produced),
 			fmt.Sprintf("%d", r.Consumed),
 			fmt.Sprintf("%d", r.PublishErrors),
+			fmt.Sprintf("%d", r.MessagesThrottled),
 			fmt.Sprintf("%d", r.ConsumeErrors),
 			fmt.Sprintf("%.3f", r.Duration.Seconds()),
 			fmt.Sprintf("%.2f", highP50),

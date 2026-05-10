@@ -14,5 +14,4 @@ const (
 	DefaultDQNSchedBatchSize     = 32
 	DefaultDQNSchedMinReplay     = 64
 	DefaultDQNSchedThreshold     = 5
-	DefaultDQNSchedWeightInit    = 0.1
 )

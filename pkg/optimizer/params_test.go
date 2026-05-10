@@ -175,7 +175,7 @@ func (s *ParamsSuite) TestNewOptimizerWithPilotData() {
 		Alpha:       0.5,
 	}
 
-	opt := NewOptimizer(nil, params, 0, pilot)
+	opt := NewOptimizer(nil, params, DefaultOptimizerConfig(), pilot)
 	require.NotNil(s.T(), opt)
 	require.Greater(s.T(), len(opt.params), 0)
 }
@@ -209,7 +209,7 @@ func (s *ParamsSuite) TestOptimizerAppliesConfig() {
 		{"BatchSize", 1, 1000, 1.0},
 	}
 
-	opt := NewOptimizer(b, params, 100*time.Millisecond)
+	opt := NewOptimizer(b, params, OptimizerConfig{Interval: 100 * time.Millisecond, BatchSize: 32, WarmupTicks: 2, Hysteresis: 0.001})
 	opt.Start()
 	defer opt.Stop()
 

@@ -84,12 +84,13 @@ type MetricsCollector struct {
 	flushToAppend   *hdrhistogram.Histogram
 	appendToConsume *hdrhistogram.Histogram
 
-	produced      atomic.Int64
-	consumed      atomic.Int64
-	publishErrors atomic.Int64
-	consumeErrors atomic.Int64
-	startTime     time.Time
-	endTime       time.Time
+	produced         atomic.Int64
+	consumed         atomic.Int64
+	publishErrors    atomic.Int64
+	publishThrottled atomic.Int64
+	consumeErrors    atomic.Int64
+	startTime        time.Time
+	endTime          time.Time
 }
 
 func NewMetricsCollector() *MetricsCollector {
@@ -181,6 +182,10 @@ func (c *MetricsCollector) RecordPublishError() {
 	c.publishErrors.Add(1)
 }
 
+func (c *MetricsCollector) RecordPublishThrottled() {
+	c.publishThrottled.Add(1)
+}
+
 func (c *MetricsCollector) RecordConsumeError() {
 	c.consumeErrors.Add(1)
 }
@@ -206,20 +211,21 @@ func (c *MetricsCollector) RecordLoadStdDev(sd float64) {
 
 // ExperimentResult holds the aggregated metrics for a single experiment run.
 type ExperimentResult struct {
-	Scenario      string        `json:"scenario"`
-	Algorithm     string        `json:"algorithm"`
-	System        string        `json:"system"`
-	Mode          string        `json:"mode"`
-	Throughput    float64       `json:"throughput_msg_per_sec"`
-	LatencyP50    time.Duration `json:"latency_p50_ns"`
-	LatencyP95    time.Duration `json:"latency_p95_ns"`
-	LatencyP99    time.Duration `json:"latency_p99_ns"`
-	LoadStdDev    float64       `json:"load_stddev"`
-	Produced      int64         `json:"produced"`
-	Consumed      int64         `json:"consumed"`
-	PublishErrors int64         `json:"publish_errors"`
-	ConsumeErrors int64         `json:"consume_errors"`
-	Duration      time.Duration `json:"duration_ns"`
+	Scenario          string        `json:"scenario"`
+	Algorithm         string        `json:"algorithm"`
+	System            string        `json:"system"`
+	Mode              string        `json:"mode"`
+	Throughput        float64       `json:"throughput_msg_per_sec"`
+	LatencyP50        time.Duration `json:"latency_p50_ns"`
+	LatencyP95        time.Duration `json:"latency_p95_ns"`
+	LatencyP99        time.Duration `json:"latency_p99_ns"`
+	LoadStdDev        float64       `json:"load_stddev"`
+	Produced          int64         `json:"produced"`
+	Consumed          int64         `json:"consumed"`
+	PublishErrors     int64         `json:"publish_errors"`
+	MessagesThrottled int64         `json:"messages_throttled"`
+	ConsumeErrors     int64         `json:"consume_errors"`
+	Duration          time.Duration `json:"duration_ns"`
 
 	LatencyEnqueueToFlushP50  time.Duration `json:"latency_enqueue_to_flush_p50_ns"`
 	LatencyFlushToAppendP50   time.Duration `json:"latency_flush_to_append_p50_ns"`
@@ -242,15 +248,16 @@ func (c *MetricsCollector) Snapshot(scenario, algorithm, system, mode string) Ex
 
 	consumed := c.consumed.Load()
 	result := ExperimentResult{
-		Scenario:      scenario,
-		Algorithm:     algorithm,
-		System:        system,
-		Mode:          mode,
-		Produced:      c.produced.Load(),
-		Consumed:      consumed,
-		PublishErrors: c.publishErrors.Load(),
-		ConsumeErrors: c.consumeErrors.Load(),
-		Duration:      duration,
+		Scenario:          scenario,
+		Algorithm:         algorithm,
+		System:            system,
+		Mode:              mode,
+		Produced:          c.produced.Load(),
+		Consumed:          consumed,
+		PublishErrors:     c.publishErrors.Load(),
+		MessagesThrottled: c.publishThrottled.Load(),
+		ConsumeErrors:     c.consumeErrors.Load(),
+		Duration:          duration,
 	}
 
 	if duration.Seconds() > 0 {

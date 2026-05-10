@@ -1,8 +1,10 @@
 package scheduler
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/Nyamerka/NyaQueue/pkg/nn"
@@ -13,23 +15,21 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/layers"
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
+	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/samber/oops"
 
 	_ "github.com/gomlx/gomlx/backends/simplego"
 )
 
-// DQNScheduler uses a Deep Q-Network (GoMLX-backed) to adaptively set the
-// priority threshold.
-//
-// Architecture mirrors DQN Balancer: inference uses RLock on model weights,
-// training runs in a separate goroutine fed via a non-blocking channel.
-// All GoMLX Exec objects are pre-compiled once and reused.
-//
-// State: [level_distribution(10), avg_wait_per_level(10), queue_depth, consumer_lag]
-// Action: threshold (0-9) — priorities >= threshold go by priority order, below by FIFO
-// Reward: weighted_latency_reduction - starvation_penalty
+// DQNScheduler adaptively sets the priority threshold via DQN.
+// State: [level_distribution, avg_wait_per_level, queue_depth, consumer_lag]; Action: threshold.
+type schedPolicySnap struct {
+	state     []float64
+	threshold int
+}
+
 type DQNScheduler struct {
-	weightsMu sync.RWMutex
+	weightsMu *xsync.RBMutex
 
 	hiddenSize int
 	stateSize  int
@@ -53,14 +53,25 @@ type DQNScheduler struct {
 	stopCh chan struct{}
 	done   chan struct{}
 
-	stateMu    sync.Mutex
-	prevState  []float64
-	lastState  []float64
-	lastAction int
-	threshold  int
+	stateMu   sync.Mutex
+	lastState []float64
+	lastPI    atomic.Pointer[broker.PriorityIndex]
+	threshold int
 
-	throttleOnLoad float64
-	fallbackFIFO   bool
+	fallbackFIFO bool
+
+	cachedThreshold atomic.Int32
+
+	// prevSnap / currSnap: policyLoop writes, OnMetrics reads.
+	prevSnap atomic.Pointer[schedPolicySnap]
+	currSnap atomic.Pointer[schedPolicySnap]
+
+	latencyMu     sync.Mutex
+	latencySums   [broker.MaxPriority]float64
+	latencyCounts [broker.MaxPriority]int
+
+	rng   *rand.Rand
+	rngMu sync.Mutex
 }
 
 const (
@@ -78,12 +89,10 @@ func WithDQNSchedReplayBufSize(n int) DQNSchedOption {
 	return func(d *DQNScheduler) { d.replayBuffer = nn.NewReplayBuffer(n) }
 }
 func WithDQNSchedBatchSize(n int) DQNSchedOption { return func(d *DQNScheduler) { d.batchSize = n } }
-func WithDQNSchedThrottleOnLoad(v float64) DQNSchedOption {
-	return func(d *DQNScheduler) { d.throttleOnLoad = v }
-}
 
 func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 	d := &DQNScheduler{
+		weightsMu:    xsync.NewRBMutex(),
 		hiddenSize:   DefaultDQNSchedHiddenSize,
 		stateSize:    DefaultDQNSchedStateSize,
 		numActions:   DefaultDQNSchedActions,
@@ -104,9 +113,12 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 		opt(d)
 	}
 
+	d.rng = rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
+	d.cachedThreshold.Store(int32(d.threshold))
 	d.initGoMLX()
 
 	go d.trainLoop()
+	go d.policyLoop()
 
 	return d
 }
@@ -173,6 +185,8 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 		return nil, consumerOffset, oops.Errorf("partition %d has no PriorityIndex", partition.ID())
 	}
 
+	d.lastPI.Store(pi)
+
 	d.stateMu.Lock()
 	fallback := d.fallbackFIFO
 	d.stateMu.Unlock()
@@ -181,16 +195,19 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 		return d.fifoFallback(partition, consumerOffset)
 	}
 
-	state := d.buildState(pi)
+	d.rngMu.Lock()
+	explore := d.rng.Float64() < d.epsilon
+	var randThreshold int
+	if explore {
+		randThreshold = d.rng.IntN(d.numActions)
+	}
+	d.rngMu.Unlock()
 
 	var threshold int
-	if rand.Float64() < d.epsilon {
-		threshold = rand.Intn(d.numActions)
+	if explore {
+		threshold = randThreshold
 	} else {
-		d.weightsMu.RLock()
-		q := d.forward(state)
-		d.weightsMu.RUnlock()
-		threshold = argmaxSched(q)
+		threshold = int(d.cachedThreshold.Load())
 	}
 
 	entry, ok := pi.PopWithThreshold(threshold)
@@ -203,12 +220,15 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 		return nil, 0, err
 	}
 
-	d.stateMu.Lock()
-	d.prevState = d.lastState
-	d.threshold = threshold
-	d.lastState = state
-	d.lastAction = threshold
-	d.stateMu.Unlock()
+	latency := time.Since(entry.ArrivedAt).Seconds()
+	level := int(msg.Header.Priority)
+	if level >= broker.MaxPriority {
+		level = broker.MaxPriority - 1
+	}
+	d.latencyMu.Lock()
+	d.latencySums[level] += latency
+	d.latencyCounts[level]++
+	d.latencyMu.Unlock()
 
 	return msg, uint64(entry.WalOffset), nil
 }
@@ -216,25 +236,55 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 func (d *DQNScheduler) Enqueue(_ *broker.Message, _ int64) {}
 
 func (d *DQNScheduler) OnMetrics(m broker.Metrics) {
-	d.stateMu.Lock()
-	if d.prevState == nil {
-		d.stateMu.Unlock()
+	prev := d.prevSnap.Load()
+	curr := d.currSnap.Load()
+	if prev == nil || curr == nil {
 		return
 	}
 
+	reward := d.computePerPriorityReward()
+
 	t := nn.Transition{
-		State:     append([]float64(nil), d.prevState...),
-		Action:    []float64{float64(d.lastAction)},
-		Reward:    -m.AvgLatency,
-		NextState: append([]float64(nil), d.lastState...),
+		State:     append([]float64(nil), prev.state...),
+		Action:    []float64{float64(prev.threshold)},
+		Reward:    reward,
+		NextState: append([]float64(nil), curr.state...),
 		Done:      false,
 	}
-	d.stateMu.Unlock()
 
 	select {
 	case d.expCh <- t:
 	default:
 	}
+}
+
+func (d *DQNScheduler) computePerPriorityReward() float64 {
+	d.latencyMu.Lock()
+	var sums [broker.MaxPriority]float64
+	var counts [broker.MaxPriority]int
+	copy(sums[:], d.latencySums[:])
+	copy(counts[:], d.latencyCounts[:])
+	// Reset windows for next interval.
+	d.latencySums = [broker.MaxPriority]float64{}
+	d.latencyCounts = [broker.MaxPriority]int{}
+	d.latencyMu.Unlock()
+
+	var reward float64
+	var totalWeight float64
+	for level := 0; level < broker.MaxPriority; level++ {
+		if counts[level] == 0 {
+			continue
+		}
+		meanLatency := sums[level] / float64(counts[level])
+		// Weight: higher priority (higher index) = higher weight.
+		weight := float64(level + 1)
+		reward -= meanLatency * weight
+		totalWeight += weight
+	}
+	if totalWeight > 0 {
+		reward /= totalWeight
+	}
+	return reward
 }
 
 func (d *DQNScheduler) SetFallbackFIFO(on bool) {
@@ -243,10 +293,50 @@ func (d *DQNScheduler) SetFallbackFIFO(on bool) {
 	d.fallbackFIFO = on
 }
 
-// Stop terminates the background training goroutine.
 func (d *DQNScheduler) Stop() {
 	close(d.stopCh)
 	<-d.done
+}
+
+func (d *DQNScheduler) policyLoop() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			pi := d.lastPI.Load()
+			if pi == nil {
+				continue
+			}
+
+			state := d.buildState(pi)
+
+			d.stateMu.Lock()
+			d.lastState = state
+			d.stateMu.Unlock()
+
+			rt := d.weightsMu.RLock()
+			q := d.forward(state)
+			d.weightsMu.RUnlock(rt)
+
+			threshold := argmaxSched(q)
+			d.cachedThreshold.Store(int32(threshold))
+
+			snap := &schedPolicySnap{
+				state:     state,
+				threshold: threshold,
+			}
+			d.prevSnap.Store(d.currSnap.Load())
+			d.currSnap.Store(snap)
+
+			d.stateMu.Lock()
+			d.threshold = threshold
+			d.stateMu.Unlock()
+		case <-d.stopCh:
+			return
+		}
+	}
 }
 
 func (d *DQNScheduler) trainLoop() {
@@ -295,10 +385,18 @@ func (d *DQNScheduler) buildState(pi *broker.PriorityIndex) []float64 {
 	for i := 0; i < levels && i < d.stateSize; i++ {
 		state[i] = float64(dist[i])
 		totalDepth += dist[i]
+	}
+
+	d.latencyMu.Lock()
+	for i := 0; i < levels; i++ {
 		if waitIdx := levels + i; waitIdx < d.stateSize {
-			state[waitIdx] = 0
+			if d.latencyCounts[i] > 0 {
+				state[waitIdx] = d.latencySums[i] / float64(d.latencyCounts[i])
+			}
 		}
 	}
+	d.latencyMu.Unlock()
+
 	if depthIdx := levels * 2; depthIdx < d.stateSize {
 		state[depthIdx] = float64(totalDepth)
 	}
@@ -341,9 +439,9 @@ func (d *DQNScheduler) trainStep() {
 	statesT := tensors.FromFlatDataAndDimensions(statesBuf, bs, d.stateSize)
 	nextStatesT := tensors.FromFlatDataAndDimensions(nextStatesBuf, bs, d.stateSize)
 
-	d.weightsMu.RLock()
+	rt := d.weightsMu.RLock()
 	maxNextQT := d.nextQExec.MustExec1(nextStatesT)
-	d.weightsMu.RUnlock()
+	d.weightsMu.RUnlock(rt)
 
 	maxNextQ := tensorToFloat64Sched(maxNextQT)
 	targets := make([]float64, bs)

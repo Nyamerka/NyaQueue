@@ -11,8 +11,7 @@ const (
 	DefaultDQNTrainEvery     = 4    // train every N experiences (SB3 default)
 	DefaultDQNFallbackRatio  = 0.8  // fallback to RR when throughput < ratio * baseline
 	DefaultDQNLoadThreshold  = 0.75 // proactive fallback when mean partition load exceeds this
-	DefaultDQNExpChannelSize = 4096 // non-blocking experience channel buffer
-	DefaultDQNWeightInit     = 0.1
+	DefaultDQNExpChannelSize = 4096
 	DefaultWRRMinLoad        = 0.01
 )
 

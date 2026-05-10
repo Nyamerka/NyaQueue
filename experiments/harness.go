@@ -95,6 +95,11 @@ func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 			}
 			h.grpc = client
 			h.external = true
+
+			if err := waitForGRPCReady(ctx, client); err != nil {
+				client.Close()
+				return nil, oops.Wrapf(err, "external grpc broker not ready at %s", cfg.BrokerAddr)
+			}
 		} else {
 			// Local broker with gRPC: loopback connection inside the same process.
 			a, err := app.New(cfg.BrokerConfig, cfg.DataDir,
@@ -130,6 +135,11 @@ func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 		if httpAddr != "" {
 			h.httpClient = transport.NewHTTPClient(httpAddr)
 			h.external = true
+
+			if err := waitForHTTPReady(ctx, h.httpClient); err != nil {
+				h.httpClient.Close()
+				return nil, oops.Wrapf(err, "external http broker not ready at %s", httpAddr)
+			}
 		} else {
 			a, err := app.New(cfg.BrokerConfig, cfg.DataDir,
 				app.WithBalancerFactory(balancerFactory),
@@ -465,7 +475,7 @@ func (h *Harness) GetPartitionLoads(ctx context.Context) ([]float64, error) {
 }
 
 func waitForHTTPReady(ctx context.Context, c *transport.HTTPClient) error {
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(30 * time.Second)
 	for {
 		probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 		_, err := c.ListTopics(probeCtx)
@@ -475,16 +485,16 @@ func waitForHTTPReady(ctx context.Context, c *transport.HTTPClient) error {
 		}
 		select {
 		case <-deadline:
-			return oops.Wrapf(err, "http server not ready after 5s")
+			return oops.Wrapf(err, "http server not ready after 30s")
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
 
 func waitForGRPCReady(ctx context.Context, c *transport.Client) error {
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(30 * time.Second)
 	for {
 		probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 		_, err := c.ListTopics(probeCtx)
@@ -494,10 +504,10 @@ func waitForGRPCReady(ctx context.Context, c *transport.Client) error {
 		}
 		select {
 		case <-deadline:
-			return oops.Wrapf(err, "grpc server not ready after 5s")
+			return oops.Wrapf(err, "grpc server not ready after 30s")
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }

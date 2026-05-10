@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"math"
 	"time"
 
 	"github.com/nobl9/govy/pkg/govy"
@@ -166,7 +167,7 @@ func DefaultTopicConfig() TopicConfig {
 }
 
 func SetParamByName(cfg *Config, name string, val float64) {
-	v := int(val)
+	v := int(math.Round(val))
 	switch name {
 	case "SegmentMaxBytes":
 		cfg.SegmentMaxBytes = v

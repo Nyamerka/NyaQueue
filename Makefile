@@ -57,4 +57,4 @@ compose-kafka:
 	docker compose -f deploy/docker-compose.yml --profile kafka up -d
 
 compose-experiment:
-	docker compose -f deploy/docker-compose.yml --profile experiment run --rm experiment
+	docker compose -f deploy/docker-compose.yml --profile experiment run --build --rm experiment

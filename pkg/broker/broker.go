@@ -36,9 +36,18 @@ type Scheduler interface {
 	Enqueue(msg *Message, walOffset int64)
 }
 
+// configSnapshot is an immutable snapshot published via a single atomic.Pointer.
+// All fields are consistent with each other: Publish/PublishBatch read exactly
+// one snapshot and operate on it without racing with ApplyConfig.
+type configSnapshot struct {
+	cfg   Config
+	codec Codec
+	gate  *ioGate
+}
+
 type Broker struct {
 	mu         sync.RWMutex
-	config     atomic.Pointer[Config]
+	snap       atomic.Pointer[configSnapshot]
 	dataDir    string
 	topics     map[string]*Topic
 	balancer   Balancer
@@ -50,9 +59,6 @@ type Broker struct {
 	predictor    *LoadPredictor
 	backpressure *BackpressureController
 	offsetStore  *OffsetStore
-
-	codec  atomic.Pointer[Codec]
-	ioPool atomic.Pointer[ioGate]
 
 	stopCh chan struct{}
 }
@@ -76,11 +82,13 @@ func New(cfg Config, dataDir string, bal Balancer, offsetStore *OffsetStore) *Br
 		offsetStore: offsetStore,
 		stopCh:      make(chan struct{}),
 	}
-	b.ioPool.Store(&ioGate{sem: semaphore.NewWeighted(ioPoolSize), cap: ioPoolSize})
-	b.config.Store(&cfg)
 
 	codec := NewCodec(cfg.CompressionType)
-	b.codec.Store(&codec)
+	b.snap.Store(&configSnapshot{
+		cfg:   cfg,
+		codec: codec,
+		gate:  &ioGate{sem: semaphore.NewWeighted(ioPoolSize), cap: ioPoolSize},
+	})
 
 	b.predictor = NewLoadPredictor(100, 8, 100*time.Millisecond)
 	b.metrics = NewMetricsCollector(b)
@@ -91,8 +99,15 @@ func New(cfg Config, dataDir string, bal Balancer, offsetStore *OffsetStore) *Br
 
 func (b *Broker) SetBalancer(bal Balancer) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	old := b.balancer
 	b.balancer = bal
+	b.mu.Unlock()
+
+	if old != nil {
+		if s, ok := old.(Stopper); ok {
+			go s.Stop()
+		}
+	}
 }
 
 func (b *Broker) SetScheduler(topic string, sched Scheduler) {
@@ -122,15 +137,14 @@ func (b *Broker) CreateTopic(name string, cfg TopicConfig) error {
 		return oops.Wrapf(ErrTopicAlreadyExists, "create topic %q", name)
 	}
 
-	brokerCfg := b.config.Load()
-	t, err := NewTopic(name, b.dataDir, cfg, brokerCfg.SyncPolicy)
+	snap := b.snap.Load()
+	t, err := NewTopic(name, b.dataDir, cfg, snap.cfg.SyncPolicy)
 	if err != nil {
 		return err
 	}
-	if brokerCfg.CompressionType != CompressionNone {
-		codec := NewCodec(brokerCfg.CompressionType)
+	if snap.cfg.CompressionType != CompressionNone {
 		for _, p := range t.Partitions() {
-			p.SetBatchCodec(codec)
+			p.SetBatchCodec(snap.codec)
 		}
 	}
 	b.topics[name] = t
@@ -161,11 +175,24 @@ func (b *Broker) DeleteTopic(name string) error {
 	if !exists {
 		return oops.Wrapf(ErrTopicNotFound, "delete topic %q", name)
 	}
+
+	// Collect partition IDs before closing to clean up predictor/metrics.
+	partIDs := make([]int, 0, len(t.Partitions()))
+	for _, p := range t.Partitions() {
+		partIDs = append(partIDs, p.ID())
+	}
+
 	delete(b.topics, name)
 	b.stopScheduler(name)
 
 	if err := t.Close(); err != nil {
 		return err
+	}
+
+	// Clean up partition-level state to prevent memory leaks in long-lived brokers.
+	for _, pid := range partIDs {
+		b.predictor.RemovePartition(pid)
+		b.metrics.RemovePartition(pid)
 	}
 
 	if err := os.RemoveAll(filepath.Join(b.dataDir, name)); err != nil {
@@ -201,8 +228,7 @@ func (b *Broker) ListTopics() []*Topic {
 	return topics
 }
 
-func (b *Broker) compressMessage(msg *Message) error {
-	codec := *b.codec.Load()
+func (b *Broker) compressMessage(msg *Message, codec Codec) error {
 	compressed, err := codec.Encode(msg.Value)
 	if err != nil {
 		return oops.Wrapf(err, "compress message value")
@@ -215,8 +241,8 @@ func (b *Broker) decompressMessage(msg *Message) error {
 	if msg.BatchDecoded {
 		return nil
 	}
-	codec := *b.codec.Load()
-	decompressed, err := codec.Decode(msg.Value)
+	snap := b.snap.Load()
+	decompressed, err := snap.codec.Decode(msg.Value)
 	if err != nil {
 		return oops.Wrapf(err, "decompress message value")
 	}
@@ -225,13 +251,13 @@ func (b *Broker) decompressMessage(msg *Message) error {
 }
 
 func (b *Broker) Publish(topicName string, msg *Message) (partition int, offset uint64, err error) {
-	cfg := b.config.Load()
-	if cfg.MaxMessageBytes > 0 && len(msg.Key)+len(msg.Value) > cfg.MaxMessageBytes {
+	snap := b.snap.Load()
+	if snap.cfg.MaxMessageBytes > 0 && len(msg.Key)+len(msg.Value) > snap.cfg.MaxMessageBytes {
 		return 0, 0, oops.Wrapf(ErrMessageTooLarge, "size %d > limit %d",
-			len(msg.Key)+len(msg.Value), cfg.MaxMessageBytes)
+			len(msg.Key)+len(msg.Value), snap.cfg.MaxMessageBytes)
 	}
 
-	if err := b.compressMessage(msg); err != nil {
+	if err := b.compressMessage(msg, snap.codec); err != nil {
 		return 0, 0, err
 	}
 
@@ -301,8 +327,9 @@ func (b *Broker) PublishBatch(topicName string, msgs []*Message) []PublishResult
 	}
 	groups := make(map[int][]indexed, numParts)
 
-	cfg := b.config.Load()
-	codec := *b.codec.Load()
+	snap := b.snap.Load()
+	cfg := &snap.cfg
+	codec := snap.codec
 	useBatchCompression := cfg.CompressionType != CompressionNone
 
 	now := time.Now().UnixNano()
@@ -383,7 +410,7 @@ func (b *Broker) PublishBatch(topicName string, msgs []*Message) []PublishResult
 		go func(partIdx int, batch []indexed) {
 			defer wg.Done()
 
-			gate := b.ioPool.Load()
+			gate := snap.gate
 			if err := gate.sem.Acquire(context.Background(), 1); err != nil {
 				for _, item := range batch {
 					results[item.idx].Err = err
@@ -513,8 +540,12 @@ func (b *Broker) Metrics() Metrics {
 	return b.metrics.Snapshot()
 }
 
+func (b *Broker) MetricsCollector() *MetricsCollector {
+	return b.metrics
+}
+
 func (b *Broker) Config() Config {
-	return *b.config.Load()
+	return b.snap.Load().cfg
 }
 
 func (b *Broker) ApplyConfig(cfg Config) error {
@@ -522,22 +553,32 @@ func (b *Broker) ApplyConfig(cfg Config) error {
 		return err
 	}
 
-	old := b.config.Load()
-	b.config.Store(&cfg)
+	old := b.snap.Load()
 
-	if cfg.CompressionType != old.CompressionType {
-		codec := NewCodec(cfg.CompressionType)
-		b.codec.Store(&codec)
+	// Idempotent: if config is structurally equal, skip all re-initialization.
+	if old.cfg == cfg {
+		return nil
 	}
 
-	if cfg.NumIOGoroutines != old.NumIOGoroutines {
+	newSnap := &configSnapshot{
+		cfg:   cfg,
+		codec: old.codec,
+		gate:  old.gate,
+	}
+
+	if cfg.CompressionType != old.cfg.CompressionType {
+		newSnap.codec = NewCodec(cfg.CompressionType)
+	}
+
+	if cfg.NumIOGoroutines != old.cfg.NumIOGoroutines {
 		newSize := int64(cfg.NumIOGoroutines)
 		if newSize <= 0 {
 			newSize = 4
 		}
-		b.ioPool.Store(&ioGate{sem: semaphore.NewWeighted(newSize), cap: newSize})
+		newSnap.gate = &ioGate{sem: semaphore.NewWeighted(newSize), cap: newSize}
 	}
 
+	b.snap.Store(newSnap)
 	return nil
 }
 
@@ -634,7 +675,7 @@ func (b *Broker) retentionLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			cfg := b.config.Load()
+			cfg := &b.snap.Load().cfg
 
 			b.mu.RLock()
 			topics := make([]*Topic, 0, len(b.topics))
@@ -685,7 +726,7 @@ func (b *Broker) sessionTimeoutLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			cfg := b.config.Load()
+			cfg := &b.snap.Load().cfg
 			if cfg.ConsumerSessionTimeoutMs <= 0 || b.offsetStore == nil {
 				continue
 			}

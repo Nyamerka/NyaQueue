@@ -55,6 +55,14 @@ func WithHTTP(addr string) Option {
 	}
 }
 
+// WithAdmin enables the admin server (/healthz, /readyz, /debug/pprof/*, /metrics)
+// on a separate port, keeping pprof and diagnostics away from client traffic.
+func WithAdmin(addr string) Option {
+	return func(a *BrokerApp) {
+		a.adminAddr = addr
+	}
+}
+
 // WithLoadPredictor enables the AR(p) load predictor that feeds predicted
 // partition loads into the DQN balancer and backpressure controller.
 func WithLoadPredictor(window, horizon int, interval time.Duration) Option {
@@ -81,11 +89,15 @@ func WithBackpressure(threshold float64, horizon int) Option {
 
 // WithOptimizer enables the DDPG auto-configuration loop that tunes
 // broker parameters online based on live metrics.
-func WithOptimizer(params []optimizer.TunableParam, interval time.Duration) Option {
+func WithOptimizer(params []optimizer.TunableParam, optCfg ...optimizer.OptimizerConfig) Option {
 	return func(a *BrokerApp) {
+		cfg := optimizer.DefaultOptimizerConfig()
+		if len(optCfg) > 0 {
+			cfg = optCfg[0]
+		}
 		a.optimizerCfg = &optimizerConfig{
-			params:   params,
-			interval: interval,
+			params: params,
+			optCfg: cfg,
 		}
 	}
 }

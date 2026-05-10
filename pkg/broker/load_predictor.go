@@ -140,6 +140,14 @@ func (lp *LoadPredictor) Stop() {
 	close(lp.stopCh)
 }
 
+// RemovePartition deletes stored history for the given partition ID,
+// preventing unbounded memory growth when topics/partitions are deleted.
+func (lp *LoadPredictor) RemovePartition(partID int) {
+	lp.mu.Lock()
+	delete(lp.history, partID)
+	lp.mu.Unlock()
+}
+
 // arPredictInto forecasts `horizon` steps ahead using AR(p) autoregression.
 // Uses pre-allocated buffers to avoid per-call allocations.
 func (lp *LoadPredictor) arPredictInto(vals []float64, horizon int) []float64 {

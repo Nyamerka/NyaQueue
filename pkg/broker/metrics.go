@@ -28,10 +28,20 @@ type DerivedMetrics struct {
 	LoadStdDev     float64
 }
 
+// ObservabilityMetrics holds counters from internal subsystems (backpressure, balancer).
+type ObservabilityMetrics struct {
+	BackpressureClosedCount int64 `json:"bp_closed_count"`
+	BackpressureWarnCount   int64 `json:"bp_warn_count"`
+	BackpressureOpenCount   int64 `json:"bp_open_count"`
+	BalancerDroppedExp      int64 `json:"balancer_dropped_exp,omitempty"`
+	BalancerEvictions       int64 `json:"balancer_evictions,omitempty"`
+}
+
 // Metrics is the unified snapshot exposed to balancers, transport, and experiments.
 type Metrics struct {
 	BusinessMetrics
 	DerivedMetrics
+	ObservabilityMetrics
 	Timestamp time.Time
 }
 
@@ -58,17 +68,20 @@ type MetricsCollector struct {
 	retentionDeletedBytes    atomic.Int64
 	retentionDeletedSegments atomic.Int64
 
-	promRegistered bool
-	promProduce    *prometheus.CounterVec
-	promConsume    *prometheus.CounterVec
-	promLoad       *prometheus.GaugeVec
-	promDepth      *prometheus.GaugeVec
-	promThroughput prometheus.Gauge
-	promLoadStdDev prometheus.Gauge
-	promRetBytes   prometheus.Counter
-	promRetSegs    prometheus.Counter
-	promBPClosed   prometheus.Counter
-	promBPWarn     prometheus.Counter
+	promRegistered   bool
+	promProduce      *prometheus.CounterVec
+	promConsume      *prometheus.CounterVec
+	promLoad         *prometheus.GaugeVec
+	promDepth        *prometheus.GaugeVec
+	promThroughput   prometheus.Gauge
+	promLoadStdDev   prometheus.Gauge
+	promRetBytes     prometheus.Counter
+	promRetSegs      prometheus.Counter
+	promBPClosed     prometheus.Counter
+	promBPWarn       prometheus.Counter
+	promBPOpen       prometheus.Gauge
+	promBalDropped   prometheus.Gauge
+	promBalEvictions prometheus.Gauge
 }
 
 func NewMetricsCollector(b *Broker) *MetricsCollector {
@@ -227,6 +240,24 @@ func (mc *MetricsCollector) Collect() Metrics {
 		mc.historyMu.Unlock()
 	}
 
+	var obs ObservabilityMetrics
+	mc.broker.mu.RLock()
+	bp := mc.broker.backpressure
+	bal := mc.broker.balancer
+	mc.broker.mu.RUnlock()
+
+	if bp != nil {
+		obs.BackpressureClosedCount = bp.ClosedCount()
+		obs.BackpressureWarnCount = bp.WarnCount()
+		obs.BackpressureOpenCount = bp.OpenCount()
+	}
+	if de, ok := bal.(interface{ DroppedExperience() int64 }); ok {
+		obs.BalancerDroppedExp = de.DroppedExperience()
+	}
+	if ev, ok := bal.(interface{ EvictionCount() int64 }); ok {
+		obs.BalancerEvictions = ev.EvictionCount()
+	}
+
 	snap := Metrics{
 		BusinessMetrics: BusinessMetrics{
 			Throughput:  throughput,
@@ -239,7 +270,8 @@ func (mc *MetricsCollector) Collect() Metrics {
 			QueueDepth:     depths,
 			LoadStdDev:     loadSD,
 		},
-		Timestamp: now,
+		ObservabilityMetrics: obs,
+		Timestamp:            now,
 	}
 
 	mc.mu.Lock()
@@ -338,6 +370,24 @@ func (mc *MetricsCollector) RegisterPrometheus(reg prometheus.Registerer) {
 		Name:      "backpressure_warn_total",
 		Help:      "Backpressure warn activations.",
 	})
+
+	mc.promBPOpen = f.NewGauge(prometheus.GaugeOpts{
+		Namespace: "nyaqueue",
+		Name:      "backpressure_open_total",
+		Help:      "Backpressure open activations.",
+	})
+
+	mc.promBalDropped = f.NewGauge(prometheus.GaugeOpts{
+		Namespace: "nyaqueue",
+		Name:      "balancer_dropped_experience_total",
+		Help:      "DQN balancer dropped experience tuples.",
+	})
+
+	mc.promBalEvictions = f.NewGauge(prometheus.GaugeOpts{
+		Namespace: "nyaqueue",
+		Name:      "balancer_evictions_total",
+		Help:      "PSA balancer LRU evictions.",
+	})
 }
 
 // updatePrometheus pushes the latest snapshot to Prometheus gauges.
@@ -369,6 +419,24 @@ func (mc *MetricsCollector) updatePrometheus(snap Metrics) {
 			partIdx++
 		}
 	}
+
+	mc.promBPOpen.Set(float64(snap.BackpressureOpenCount))
+	mc.promBalDropped.Set(float64(snap.BalancerDroppedExp))
+	mc.promBalEvictions.Set(float64(snap.BalancerEvictions))
+}
+
+// RemovePartition clears partition-level counters and histories for a deleted partition.
+func (mc *MetricsCollector) RemovePartition(partID int) {
+	mc.mu.Lock()
+	if partID < len(mc.partProduces) {
+		mc.partProduces[partID].Store(0)
+		mc.partConsumes[partID].Store(0)
+	}
+	if partID < len(mc.prevPartProduces) {
+		mc.prevPartProduces[partID] = 0
+		mc.prevPartConsumes[partID] = 0
+	}
+	mc.mu.Unlock()
 }
 
 // RecordProduceLabeled records a produce for Prometheus with topic/partition labels.

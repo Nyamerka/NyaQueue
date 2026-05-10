@@ -14,6 +14,8 @@ func mapBrokerError(err error) error {
 		return nil
 	}
 	switch {
+	case errors.Is(err, broker.ErrThrottled):
+		return status.Error(codes.ResourceExhausted, err.Error())
 	case errors.Is(err, broker.ErrTopicAlreadyExists):
 		return status.Error(codes.AlreadyExists, err.Error())
 	case errors.Is(err, broker.ErrTopicNotFound):

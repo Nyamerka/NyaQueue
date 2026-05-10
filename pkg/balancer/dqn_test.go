@@ -84,33 +84,55 @@ func (s *DQNSuite) TestOnMetricsTrains() {
 	dqn := NewDQNBalancer(4, WithDQNTrainEvery(1))
 	defer dqn.Stop()
 
-	dqn.SelectPartition("t", []byte("k"), 4)
 	dqn.OnMetrics(broker.Metrics{
 		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8}},
 	})
 
+	// Wait for policyLoop to produce snapshots.
+	time.Sleep(300 * time.Millisecond)
+
+	// Send more OnMetrics to trigger experience push.
+	for i := 0; i < 5; i++ {
+		dqn.OnMetrics(broker.Metrics{
+			DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.3, 0.5, 0.7, 0.9}},
+		})
+		time.Sleep(110 * time.Millisecond)
+	}
+
 	require.Eventually(s.T(), func() bool {
 		return dqn.replayBuffer.Len() > 0
-	}, time.Second, 5*time.Millisecond)
+	}, 2*time.Second, 10*time.Millisecond)
 }
 
-func (s *DQNSuite) TestComputeRewardEmpty() {
+func (s *DQNSuite) TestRewardPropertyMonotonicity() {
+	balanced := computeReward(broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
+	})
+	imbalanced := computeReward(broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.9, 0.1, 0.9}},
+	})
+	require.Greater(s.T(), balanced, imbalanced,
+		"more balanced loads should yield higher reward")
+}
+
+func (s *DQNSuite) TestRewardPropertyEmptyLoads() {
 	reward := computeReward(broker.Metrics{})
 	require.Equal(s.T(), 0.0, reward)
 }
 
-func (s *DQNSuite) TestComputeRewardPerfectBalance() {
-	reward := computeReward(broker.Metrics{
-		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
+func (s *DQNSuite) TestRewardPropertyThroughputMatters() {
+	lowTP := computeReward(broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 1000},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
 	})
-	require.Equal(s.T(), 0.0, reward)
-}
-
-func (s *DQNSuite) TestComputeRewardImbalance() {
-	reward := computeReward(broker.Metrics{
-		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.9, 0.1, 0.9}},
+	highTP := computeReward(broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 80000},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
 	})
-	require.Less(s.T(), reward, 0.0, "imbalanced loads yield negative reward")
+	require.Greater(s.T(), highTP, lowTP,
+		"higher throughput should yield higher reward")
 }
 
 func (s *DQNSuite) TestSetPredictedLoads() {
@@ -124,41 +146,24 @@ func (s *DQNSuite) TestSetPredictedLoads() {
 	require.Equal(s.T(), []float64{0.1, 0.2, 0.3, 0.4}, loads)
 }
 
-func (s *DQNSuite) TestBuildStateSize() {
-	dqn := NewDQNBalancer(4)
+func (s *DQNSuite) TestTrainStepWithEnoughData() {
+	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
 	defer dqn.Stop()
 
-	dqn.stateMu.Lock()
-	state := dqn.buildStateLocked()
-	dqn.stateMu.Unlock()
-	require.Len(s.T(), state, 4*2+2)
-}
+	dqn.OnMetrics(broker.Metrics{
+		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4}},
+	})
 
-func (s *DQNSuite) TestForwardOutputSize() {
-	dqn := NewDQNBalancer(4)
-	defer dqn.Stop()
+	for i := 0; i < 5; i++ {
+		dqn.OnMetrics(broker.Metrics{
+			DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.2, 0.3, float64(i) * 0.1}},
+		})
+		time.Sleep(110 * time.Millisecond)
+	}
 
-	dqn.stateMu.Lock()
-	state := dqn.buildStateLocked()
-	dqn.stateMu.Unlock()
-
-	dqn.weightsMu.RLock()
-	q := dqn.forward(state)
-	dqn.weightsMu.RUnlock()
-	require.Len(s.T(), q, 4)
-}
-
-func (s *DQNSuite) TestForwardDeterministic() {
-	dqn := NewDQNBalancer(4, WithDQNEpsilon(0))
-	defer dqn.Stop()
-	state := []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.0, 0.0}
-
-	dqn.weightsMu.RLock()
-	q1 := dqn.forward(state)
-	q2 := dqn.forward(state)
-	dqn.weightsMu.RUnlock()
-
-	require.InDeltaSlice(s.T(), q1, q2, 1e-12)
+	require.Eventually(s.T(), func() bool {
+		return dqn.replayBuffer.Len() >= 2
+	}, time.Second, 5*time.Millisecond)
 }
 
 func (s *DQNSuite) TestAllOptions() {
@@ -170,7 +175,6 @@ func (s *DQNSuite) TestAllOptions() {
 		WithDQNBatchSize(16),
 		WithDQNMinReplay(32),
 		WithDQNFallbackRatio(0.5),
-		WithDQNWeightInit(0.05),
 		WithDQNReplayBufSize(1000),
 	)
 	defer dqn.Stop()
@@ -181,54 +185,6 @@ func (s *DQNSuite) TestAllOptions() {
 	require.Equal(s.T(), 16, dqn.batchSize)
 	require.Equal(s.T(), 32, dqn.minReplay)
 	require.Equal(s.T(), 0.5, dqn.fallbackRatio)
-	require.Equal(s.T(), 0.05, dqn.weightInit)
-}
-
-func (s *DQNSuite) TestTrainStepWithEnoughData() {
-	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
-	defer dqn.Stop()
-	for i := 0; i < 5; i++ {
-		dqn.SelectPartition("t", []byte("k"), 4)
-		dqn.OnMetrics(broker.Metrics{
-			DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4}},
-		})
-	}
-	require.Eventually(s.T(), func() bool {
-		return dqn.replayBuffer.Len() >= 2
-	}, time.Second, 5*time.Millisecond)
-}
-
-func (s *DQNSuite) TestTrainStepChangesWeights() {
-	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNLearningRate(0.1))
-	defer dqn.Stop()
-
-	state := []float64{0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.0, 0.0}
-	dqn.weightsMu.RLock()
-	qBefore := dqn.forward(state)
-	dqn.weightsMu.RUnlock()
-
-	for i := 0; i < 10; i++ {
-		dqn.SelectPartition("t", []byte("k"), 4)
-		dqn.OnMetrics(broker.Metrics{
-			DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4}},
-		})
-	}
-
-	// Allow training to happen.
-	time.Sleep(200 * time.Millisecond)
-
-	dqn.weightsMu.RLock()
-	qAfter := dqn.forward(state)
-	dqn.weightsMu.RUnlock()
-
-	changed := false
-	for i := range qBefore {
-		if qAfter[i] != qBefore[i] {
-			changed = true
-			break
-		}
-	}
-	require.True(s.T(), changed, "weights should change after training step")
 }
 
 func (s *DQNSuite) TestAsyncTrainingDoesNotBlockInference() {

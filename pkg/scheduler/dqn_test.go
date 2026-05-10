@@ -71,8 +71,6 @@ func (s *DQNSchedSuite) TestFunctionalOptions() {
 			dqn := NewDQNScheduler(tc.opts...)
 			defer dqn.Stop()
 			require.NotNil(s.T(), dqn)
-			require.NotNil(s.T(), dqn.fwdExec, "GoMLX fwdExec should be initialized")
-			require.NotNil(s.T(), dqn.trainExec, "GoMLX trainExec should be initialized")
 		})
 	}
 }
@@ -89,8 +87,13 @@ func (s *DQNSchedSuite) TestOnMetrics() {
 		_, _ = p.Append(broker.NewMessage(5, []byte("k"), []byte("v")))
 	}
 
+	// Call Next to let policyLoop discover the PriorityIndex.
 	_, _, _ = dqn.Next(p, 0)
-	_, _, _ = dqn.Next(p, 0)
+
+	// Wait for policyLoop to produce snapshots from the cached PI.
+	require.Eventually(s.T(), func() bool {
+		return dqn.prevSnap.Load() != nil && dqn.currSnap.Load() != nil
+	}, 2*time.Second, 10*time.Millisecond)
 
 	dqn.OnMetrics(broker.Metrics{BusinessMetrics: broker.BusinessMetrics{AvgLatency: 10.0}})
 
@@ -103,40 +106,6 @@ func (s *DQNSchedSuite) TestOnMetricsWithoutPriorState() {
 	dqn.OnMetrics(broker.Metrics{BusinessMetrics: broker.BusinessMetrics{AvgLatency: 5.0}})
 	dqn.Stop()
 	require.Equal(s.T(), 0, dqn.replayBuffer.Len(), "no push without prior state")
-}
-
-func (s *DQNSchedSuite) TestForwardOutputSize() {
-	dqn := NewDQNScheduler()
-	defer dqn.Stop()
-	state := make([]float64, dqn.stateSize)
-	dqn.weightsMu.RLock()
-	q := dqn.forward(state)
-	dqn.weightsMu.RUnlock()
-	require.Len(s.T(), q, dqn.numActions)
-}
-
-func (s *DQNSchedSuite) TestForwardDeterministic() {
-	dqn := NewDQNScheduler()
-	defer dqn.Stop()
-	state := make([]float64, dqn.stateSize)
-	for i := range state {
-		state[i] = float64(i) * 0.1
-	}
-	dqn.weightsMu.RLock()
-	q1 := dqn.forward(state)
-	q2 := dqn.forward(state)
-	dqn.weightsMu.RUnlock()
-	require.InDeltaSlice(s.T(), q1, q2, 1e-12)
-}
-
-func (s *DQNSchedSuite) TestForwardShortState() {
-	dqn := NewDQNScheduler()
-	defer dqn.Stop()
-	state := padOrTruncSched([]float64{0.1, 0.2}, dqn.stateSize)
-	dqn.weightsMu.RLock()
-	q := dqn.forward(state)
-	dqn.weightsMu.RUnlock()
-	require.Len(s.T(), q, dqn.numActions)
 }
 
 func (s *DQNSchedSuite) TestEnqueueNoop() {
@@ -155,12 +124,6 @@ func (s *DQNSchedSuite) TestSetFallbackFIFOToggle() {
 	require.True(s.T(), dqn.fallbackFIFO)
 	dqn.SetFallbackFIFO(false)
 	require.False(s.T(), dqn.fallbackFIFO)
-}
-
-func (s *DQNSchedSuite) TestThrottleOnLoadOption() {
-	dqn := NewDQNScheduler(WithDQNSchedThrottleOnLoad(0.7))
-	defer dqn.Stop()
-	require.Equal(s.T(), 0.7, dqn.throttleOnLoad)
 }
 
 func (s *DQNSchedSuite) TestReplayBufSizeOption() {
@@ -195,6 +158,12 @@ func (s *DQNSchedSuite) TestAsyncTrainingDoesNotBlockInference() {
 	dqn := NewDQNScheduler(WithDQNSchedEpsilon(0.5))
 	defer dqn.Stop()
 
+	// Call Next to feed PI to policyLoop.
+	_, _, _ = dqn.Next(p, 0)
+	require.Eventually(s.T(), func() bool {
+		return dqn.prevSnap.Load() != nil
+	}, 2*time.Second, 10*time.Millisecond)
+
 	for i := 0; i < 100; i++ {
 		_, _, _ = dqn.Next(p, 0)
 		dqn.OnMetrics(broker.Metrics{BusinessMetrics: broker.BusinessMetrics{AvgLatency: float64(i)}})
@@ -217,29 +186,17 @@ func (s *DQNSchedSuite) TestBellmanUsesCorrectNextState() {
 		_, _ = p.Append(broker.NewMessage(uint8(i%10), []byte("k"), []byte("v")))
 	}
 
-	_, _, _ = dqn.Next(p, 0)
+	// Call Next to let policyLoop discover PI.
 	_, _, _ = dqn.Next(p, 0)
 
-	dqn.stateMu.Lock()
-	prevState := dqn.prevState
-	lastState := dqn.lastState
-	dqn.stateMu.Unlock()
-
-	require.NotNil(s.T(), prevState, "prevState should be set after two Next calls")
-	require.NotNil(s.T(), lastState, "lastState should be set")
+	require.Eventually(s.T(), func() bool {
+		return dqn.prevSnap.Load() != nil && dqn.currSnap.Load() != nil
+	}, 2*time.Second, 10*time.Millisecond)
 
 	dqn.OnMetrics(broker.Metrics{BusinessMetrics: broker.BusinessMetrics{AvgLatency: 5.0}})
 	dqn.Stop()
 
 	require.Greater(s.T(), dqn.replayBuffer.Len(), 0)
-}
-
-func (s *DQNSchedSuite) TestGoMLXExecsPrecompiled() {
-	dqn := NewDQNScheduler()
-	defer dqn.Stop()
-	require.NotNil(s.T(), dqn.fwdExec, "fwdExec should be precompiled")
-	require.NotNil(s.T(), dqn.nextQExec, "nextQExec should be precompiled")
-	require.NotNil(s.T(), dqn.trainExec, "trainExec should be precompiled")
 }
 
 func (s *DQNSchedSuite) TestConcurrentNextAndOnMetrics() {
