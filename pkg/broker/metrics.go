@@ -14,6 +14,7 @@ import (
 // BusinessMetrics holds raw counters-derived metrics.
 type BusinessMetrics struct {
 	Throughput  float64
+	ConsumeRate float64
 	AvgLatency  float64
 	SuccessRate float64
 	MsgRate     float64
@@ -48,12 +49,13 @@ type Metrics struct {
 type MetricsCollector struct {
 	broker *Broker
 
-	mu           sync.Mutex
-	produceCount int64
-	consumeCount int64
-	produceBytes int64
-	lastSnap     Metrics
-	lastCollect  time.Time
+	produceCount atomic.Int64
+	consumeCount atomic.Int64
+	produceBytes atomic.Int64
+	lastSnap     atomic.Pointer[Metrics]
+
+	mu          sync.Mutex
+	lastCollect time.Time
 
 	partProduces []atomic.Int64
 	partConsumes []atomic.Int64
@@ -85,14 +87,16 @@ type MetricsCollector struct {
 }
 
 func NewMetricsCollector(b *Broker) *MetricsCollector {
-	return &MetricsCollector{
+	mc := &MetricsCollector{
 		broker:      b,
 		lastCollect: time.Now(),
 	}
+	mc.lastSnap.Store(&Metrics{})
+	return mc
 }
 
 func (mc *MetricsCollector) RecordProduce(topic string, partition int) {
-	atomic.AddInt64(&mc.produceCount, 1)
+	mc.produceCount.Add(1)
 	mc.mu.Lock()
 	mc.ensurePartCountersLocked(partition + 1)
 	mc.partProduces[partition].Add(1)
@@ -101,8 +105,8 @@ func (mc *MetricsCollector) RecordProduce(topic string, partition int) {
 }
 
 func (mc *MetricsCollector) RecordProduceWithSize(_ string, partition int, msgBytes int) {
-	atomic.AddInt64(&mc.produceCount, 1)
-	atomic.AddInt64(&mc.produceBytes, int64(msgBytes))
+	mc.produceCount.Add(1)
+	mc.produceBytes.Add(int64(msgBytes))
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 	mc.ensurePartCountersLocked(partition + 1)
@@ -110,7 +114,7 @@ func (mc *MetricsCollector) RecordProduceWithSize(_ string, partition int, msgBy
 }
 
 func (mc *MetricsCollector) RecordProduceBatch(_ string, partition int, n int) {
-	atomic.AddInt64(&mc.produceCount, int64(n))
+	mc.produceCount.Add(int64(n))
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 	mc.ensurePartCountersLocked(partition + 1)
@@ -118,7 +122,7 @@ func (mc *MetricsCollector) RecordProduceBatch(_ string, partition int, n int) {
 }
 
 func (mc *MetricsCollector) RecordConsume(topic string, partition int, group string) {
-	atomic.AddInt64(&mc.consumeCount, 1)
+	mc.consumeCount.Add(1)
 	mc.mu.Lock()
 	mc.ensurePartCountersLocked(partition + 1)
 	mc.partConsumes[partition].Add(1)
@@ -152,16 +156,13 @@ func (mc *MetricsCollector) Collect() Metrics {
 	if elapsed < 0.001 {
 		elapsed = 0.001
 	}
-
-	produced := atomic.LoadInt64(&mc.produceCount)
-	consumed := atomic.LoadInt64(&mc.consumeCount)
 	mc.lastCollect = now
 	mc.mu.Unlock()
 
-	throughput := float64(produced+consumed) / elapsed
+	produced := mc.produceCount.Swap(0)
+	consumed := mc.consumeCount.Swap(0)
 
-	atomic.StoreInt64(&mc.produceCount, 0)
-	atomic.StoreInt64(&mc.consumeCount, 0)
+	throughput := float64(produced+consumed) / elapsed
 
 	mc.broker.mu.RLock()
 	topics := make([]*Topic, 0, len(mc.broker.topics))
@@ -219,10 +220,10 @@ func (mc *MetricsCollector) Collect() Metrics {
 		successRate = 0.0
 	}
 
-	producedBytes := atomic.LoadInt64(&mc.produceBytes)
-	atomic.StoreInt64(&mc.produceBytes, 0)
+	producedBytes := mc.produceBytes.Swap(0)
 
 	msgRate := float64(produced) / elapsed
+	consumeRate := float64(consumed) / elapsed
 	avgMsgSize := 0.0
 	if produced > 0 {
 		avgMsgSize = float64(producedBytes) / float64(produced)
@@ -261,6 +262,7 @@ func (mc *MetricsCollector) Collect() Metrics {
 	snap := Metrics{
 		BusinessMetrics: BusinessMetrics{
 			Throughput:  throughput,
+			ConsumeRate: consumeRate,
 			SuccessRate: successRate,
 			MsgRate:     msgRate,
 			AvgMsgSize:  avgMsgSize,
@@ -274,9 +276,7 @@ func (mc *MetricsCollector) Collect() Metrics {
 		Timestamp:            now,
 	}
 
-	mc.mu.Lock()
-	mc.lastSnap = snap
-	mc.mu.Unlock()
+	mc.lastSnap.Store(&snap)
 
 	mc.updatePrometheus(snap)
 
@@ -289,9 +289,10 @@ func (mc *MetricsCollector) RecordRetention(segments int, bytes int64) {
 }
 
 func (mc *MetricsCollector) Snapshot() Metrics {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	return mc.lastSnap
+	if p := mc.lastSnap.Load(); p != nil {
+		return *p
+	}
+	return Metrics{}
 }
 
 func (mc *MetricsCollector) RetentionDeletedBytes() int64 {

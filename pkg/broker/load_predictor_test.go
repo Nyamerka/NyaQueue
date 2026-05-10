@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -185,7 +186,7 @@ func (s *LoadPredictorSuite) TestBrokerMetricsIncludesPredictions() {
 
 	for i := 0; i < 50; i++ {
 		msg := NewMessage(0, []byte("k"), []byte("v"))
-		b.Publish("t", msg)
+		b.Publish(context.Background(), "t", msg)
 		time.Sleep(5 * time.Millisecond)
 	}
 

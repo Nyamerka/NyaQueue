@@ -1,6 +1,7 @@
 package benchmarks
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -17,7 +18,7 @@ func BenchmarkPublishFIFO(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, err := brk.Publish("bench", msg)
+		_, _, err := brk.Publish(context.Background(), "bench", msg)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -32,7 +33,7 @@ func BenchmarkPublishPriority(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		priority := uint8(i % 10)
 		msg := broker.NewMessage(priority, []byte("key"), GenerateMessage(256))
-		_, _, err := brk.Publish("bench", msg)
+		_, _, err := brk.Publish(context.Background(), "bench", msg)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -45,7 +46,7 @@ func BenchmarkConsumeFIFO(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		msg := broker.NewMessage(0, []byte(fmt.Sprintf("k%d", i)), GenerateMessage(256))
-		brk.Publish("bench", msg)
+		brk.Publish(context.Background(), "bench", msg)
 	}
 
 	fifo := scheduler.NewFIFO()
@@ -133,7 +134,7 @@ func BenchmarkScenarioTable(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				priority := sc.SamplePriority()
 				msg := broker.NewMessage(priority, []byte("k"), GenerateMessage(sc.MsgSize))
-				brk.Publish("bench", msg)
+				brk.Publish(context.Background(), "bench", msg)
 			}
 		})
 	}

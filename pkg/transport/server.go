@@ -102,14 +102,14 @@ func (s *Server) Addr() string {
 	return ""
 }
 
-func (s *Server) Produce(_ context.Context, req *pb.ProduceRequest) (*pb.ProduceResponse, error) {
+func (s *Server) Produce(ctx context.Context, req *pb.ProduceRequest) (*pb.ProduceResponse, error) {
 	if len(req.Messages) > 0 {
-		return s.produceBatch(req)
+		return s.produceBatch(ctx, req)
 	}
-	return s.produceSingle(req)
+	return s.produceSingle(ctx, req)
 }
 
-func (s *Server) produceSingle(req *pb.ProduceRequest) (*pb.ProduceResponse, error) {
+func (s *Server) produceSingle(ctx context.Context, req *pb.ProduceRequest) (*pb.ProduceResponse, error) {
 	msg := &broker.Message{
 		Header: broker.MessageHeader{
 			Priority:  uint8(req.Priority),
@@ -119,9 +119,9 @@ func (s *Server) produceSingle(req *pb.ProduceRequest) (*pb.ProduceResponse, err
 		Value: req.Value,
 	}
 
-	partition, offset, err := s.broker.Publish(req.Topic, msg)
+	partition, offset, err := s.broker.Publish(ctx, req.Topic, msg)
 	if err != nil {
-		return nil, mapBrokerError(err)
+		return nil, oops.Wrapf(mapBrokerError(err), "produce topic=%s", req.Topic)
 	}
 
 	return &pb.ProduceResponse{
@@ -130,7 +130,7 @@ func (s *Server) produceSingle(req *pb.ProduceRequest) (*pb.ProduceResponse, err
 	}, nil
 }
 
-func (s *Server) produceBatch(req *pb.ProduceRequest) (*pb.ProduceResponse, error) {
+func (s *Server) produceBatch(ctx context.Context, req *pb.ProduceRequest) (*pb.ProduceResponse, error) {
 	now := time.Now().UnixNano()
 	msgs := make([]*broker.Message, len(req.Messages))
 	for i, m := range req.Messages {
@@ -144,7 +144,7 @@ func (s *Server) produceBatch(req *pb.ProduceRequest) (*pb.ProduceResponse, erro
 		}
 	}
 
-	batchResults := s.broker.PublishBatch(req.Topic, msgs)
+	batchResults := s.broker.PublishBatch(ctx, req.Topic, msgs)
 
 	results := make([]*pb.ProduceResult, len(batchResults))
 	var firstErr error
@@ -159,7 +159,7 @@ func (s *Server) produceBatch(req *pb.ProduceRequest) (*pb.ProduceResponse, erro
 	}
 
 	if firstErr != nil && allFailed(batchResults) {
-		return nil, mapBrokerError(firstErr)
+		return nil, oops.Wrapf(mapBrokerError(firstErr), "produce-batch topic=%s count=%d", req.Topic, len(req.Messages))
 	}
 
 	return &pb.ProduceResponse{Results: results}, nil
@@ -216,7 +216,7 @@ func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.Consume
 			if len(envelopes) > 0 {
 				break
 			}
-			return nil, err
+			return nil, oops.Wrapf(err, "consume topic=%s group=%s partition=%d", req.Topic, req.Group, req.Partition)
 		}
 
 		env := &pb.MessageEnvelope{
@@ -245,7 +245,7 @@ func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.Consume
 func (s *Server) Commit(_ context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
 	err := s.broker.Commit(req.Group, req.Topic, int(req.Partition), req.Offset)
 	if err != nil {
-		return nil, err
+		return nil, oops.Wrapf(err, "commit topic=%s group=%s partition=%d", req.Topic, req.Group, req.Partition)
 	}
 	return &pb.CommitResponse{}, nil
 }
@@ -275,14 +275,14 @@ func (s *Server) CreateTopic(_ context.Context, req *pb.CreateTopicRequest) (*pb
 	}
 
 	if err := s.broker.CreateTopic(req.Topic, cfg); err != nil {
-		return nil, mapBrokerError(err)
+		return nil, oops.Wrapf(mapBrokerError(err), "create-topic %s", req.Topic)
 	}
 	return &pb.CreateTopicResponse{}, nil
 }
 
 func (s *Server) DeleteTopic(_ context.Context, req *pb.DeleteTopicRequest) (*pb.DeleteTopicResponse, error) {
 	if err := s.broker.DeleteTopic(req.Topic); err != nil {
-		return nil, mapBrokerError(err)
+		return nil, oops.Wrapf(mapBrokerError(err), "delete-topic %s", req.Topic)
 	}
 	return &pb.DeleteTopicResponse{}, nil
 }

@@ -246,7 +246,7 @@ func (h *Harness) Publish(ctx context.Context, topic string, key, value []byte, 
 	switch h.mode {
 	case ModeInProcess:
 		msg := broker.NewMessage(priority, key, value)
-		_, _, err := h.app.Broker().Publish(topic, msg)
+		_, _, err := h.app.Broker().Publish(ctx, topic, msg)
 		return err
 	case ModeGRPC:
 		_, _, err := h.grpc.Produce(ctx, topic, key, value, uint32(priority))
@@ -278,7 +278,7 @@ func (h *Harness) PublishBatch(ctx context.Context, topic string, items []BatchI
 		}
 
 		var (
-			results  = h.app.Broker().PublishBatch(topic, msgs)
+			results  = h.app.Broker().PublishBatch(ctx, topic, msgs)
 			ok       = 0
 			firstErr error
 		)

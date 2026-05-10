@@ -1,8 +1,8 @@
 package balancer
 
 import (
-	"math/rand/v2"
-	"sync"
+	stdctx "context"
+	"log"
 	"sync/atomic"
 	"time"
 
@@ -16,6 +16,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/layers"
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
 	"github.com/puzpuzpuz/xsync/v3"
+	"golang.org/x/sync/errgroup"
 	"gonum.org/v1/gonum/stat"
 
 	_ "github.com/gomlx/gomlx/backends/simplego"
@@ -51,8 +52,8 @@ type DQNBalancer struct {
 	replayBuffer *nn.ReplayBuffer
 
 	expCh  chan nn.Transition
-	stopCh chan struct{}
-	done   chan struct{}
+	eg     *errgroup.Group
+	cancel stdctx.CancelFunc
 
 	fallbackRR     *RoundRobin
 	fallbackRatio  float64
@@ -60,7 +61,7 @@ type DQNBalancer struct {
 	baseThroughput atomic.Int64
 	fallbackActive atomic.Bool
 
-	stateMu        sync.Mutex
+	stateMu        *xsync.RBMutex
 	loads          []float64
 	predictedLoads []float64
 	msgRate        float64
@@ -81,9 +82,6 @@ type DQNBalancer struct {
 	policyStateBuf []float64
 	policySnapBuf  [2]policySnap
 	policySnapIdx  int
-
-	rng   *rand.Rand
-	rngMu sync.Mutex
 }
 
 // DQNOption configures a DQNBalancer.
@@ -105,6 +103,7 @@ func WithDQNTrainEvery(n int) DQNOption        { return func(d *DQNBalancer) { d
 func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 	d := &DQNBalancer{
 		weightsMu:     xsync.NewRBMutex(),
+		stateMu:       xsync.NewRBMutex(),
 		numPartitions: numPartitions,
 		hiddenSize:    DefaultDQNHiddenSize,
 		epsilon:       DefaultDQNEpsilon,
@@ -118,8 +117,6 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 		fallbackRatio: DefaultDQNFallbackRatio,
 		loadThreshold: DefaultDQNLoadThreshold,
 		expCh:         make(chan nn.Transition, DefaultDQNExpChannelSize),
-		stopCh:        make(chan struct{}),
-		done:          make(chan struct{}),
 
 		loads:          make([]float64, numPartitions),
 		predictedLoads: make([]float64, numPartitions),
@@ -133,10 +130,29 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 	d.policyStateBuf = make([]float64, d.stateSize)
 	d.policySnapBuf[0].state = make([]float64, d.stateSize)
 	d.policySnapBuf[1].state = make([]float64, d.stateSize)
-	d.rng = rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
 	d.initGoMLX()
-	go d.trainLoop()
-	go d.policyLoop()
+
+	ctx, cancel := stdctx.WithCancel(stdctx.Background())
+	d.cancel = cancel
+	d.eg, _ = errgroup.WithContext(ctx)
+	d.eg.Go(func() error {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[dqn-balancer] trainLoop panic: %v", r)
+			}
+		}()
+		d.trainLoop(ctx)
+		return nil
+	})
+	d.eg.Go(func() error {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[dqn-balancer] policyLoop panic: %v", r)
+			}
+		}()
+		d.policyLoop(ctx)
+		return nil
+	})
 
 	return d
 }
@@ -283,12 +299,12 @@ func (d *DQNBalancer) SetBaseThroughput(t float64) {
 
 func (d *DQNBalancer) SetPredictedLoads(predicted []float64) {
 	d.stateMu.Lock()
-	defer d.stateMu.Unlock()
 	if cap(d.predictedLoads) < len(predicted) {
 		d.predictedLoads = make([]float64, len(predicted))
 	}
 	d.predictedLoads = d.predictedLoads[:len(predicted)]
 	copy(d.predictedLoads, predicted)
+	d.stateMu.Unlock()
 }
 
 func (d *DQNBalancer) IsFallbackActive() bool {
@@ -300,12 +316,11 @@ func (d *DQNBalancer) DroppedExperience() int64 {
 }
 
 func (d *DQNBalancer) Stop() {
-	close(d.stopCh)
-	<-d.done
+	d.cancel()
+	_ = d.eg.Wait()
 }
 
-func (d *DQNBalancer) trainLoop() {
-	defer close(d.done)
+func (d *DQNBalancer) trainLoop(ctx stdctx.Context) {
 	steps := 0
 
 	for {
@@ -316,7 +331,7 @@ func (d *DQNBalancer) trainLoop() {
 			if steps%d.trainEvery == 0 {
 				d.trainStep()
 			}
-		case <-d.stopCh:
+		case <-ctx.Done():
 			for {
 				select {
 				case t := <-d.expCh:
@@ -329,16 +344,16 @@ func (d *DQNBalancer) trainLoop() {
 	}
 }
 
-func (d *DQNBalancer) policyLoop() {
+func (d *DQNBalancer) policyLoop(ctx stdctx.Context) {
 	ticker := newTicker100ms()
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			d.stateMu.Lock()
+			srt := d.stateMu.RLock()
 			d.buildStateInto(d.policyStateBuf)
-			d.stateMu.Unlock()
+			d.stateMu.RUnlock(srt)
 
 			rt := d.weightsMu.RLock()
 			qValues := d.forward(d.policyStateBuf)
@@ -356,7 +371,7 @@ func (d *DQNBalancer) policyLoop() {
 
 			d.prevSnap.Store(d.currSnap.Load())
 			d.currSnap.Store(snap)
-		case <-d.stopCh:
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -394,6 +409,15 @@ func computeReward(m broker.Metrics) float64 {
 		}
 	}
 
+	meanLoad := 0.0
+	for _, l := range m.PartitionLoads {
+		meanLoad += l
+	}
+	meanLoad /= float64(len(m.PartitionLoads))
+
+	if meanLoad > 0.7 {
+		return 1.5*imbalancePenalty + 0.1*throughputReward
+	}
 	return 0.5*imbalancePenalty + 0.5*throughputReward
 }
 

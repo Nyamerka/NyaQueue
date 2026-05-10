@@ -2,9 +2,10 @@ package broker
 
 import (
 	"encoding/binary"
-	"errors"
 	"sync"
 	"time"
+
+	"github.com/samber/oops"
 )
 
 // Wire layout v1: [version:1][priority:1][timestamp:8][keyLen:4][key:keyLen][value:...]
@@ -123,21 +124,21 @@ func (m *Message) marshalInto(buf []byte) {
 
 func UnmarshalMessage(data []byte) (*Message, error) {
 	if len(data) < metadataSize {
-		return nil, errors.New("message data too short")
+		return nil, oops.Errorf("message data too short: got %d bytes, need at least %d", len(data), metadataSize)
 	}
 
 	version := data[0]
 
 	if version == currentVersion {
 		if len(data) < v1MetadataSize {
-			return nil, errors.New("v1 message data too short")
+			return nil, oops.Errorf("v1 message data too short: got %d bytes, need at least %d", len(data), v1MetadataSize)
 		}
 		priority := data[v1PriorityOffset]
 		timestamp := int64(binary.BigEndian.Uint64(data[v1TimestampOff:v1KeyLenOff]))
 		keyLen := int(binary.BigEndian.Uint32(data[v1KeyLenOff:v1KeyOff]))
 
 		if len(data) < v1MetadataSize+keyLen {
-			return nil, errors.New("v1 message data truncated")
+			return nil, oops.Errorf("v1 message truncated: got %d bytes, need %d (keyLen=%d)", len(data), v1MetadataSize+keyLen, keyLen)
 		}
 
 		key := make([]byte, keyLen)
@@ -157,13 +158,12 @@ func UnmarshalMessage(data []byte) (*Message, error) {
 		}, nil
 	}
 
-	// v0 (legacy) format: no version byte, first byte is priority.
 	priority := data[0]
 	timestamp := int64(binary.BigEndian.Uint64(data[timestampOffset:keyLenOffset]))
 	keyLen := int(binary.BigEndian.Uint32(data[keyLenOffset:keyOffset]))
 
 	if len(data) < metadataSize+keyLen {
-		return nil, errors.New("message data truncated")
+		return nil, oops.Errorf("v0 message truncated: got %d bytes, need %d (keyLen=%d)", len(data), metadataSize+keyLen, keyLen)
 	}
 
 	key := make([]byte, keyLen)
@@ -186,13 +186,13 @@ func UnmarshalMessage(data []byte) (*Message, error) {
 // Handles both v0 and v1 formats.
 func UnmarshalHeader(data []byte) (MessageHeader, error) {
 	if len(data) < HeaderSize {
-		return MessageHeader{}, errors.New("data too short for header")
+		return MessageHeader{}, oops.Errorf("data too short for header: got %d bytes, need at least %d", len(data), HeaderSize)
 	}
 
 	version := data[0]
 	if version == currentVersion {
 		if len(data) < v1TimestampOff+timestampFieldSize {
-			return MessageHeader{}, errors.New("v1 data too short for header")
+			return MessageHeader{}, oops.Errorf("v1 header too short: got %d bytes, need at least %d", len(data), v1TimestampOff+timestampFieldSize)
 		}
 		return MessageHeader{
 			Version:   version,

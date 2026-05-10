@@ -1,8 +1,9 @@
 package scheduler
 
 import (
+	stdctx "context"
+	"log"
 	"math/rand/v2"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
 	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/samber/oops"
+	"golang.org/x/sync/errgroup"
 
 	_ "github.com/gomlx/gomlx/backends/simplego"
 )
@@ -50,10 +52,10 @@ type DQNScheduler struct {
 	replayBuffer *nn.ReplayBuffer
 
 	expCh  chan nn.Transition
-	stopCh chan struct{}
-	done   chan struct{}
+	eg     *errgroup.Group
+	cancel stdctx.CancelFunc
 
-	stateMu   sync.Mutex
+	stateMu   *xsync.RBMutex
 	lastState []float64
 	lastPI    atomic.Pointer[broker.PriorityIndex]
 	threshold int
@@ -62,16 +64,13 @@ type DQNScheduler struct {
 
 	cachedThreshold atomic.Int32
 
-	// prevSnap / currSnap: policyLoop writes, OnMetrics reads.
 	prevSnap atomic.Pointer[schedPolicySnap]
 	currSnap atomic.Pointer[schedPolicySnap]
 
-	latencyMu     sync.Mutex
-	latencySums   [broker.MaxPriority]float64
-	latencyCounts [broker.MaxPriority]int
+	latencySums   [broker.MaxPriority]atomic.Uint64
+	latencyCounts [broker.MaxPriority]atomic.Uint64
 
-	rng   *rand.Rand
-	rngMu sync.Mutex
+	rng *rand.Rand
 }
 
 const (
@@ -93,6 +92,7 @@ func WithDQNSchedBatchSize(n int) DQNSchedOption { return func(d *DQNScheduler) 
 func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 	d := &DQNScheduler{
 		weightsMu:    xsync.NewRBMutex(),
+		stateMu:      xsync.NewRBMutex(),
 		hiddenSize:   DefaultDQNSchedHiddenSize,
 		stateSize:    DefaultDQNSchedStateSize,
 		numActions:   DefaultDQNSchedActions,
@@ -105,8 +105,6 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 		replayBuffer: nn.NewReplayBuffer(DefaultDQNSchedReplayBufSize),
 		threshold:    DefaultDQNSchedThreshold,
 		expCh:        make(chan nn.Transition, DefaultDQNSchedExpChSize),
-		stopCh:       make(chan struct{}),
-		done:         make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -117,8 +115,27 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 	d.cachedThreshold.Store(int32(d.threshold))
 	d.initGoMLX()
 
-	go d.trainLoop()
-	go d.policyLoop()
+	ctx, cancel := stdctx.WithCancel(stdctx.Background())
+	d.cancel = cancel
+	d.eg, _ = errgroup.WithContext(ctx)
+	d.eg.Go(func() error {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[dqn-scheduler] trainLoop panic: %v", r)
+			}
+		}()
+		d.trainLoop(ctx)
+		return nil
+	})
+	d.eg.Go(func() error {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[dqn-scheduler] policyLoop panic: %v", r)
+			}
+		}()
+		d.policyLoop(ctx)
+		return nil
+	})
 
 	return d
 }
@@ -187,25 +204,19 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 
 	d.lastPI.Store(pi)
 
-	d.stateMu.Lock()
+	srt := d.stateMu.RLock()
 	fallback := d.fallbackFIFO
-	d.stateMu.Unlock()
+	d.stateMu.RUnlock(srt)
 
 	if fallback {
 		return d.fifoFallback(partition, consumerOffset)
 	}
 
-	d.rngMu.Lock()
 	explore := d.rng.Float64() < d.epsilon
-	var randThreshold int
-	if explore {
-		randThreshold = d.rng.IntN(d.numActions)
-	}
-	d.rngMu.Unlock()
 
 	var threshold int
 	if explore {
-		threshold = randThreshold
+		threshold = d.rng.IntN(d.numActions)
 	} else {
 		threshold = int(d.cachedThreshold.Load())
 	}
@@ -220,15 +231,13 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 		return nil, 0, err
 	}
 
-	latency := time.Since(entry.ArrivedAt).Seconds()
+	latencyNs := uint64(time.Since(entry.ArrivedAt).Nanoseconds())
 	level := int(msg.Header.Priority)
 	if level >= broker.MaxPriority {
 		level = broker.MaxPriority - 1
 	}
-	d.latencyMu.Lock()
-	d.latencySums[level] += latency
-	d.latencyCounts[level]++
-	d.latencyMu.Unlock()
+	d.latencySums[level].Add(latencyNs)
+	d.latencyCounts[level].Add(1)
 
 	return msg, uint64(entry.WalOffset), nil
 }
@@ -259,15 +268,12 @@ func (d *DQNScheduler) OnMetrics(m broker.Metrics) {
 }
 
 func (d *DQNScheduler) computePerPriorityReward() float64 {
-	d.latencyMu.Lock()
-	var sums [broker.MaxPriority]float64
-	var counts [broker.MaxPriority]int
-	copy(sums[:], d.latencySums[:])
-	copy(counts[:], d.latencyCounts[:])
-	// Reset windows for next interval.
-	d.latencySums = [broker.MaxPriority]float64{}
-	d.latencyCounts = [broker.MaxPriority]int{}
-	d.latencyMu.Unlock()
+	var sums [broker.MaxPriority]uint64
+	var counts [broker.MaxPriority]uint64
+	for i := 0; i < broker.MaxPriority; i++ {
+		sums[i] = d.latencySums[i].Swap(0)
+		counts[i] = d.latencyCounts[i].Swap(0)
+	}
 
 	var reward float64
 	var totalWeight float64
@@ -275,10 +281,9 @@ func (d *DQNScheduler) computePerPriorityReward() float64 {
 		if counts[level] == 0 {
 			continue
 		}
-		meanLatency := sums[level] / float64(counts[level])
-		// Weight: higher priority (higher index) = higher weight.
+		meanLatencySec := float64(sums[level]) / float64(counts[level]) / 1e9
 		weight := float64(level + 1)
-		reward -= meanLatency * weight
+		reward -= meanLatencySec * weight
 		totalWeight += weight
 	}
 	if totalWeight > 0 {
@@ -289,16 +294,16 @@ func (d *DQNScheduler) computePerPriorityReward() float64 {
 
 func (d *DQNScheduler) SetFallbackFIFO(on bool) {
 	d.stateMu.Lock()
-	defer d.stateMu.Unlock()
 	d.fallbackFIFO = on
+	d.stateMu.Unlock()
 }
 
 func (d *DQNScheduler) Stop() {
-	close(d.stopCh)
-	<-d.done
+	d.cancel()
+	_ = d.eg.Wait()
 }
 
-func (d *DQNScheduler) policyLoop() {
+func (d *DQNScheduler) policyLoop(ctx stdctx.Context) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -333,14 +338,14 @@ func (d *DQNScheduler) policyLoop() {
 			d.stateMu.Lock()
 			d.threshold = threshold
 			d.stateMu.Unlock()
-		case <-d.stopCh:
+
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (d *DQNScheduler) trainLoop() {
-	defer close(d.done)
+func (d *DQNScheduler) trainLoop(ctx stdctx.Context) {
 	steps := 0
 
 	for {
@@ -351,7 +356,7 @@ func (d *DQNScheduler) trainLoop() {
 			if steps%d.trainEvery == 0 {
 				d.trainStep()
 			}
-		case <-d.stopCh:
+		case <-ctx.Done():
 			for {
 				select {
 				case t := <-d.expCh:
@@ -387,21 +392,18 @@ func (d *DQNScheduler) buildState(pi *broker.PriorityIndex) []float64 {
 		totalDepth += dist[i]
 	}
 
-	d.latencyMu.Lock()
 	for i := 0; i < levels; i++ {
 		if waitIdx := levels + i; waitIdx < d.stateSize {
-			if d.latencyCounts[i] > 0 {
-				state[waitIdx] = d.latencySums[i] / float64(d.latencyCounts[i])
+			cnt := d.latencyCounts[i].Load()
+			if cnt > 0 {
+				sumNs := d.latencySums[i].Load()
+				state[waitIdx] = float64(sumNs) / float64(cnt) / 1e9
 			}
 		}
 	}
-	d.latencyMu.Unlock()
 
 	if depthIdx := levels * 2; depthIdx < d.stateSize {
 		state[depthIdx] = float64(totalDepth)
-	}
-	if lagIdx := levels*2 + 1; lagIdx < d.stateSize {
-		state[lagIdx] = 0
 	}
 
 	return state

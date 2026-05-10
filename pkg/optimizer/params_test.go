@@ -91,7 +91,7 @@ func (s *ParamsSuite) TestActiveParams() {
 
 func (s *ParamsSuite) TestDefaultTunableParams() {
 	params := DefaultTunableParams()
-	require.Equal(s.T(), 22, len(params))
+	require.Equal(s.T(), 10, len(params))
 
 	for _, p := range params {
 		require.Less(s.T(), p.Min, p.Max)

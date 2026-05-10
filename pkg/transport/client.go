@@ -52,7 +52,7 @@ func (c *Client) Produce(ctx context.Context, topic string, key, value []byte, p
 		Priority: priority,
 	})
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, oops.Wrapf(err, "produce topic=%s", topic)
 	}
 	return resp.Partition, resp.Offset, nil
 }
@@ -64,7 +64,7 @@ func (c *Client) ProduceBatch(ctx context.Context, topic string, msgs []*pb.Prod
 		Messages: msgs,
 	})
 	if err != nil {
-		return nil, err
+		return nil, oops.Wrapf(err, "produce-batch topic=%s count=%d", topic, len(msgs))
 	}
 	return resp.Results, nil
 }
@@ -77,7 +77,7 @@ func (c *Client) Consume(ctx context.Context, topic, group string, partition int
 		MaxBytes:  maxBytes,
 	})
 	if err != nil {
-		return nil, err
+		return nil, oops.Wrapf(err, "consume topic=%s group=%s partition=%d", topic, group, partition)
 	}
 	return resp.Messages, nil
 }
@@ -89,7 +89,10 @@ func (c *Client) Commit(ctx context.Context, topic, group string, partition int3
 		Partition: partition,
 		Offset:    offset,
 	})
-	return err
+	if err != nil {
+		return oops.Wrapf(err, "commit topic=%s group=%s partition=%d offset=%d", topic, group, partition, offset)
+	}
+	return nil
 }
 
 func (c *Client) CreateTopic(ctx context.Context, topic string, numPartitions int32, mode pb.ScheduleMode) error {
@@ -100,24 +103,34 @@ func (c *Client) CreateTopic(ctx context.Context, topic string, numPartitions in
 			Mode: mode,
 		},
 	})
-	return mapClientError(err)
+	if err != nil {
+		return oops.Wrapf(mapClientError(err), "create-topic %s partitions=%d", topic, numPartitions)
+	}
+	return nil
 }
 
 func (c *Client) DeleteTopic(ctx context.Context, topic string) error {
 	_, err := c.client.DeleteTopic(ctx, &pb.DeleteTopicRequest{Topic: topic})
-	return mapClientError(err)
+	if err != nil {
+		return oops.Wrapf(mapClientError(err), "delete-topic %s", topic)
+	}
+	return nil
 }
 
 func (c *Client) ListTopics(ctx context.Context) ([]*pb.TopicInfo, error) {
 	resp, err := c.client.ListTopics(ctx, &pb.ListTopicsRequest{})
 	if err != nil {
-		return nil, err
+		return nil, oops.Wrapf(err, "list-topics")
 	}
 	return resp.Topics, nil
 }
 
 func (c *Client) GetMetrics(ctx context.Context) (*pb.MetricsResponse, error) {
-	return c.client.GetMetrics(ctx, &pb.MetricsRequest{})
+	resp, err := c.client.GetMetrics(ctx, &pb.MetricsRequest{})
+	if err != nil {
+		return nil, oops.Wrapf(err, "get-metrics")
+	}
+	return resp, nil
 }
 
 // BufferedProducer accumulates messages and sends them in batches via a single

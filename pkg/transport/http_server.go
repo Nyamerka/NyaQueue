@@ -207,7 +207,7 @@ func (s *HTTPServer) handleProduce(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	batchResults := s.broker.PublishBatch(topic, msgs)
+	batchResults := s.broker.PublishBatch(r.Context(), topic, msgs)
 	results := make([]HTTPProduceResult, len(batchResults))
 	for i, br := range batchResults {
 		if br.Err != nil {

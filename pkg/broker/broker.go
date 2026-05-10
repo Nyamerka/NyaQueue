@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/samber/oops"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -60,7 +61,8 @@ type Broker struct {
 	backpressure *BackpressureController
 	offsetStore  *OffsetStore
 
-	stopCh chan struct{}
+	eg     *errgroup.Group
+	cancel context.CancelFunc
 }
 
 type ioGate struct {
@@ -80,7 +82,6 @@ func New(cfg Config, dataDir string, bal Balancer, offsetStore *OffsetStore) *Br
 		balancer:    bal,
 		schedulers:  make(map[string]Scheduler),
 		offsetStore: offsetStore,
-		stopCh:      make(chan struct{}),
 	}
 
 	codec := NewCodec(cfg.CompressionType)
@@ -250,7 +251,7 @@ func (b *Broker) decompressMessage(msg *Message) error {
 	return nil
 }
 
-func (b *Broker) Publish(topicName string, msg *Message) (partition int, offset uint64, err error) {
+func (b *Broker) Publish(ctx context.Context, topicName string, msg *Message) (partition int, offset uint64, err error) {
 	snap := b.snap.Load()
 	if snap.cfg.MaxMessageBytes > 0 && len(msg.Key)+len(msg.Value) > snap.cfg.MaxMessageBytes {
 		return 0, 0, oops.Wrapf(ErrMessageTooLarge, "size %d > limit %d",
@@ -303,7 +304,7 @@ type PublishResult struct {
 	Err       error
 }
 
-func (b *Broker) PublishBatch(topicName string, msgs []*Message) []PublishResult {
+func (b *Broker) PublishBatch(ctx context.Context, topicName string, msgs []*Message) []PublishResult {
 	results := make([]PublishResult, len(msgs))
 
 	b.mu.RLock()
@@ -411,7 +412,7 @@ func (b *Broker) PublishBatch(topicName string, msgs []*Message) []PublishResult
 			defer wg.Done()
 
 			gate := snap.gate
-			if err := gate.sem.Acquire(context.Background(), 1); err != nil {
+			if err := gate.sem.Acquire(ctx, 1); err != nil {
 				for _, item := range batch {
 					results[item.idx].Err = err
 				}
@@ -583,16 +584,44 @@ func (b *Broker) ApplyConfig(cfg Config) error {
 }
 
 func (b *Broker) Start() {
-	go b.metricsLoop()
-	go b.retentionLoop()
-	go b.sessionTimeoutLoop()
+	ctx, cancel := context.WithCancel(context.Background())
+	b.cancel = cancel
+	b.eg, _ = errgroup.WithContext(ctx)
+
+	b.eg.Go(func() error {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[broker] metricsLoop panic: %v", r)
+			}
+		}()
+		b.metricsLoop(ctx)
+		return nil
+	})
+	b.eg.Go(func() error {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[broker] retentionLoop panic: %v", r)
+			}
+		}()
+		b.retentionLoop(ctx)
+		return nil
+	})
+	b.eg.Go(func() error {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[broker] sessionTimeoutLoop panic: %v", r)
+			}
+		}()
+		b.sessionTimeoutLoop(ctx)
+		return nil
+	})
 }
 
-func (b *Broker) metricsLoop() {
+func (b *Broker) metricsLoop(ctx context.Context) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
-	const warmupTicks = 50 // 5 seconds at 100ms
+	const warmupTicks = 50
 	const historyCapacity = 100
 
 	for {
@@ -603,9 +632,7 @@ func (b *Broker) metricsLoop() {
 			if b.predictor != nil && len(snap.PartitionLoads) > 0 {
 				b.predictor.Update(snap.PartitionLoads)
 				snap.PredictedLoads = b.predictor.PredictAll(8)
-				b.metrics.mu.Lock()
-				b.metrics.lastSnap = snap
-				b.metrics.mu.Unlock()
+				b.metrics.lastSnap.Store(&snap)
 			}
 
 			b.mu.RLock()
@@ -660,15 +687,13 @@ func (b *Broker) metricsLoop() {
 					setter.SetBaseThroughput(baseTP)
 				}
 			}
-		case <-b.stopCh:
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-// retentionLoop implements dual-threshold retention (like Kafka log.retention.ms + log.retention.bytes).
-// Time-based and size-based retention have priority; commit-floor is fallback when neither is configured.
-func (b *Broker) retentionLoop() {
+func (b *Broker) retentionLoop(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -713,13 +738,13 @@ func (b *Broker) retentionLoop() {
 					}
 				}
 			}
-		case <-b.stopCh:
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (b *Broker) sessionTimeoutLoop() {
+func (b *Broker) sessionTimeoutLoop(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -731,7 +756,7 @@ func (b *Broker) sessionTimeoutLoop() {
 				continue
 			}
 			b.offsetStore.ExpireSessions(time.Duration(cfg.ConsumerSessionTimeoutMs) * time.Millisecond)
-		case <-b.stopCh:
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -742,7 +767,12 @@ type Stopper interface {
 }
 
 func (b *Broker) Stop() {
-	close(b.stopCh)
+	if b.cancel != nil {
+		b.cancel()
+	}
+	if b.eg != nil {
+		_ = b.eg.Wait()
+	}
 
 	b.mu.Lock()
 	defer b.mu.Unlock()

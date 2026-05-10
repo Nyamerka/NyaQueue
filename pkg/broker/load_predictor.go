@@ -1,9 +1,13 @@
 package broker
 
 import (
-	"sync"
+	"context"
+	"log"
 	"sync/atomic"
 	"time"
+
+	"github.com/puzpuzpuz/xsync/v3"
+	"golang.org/x/sync/errgroup"
 )
 
 type PartitionPrediction struct {
@@ -17,29 +21,28 @@ type PartitionPrediction struct {
 // Pre-allocated buffers eliminate per-predict allocations on the hot path.
 type LoadPredictor struct {
 	predictions atomic.Value // stores []PartitionPrediction
-	mu          sync.Mutex
-	history     map[int]*RingBuffer
+	history     *xsync.MapOf[int, *RingBuffer]
 	window      int
 	horizon     int
 	interval    time.Duration
-	stopCh      chan struct{}
+	eg          *errgroup.Group
+	cancel      context.CancelFunc
 
 	predBuf   []float64
 	centerBuf []float64
 	arBuf     []float64
 	coeffBuf  []float64
 	valsBuf   []float64
-	rBuf      []float64 // autocorrelation buffer for yuleWalker
-	aOldBuf   []float64 // Levinson-Durbin scratch for yuleWalker
+	rBuf      []float64
+	aOldBuf   []float64
 }
 
 func NewLoadPredictor(window, horizon int, interval time.Duration) *LoadPredictor {
 	lp := &LoadPredictor{
-		history:   make(map[int]*RingBuffer),
+		history:   xsync.NewMapOf[int, *RingBuffer](),
 		window:    window,
 		horizon:   horizon,
 		interval:  interval,
-		stopCh:    make(chan struct{}),
 		predBuf:   make([]float64, horizon),
 		centerBuf: make([]float64, window),
 		arBuf:     make([]float64, window+horizon),
@@ -61,26 +64,18 @@ func (lp *LoadPredictor) Predictions() []PartitionPrediction {
 }
 
 func (lp *LoadPredictor) Update(loads []float64) {
-	lp.mu.Lock()
 	for i, load := range loads {
-		buf, ok := lp.history[i]
-		if !ok {
-			buf = NewRingBuffer(lp.window)
-			lp.history[i] = buf
-		}
+		buf, _ := lp.history.LoadOrCompute(i, func() *RingBuffer {
+			return NewRingBuffer(lp.window)
+		})
 		buf.Push(load)
 	}
-	lp.mu.Unlock()
 	lp.predict()
 }
 
 func (lp *LoadPredictor) predict() {
-	// RingBuffer is lock-free, so we can iterate history under lp.mu without
-	// creating a map snapshot — eliminates per-predict allocation.
-	lp.mu.Lock()
-
-	preds := make([]PartitionPrediction, 0, len(lp.history))
-	for id, buf := range lp.history {
+	var preds []PartitionPrediction
+	lp.history.Range(func(id int, buf *RingBuffer) bool {
 		n := buf.ValuesInto(lp.valsBuf)
 		vals := lp.valsBuf[:n]
 
@@ -99,8 +94,8 @@ func (lp *LoadPredictor) predict() {
 			Current:     current,
 			Predicted:   predCopy,
 		})
-	}
-	lp.mu.Unlock()
+		return true
+	})
 
 	lp.predictions.Store(preds)
 }
@@ -122,30 +117,41 @@ func (lp *LoadPredictor) PredictAll(horizon int) []float64 {
 }
 
 func (lp *LoadPredictor) Start() {
-	go func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	lp.cancel = cancel
+	lp.eg, _ = errgroup.WithContext(ctx)
+	lp.eg.Go(func() error {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[load-predictor] loop panic: %v", r)
+			}
+		}()
 		ticker := time.NewTicker(lp.interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				lp.predict()
-			case <-lp.stopCh:
-				return
+			case <-ctx.Done():
+				return nil
 			}
 		}
-	}()
+	})
 }
 
 func (lp *LoadPredictor) Stop() {
-	close(lp.stopCh)
+	if lp.cancel != nil {
+		lp.cancel()
+	}
+	if lp.eg != nil {
+		_ = lp.eg.Wait()
+	}
 }
 
 // RemovePartition deletes stored history for the given partition ID,
 // preventing unbounded memory growth when topics/partitions are deleted.
 func (lp *LoadPredictor) RemovePartition(partID int) {
-	lp.mu.Lock()
-	delete(lp.history, partID)
-	lp.mu.Unlock()
+	lp.history.Delete(partID)
 }
 
 // arPredictInto forecasts `horizon` steps ahead using AR(p) autoregression.
@@ -204,10 +210,11 @@ func (lp *LoadPredictor) arPredictInto(vals []float64, horizon int) []float64 {
 	buf := lp.arBuf[:needed]
 	copy(buf, centered)
 
+	order := len(coeffs)
 	for k := 0; k < horizon; k++ {
 		idx := n + k
 		pred := 0.0
-		for j := 0; j < p; j++ {
+		for j := 0; j < order; j++ {
 			pred += coeffs[j] * buf[idx-1-j]
 		}
 		buf[idx] = pred

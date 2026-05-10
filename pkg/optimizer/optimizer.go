@@ -1,12 +1,14 @@
 package optimizer
 
 import (
+	"context"
 	"log"
 	"math"
 	"sync"
 	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	"golang.org/x/sync/errgroup"
 )
 
 // PilotData holds results from pilot runs used for Lasso calibration.
@@ -53,7 +55,8 @@ type Optimizer struct {
 
 	currentVals []float64
 	prevMetrics *broker.Metrics
-	stopCh      chan struct{}
+	eg          *errgroup.Group
+	cancel      context.CancelFunc
 
 	throughputWindow []float64
 	windowCap        int
@@ -112,21 +115,36 @@ func NewOptimizer(b *broker.Broker, params []TunableParam, optCfg OptimizerConfi
 		warmup:           optCfg.WarmupTicks,
 		hysteresis:       optCfg.Hysteresis,
 		currentVals:      currentVals,
-		stopCh:           make(chan struct{}),
 		windowCap:        rewardWindowCap,
 		throughputWindow: make([]float64, 0, rewardWindowCap),
 	}
 }
 
 func (o *Optimizer) Start() {
-	go o.loop()
+	ctx, cancel := context.WithCancel(context.Background())
+	o.cancel = cancel
+	o.eg, _ = errgroup.WithContext(ctx)
+	o.eg.Go(func() error {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[optimizer] loop panic: %v", r)
+			}
+		}()
+		o.loop(ctx)
+		return nil
+	})
 }
 
 func (o *Optimizer) Stop() {
-	close(o.stopCh)
+	if o.cancel != nil {
+		o.cancel()
+	}
+	if o.eg != nil {
+		_ = o.eg.Wait()
+	}
 }
 
-func (o *Optimizer) loop() {
+func (o *Optimizer) loop(ctx context.Context) {
 	ticker := time.NewTicker(o.interval)
 	defer ticker.Stop()
 
@@ -134,7 +152,7 @@ func (o *Optimizer) loop() {
 		select {
 		case <-ticker.C:
 			o.step()
-		case <-o.stopCh:
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -151,7 +169,15 @@ func (o *Optimizer) step() {
 	action := o.ddpg.Act(state)
 
 	if o.ticks > o.warmup {
-		o.applyAction(action)
+		safe := true
+		if metrics.MsgRate > 0 && metrics.ConsumeRate > 0 {
+			if metrics.ConsumeRate/metrics.MsgRate < 0.7 {
+				safe = false
+			}
+		}
+		if safe {
+			o.applyAction(action)
+		}
 	}
 
 	if o.prevMetrics != nil {
@@ -176,12 +202,13 @@ func (o *Optimizer) applyAction(action []float64) {
 		if i >= len(o.params) {
 			break
 		}
-		p := o.params[i]
-		scale := p.Max - p.Min
-		delta := a * scale
-		rawVal := Denormalize(o.currentVals[i], p.Min, p.Max)
-		newVal := ClipAction(rawVal, delta, p.Min, p.Max)
-		newNorm := Normalize(newVal, p.Min, p.Max)
+		newNorm := (a + 1.0) / 2.0
+		if newNorm < 0 {
+			newNorm = 0
+		}
+		if newNorm > 1 {
+			newNorm = 1
+		}
 
 		if math.Abs(newNorm-o.currentVals[i]) < o.hysteresis {
 			continue
@@ -204,7 +231,12 @@ func (o *Optimizer) applyAction(action []float64) {
 }
 
 func (o *Optimizer) computeReward(m *broker.Metrics) float64 {
-	o.throughputWindow = append(o.throughputWindow, m.Throughput)
+	delivered := m.ConsumeRate
+	if delivered == 0 {
+		delivered = m.Throughput
+	}
+
+	o.throughputWindow = append(o.throughputWindow, delivered)
 	if len(o.throughputWindow) > o.windowCap {
 		o.throughputWindow = o.throughputWindow[1:]
 	}
@@ -219,7 +251,7 @@ func (o *Optimizer) computeReward(m *broker.Metrics) float64 {
 
 	var throughputReward float64
 	if baseline > 1 {
-		throughputReward = (m.Throughput - baseline) / baseline
+		throughputReward = (delivered - baseline) / baseline
 	}
 
 	latencyPenalty := 0.0
@@ -232,11 +264,11 @@ func (o *Optimizer) computeReward(m *broker.Metrics) float64 {
 	for _, d := range m.QueueDepth {
 		totalDepth += d
 	}
-	if totalDepth > 10000 {
-		queuePenalty = -float64(totalDepth) / 100000.0
+	if totalDepth > 1000 {
+		queuePenalty = -float64(totalDepth) / 10000.0
 	}
 
-	reward := throughputReward + 0.3*latencyPenalty + 0.5*queuePenalty
+	reward := throughputReward + 0.3*latencyPenalty + 1.5*queuePenalty
 
 	if reward < -2.0 {
 		reward = -2.0

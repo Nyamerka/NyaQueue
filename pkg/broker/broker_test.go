@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -57,7 +58,7 @@ func (s *BrokerSuite) TestPublishToUnknownTopic() {
 	b, cleanup := s.newBroker()
 	defer cleanup()
 
-	_, _, err := b.Publish("nonexistent", NewMessage(0, nil, nil))
+	_, _, err := b.Publish(context.Background(), "nonexistent", NewMessage(0, nil, nil))
 	require.Error(s.T(), err)
 }
 
@@ -71,7 +72,7 @@ func (s *BrokerSuite) TestPublishAndConsume() {
 	b.SetScheduler("t", fifoScheduler{})
 
 	msg := NewMessage(0, []byte("k"), []byte("hello"))
-	part, off, err := b.Publish("t", msg)
+	part, off, err := b.Publish(context.Background(), "t", msg)
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), 0, part)
 	require.Equal(s.T(), uint64(1), off)
@@ -103,7 +104,7 @@ func (s *BrokerSuite) TestPublishBatch() {
 		msgs[i] = NewMessage(0, []byte("k"), []byte("v"))
 	}
 
-	results := b.PublishBatch("t", msgs)
+	results := b.PublishBatch(context.Background(), "t", msgs)
 	require.Len(s.T(), results, 20)
 
 	for _, r := range results {
@@ -117,7 +118,7 @@ func (s *BrokerSuite) TestPublishBatchToUnknownTopic() {
 	defer cleanup()
 
 	msgs := []*Message{NewMessage(0, nil, nil)}
-	results := b.PublishBatch("nonexistent", msgs)
+	results := b.PublishBatch(context.Background(), "nonexistent", msgs)
 	require.Len(s.T(), results, 1)
 	require.Error(s.T(), results[0].Err)
 }
@@ -148,7 +149,7 @@ func (s *BrokerSuite) TestDeleteTopicCleansWAL() {
 	b.SetScheduler("wal-clean", fifoScheduler{})
 
 	msg := NewMessage(0, []byte("k"), []byte("v"))
-	_, _, err = b.Publish("wal-clean", msg)
+	_, _, err = b.Publish(context.Background(), "wal-clean", msg)
 	require.NoError(s.T(), err)
 
 	walDir := filepath.Join(dir, "wal-clean")
@@ -175,7 +176,7 @@ func (s *BrokerSuite) TestDeleteTopicCleansOffsets() {
 	b.SetScheduler("off-clean", fifoScheduler{})
 
 	msg := NewMessage(0, []byte("k"), []byte("v"))
-	_, _, err = b.Publish("off-clean", msg)
+	_, _, err = b.Publish(context.Background(), "off-clean", msg)
 	require.NoError(s.T(), err)
 
 	require.NoError(s.T(), b.Commit("grp", "off-clean", 0, 42))
@@ -199,7 +200,7 @@ func (s *BrokerSuite) TestDeleteAndRecreateTopic() {
 	b.SetScheduler("recreate", fifoScheduler{})
 
 	msg := NewMessage(0, []byte("k"), []byte("old"))
-	_, _, err := b.Publish("recreate", msg)
+	_, _, err := b.Publish(context.Background(), "recreate", msg)
 	require.NoError(s.T(), err)
 
 	require.NoError(s.T(), b.DeleteTopic("recreate"))
@@ -207,7 +208,7 @@ func (s *BrokerSuite) TestDeleteAndRecreateTopic() {
 	b.SetScheduler("recreate", fifoScheduler{})
 
 	msg2 := NewMessage(0, []byte("k"), []byte("new"))
-	_, _, err = b.Publish("recreate", msg2)
+	_, _, err = b.Publish(context.Background(), "recreate", msg2)
 	require.NoError(s.T(), err)
 
 	got, _, err := b.Consume("recreate", "grp", 0)
@@ -231,11 +232,11 @@ func (s *BrokerSuite) TestPublishRejectsOversizedMessage() {
 	b.SetScheduler("t", fifoScheduler{})
 
 	small := NewMessage(0, []byte("k"), make([]byte, 50))
-	_, _, err = b.Publish("t", small)
+	_, _, err = b.Publish(context.Background(), "t", small)
 	require.NoError(s.T(), err)
 
 	big := NewMessage(0, []byte("k"), make([]byte, 200))
-	_, _, err = b.Publish("t", big)
+	_, _, err = b.Publish(context.Background(), "t", big)
 	require.ErrorIs(s.T(), err, ErrMessageTooLarge)
 }
 
@@ -260,7 +261,7 @@ func (s *BrokerSuite) TestPublishBatchRejectsOversizedMessage() {
 		NewMessage(0, []byte("k"), make([]byte, 30)),
 	}
 
-	results := b.PublishBatch("t", msgs)
+	results := b.PublishBatch(context.Background(), "t", msgs)
 	require.Len(s.T(), results, 3)
 	require.NoError(s.T(), results[0].Err)
 	require.ErrorIs(s.T(), results[1].Err, ErrMessageTooLarge)
@@ -286,7 +287,7 @@ func (s *BrokerSuite) TestCompressionRoundTrip() {
 
 			original := []byte("hello world this is a compression test payload")
 			msg := NewMessage(0, []byte("k"), original)
-			_, _, err = b.Publish("t", msg)
+			_, _, err = b.Publish(context.Background(), "t", msg)
 			require.NoError(s.T(), err)
 
 			got, _, err := b.Consume("t", "grp", 0)
@@ -329,7 +330,7 @@ func (s *BrokerSuite) TestIOPoolConcurrentBatchWrites() {
 		msgs[i] = NewMessage(0, []byte("k"), []byte("v"))
 	}
 
-	results := b.PublishBatch("t", msgs)
+	results := b.PublishBatch(context.Background(), "t", msgs)
 	require.Len(s.T(), results, 100)
 
 	for _, r := range results {

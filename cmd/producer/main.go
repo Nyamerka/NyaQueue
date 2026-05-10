@@ -14,8 +14,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 
-	"github.com/Nyamerka/NyaQueue/pkg/metrics"
+	"net"
+	"net/http"
+
 	"github.com/Nyamerka/NyaQueue/pkg/transport"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -39,10 +42,14 @@ func main() {
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	m := registerMetrics(reg)
 
-	metricsSrv, err := metrics.Serve(cfg.MetricsAddr, reg)
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	ln, err := net.Listen("tcp", cfg.MetricsAddr)
 	if err != nil {
-		log.Fatalf("metrics serve: %v", err)
+		log.Fatalf("metrics listen: %v", err)
 	}
+	metricsSrv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go metricsSrv.Serve(ln)
 
 	client, err := transport.NewClient(cfg.Addr)
 	if err != nil {
@@ -54,7 +61,7 @@ func main() {
 	defer stop()
 
 	log.Printf("producer: addr=%s topic=%s scenario=%s workers=%d metrics=%s",
-		cfg.Addr, cfg.Topic, cfg.Scenario, cfg.Producers, metricsSrv.Addr())
+		cfg.Addr, cfg.Topic, cfg.Scenario, cfg.Producers, ln.Addr().String())
 
 	if err := Run(ctx, cfg, client, m); err != nil {
 		log.Fatalf("run: %v", err)
