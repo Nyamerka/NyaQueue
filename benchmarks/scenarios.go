@@ -22,6 +22,7 @@ type Scenario struct {
 	Priorities    [10]float64   // probability distribution over priority levels
 	Seed          int64         // RNG seed for deterministic replay; default 42
 	BatchBytes    int           // target batch size in bytes (0 = default 16KB)
+	LingerMs      int           // batch linger in ms for rate-limited producers (0 = default 1)
 }
 
 // Uniform generates steady, evenly distributed load at a rate both NyaQueue
@@ -36,6 +37,7 @@ func Uniform() Scenario {
 		RatePerSec: 1200,
 		Priorities: uniformPriorities(),
 		Seed:       42,
+		LingerMs:   1,
 	}
 }
 
@@ -51,6 +53,7 @@ func Skewed() Scenario {
 		SkewRatio:  0.8,
 		Priorities: uniformPriorities(),
 		Seed:       42,
+		LingerMs:   1,
 	}
 }
 
@@ -67,6 +70,7 @@ func Bursty() Scenario {
 		BurstFactor: 5,
 		Priorities:  uniformPriorities(),
 		Seed:        42,
+		LingerMs:    1,
 	}
 }
 
@@ -81,6 +85,7 @@ func GrowingLoad() Scenario {
 		RatePerSec: 600,
 		Priorities: uniformPriorities(),
 		Seed:       42,
+		LingerMs:   1,
 	}
 }
 
@@ -95,6 +100,7 @@ func MixedPriority() Scenario {
 		RatePerSec: 1200,
 		Priorities: [10]float64{0.30, 0.25, 0.15, 0.10, 0.08, 0.05, 0.03, 0.02, 0.01, 0.01},
 		Seed:       42,
+		LingerMs:   1,
 	}
 }
 
@@ -127,6 +133,7 @@ func SkewedK16() Scenario {
 		SkewRatio:     0.8,
 		Priorities:    uniformPriorities(),
 		Seed:          42,
+		LingerMs:      1,
 	}
 }
 

@@ -106,7 +106,7 @@ func resolvePartitions(ctx context.Context, client *transport.Client, cfg Config
 	for {
 		topics, err := client.ListTopics(ctx)
 		if err != nil {
-			return nil, err
+			return nil, oops.Wrapf(err, "list topics")
 		}
 		for _, t := range topics {
 			if t.Topic != cfg.Topic {

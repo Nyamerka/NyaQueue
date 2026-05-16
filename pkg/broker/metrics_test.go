@@ -111,6 +111,43 @@ func (s *MetricsSuite) TestDeltaLoadsReflectRecentActivity() {
 		"partition 1: no new produces, load should be ~0")
 }
 
+func (s *MetricsSuite) TestDeliveryRatio() {
+	dir := s.T().TempDir()
+	store, err := NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+	defer store.Close()
+
+	b := New(DefaultConfig(), dir, noopBalancer{}, store)
+	require.NoError(s.T(), b.CreateTopic("t", DefaultTopicConfig()))
+
+	mc := b.metrics
+
+	for i := 0; i < 100; i++ {
+		mc.RecordProduce("t", 0)
+	}
+	for i := 0; i < 70; i++ {
+		mc.RecordConsume("t", 0, "g")
+	}
+
+	snap := mc.Collect()
+	require.InDelta(s.T(), 0.7, snap.DeliveryRatio, 0.01,
+		"produced 100, consumed 70 → DeliveryRatio ≈ 0.7")
+}
+
+func (s *MetricsSuite) TestDeliveryRatioNoProduces() {
+	dir := s.T().TempDir()
+	store, err := NewOffsetStore(dir)
+	require.NoError(s.T(), err)
+	defer store.Close()
+
+	b := New(DefaultConfig(), dir, noopBalancer{}, store)
+	mc := b.metrics
+
+	snap := mc.Collect()
+	require.Equal(s.T(), 1.0, snap.DeliveryRatio,
+		"no produces → DeliveryRatio should be 1.0")
+}
+
 type noopBalancer struct{}
 
 func (noopBalancer) SelectPartition(string, []byte, int) int { return 0 }

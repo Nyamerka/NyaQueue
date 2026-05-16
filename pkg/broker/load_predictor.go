@@ -3,6 +3,8 @@ package broker
 import (
 	"context"
 	"log"
+	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,6 +30,7 @@ type LoadPredictor struct {
 	eg          *errgroup.Group
 	cancel      context.CancelFunc
 
+	predictMu sync.Mutex // serializes predict() which reuses scratch buffers
 	predBuf   []float64
 	centerBuf []float64
 	arBuf     []float64
@@ -74,6 +77,9 @@ func (lp *LoadPredictor) Update(loads []float64) {
 }
 
 func (lp *LoadPredictor) predict() {
+	lp.predictMu.Lock()
+	defer lp.predictMu.Unlock()
+
 	var preds []PartitionPrediction
 	lp.history.Range(func(id int, buf *RingBuffer) bool {
 		n := buf.ValuesInto(lp.valsBuf)
@@ -176,9 +182,13 @@ func (lp *LoadPredictor) arPredictInto(vals []float64, horizon int) []float64 {
 	}
 	mean /= float64(n)
 
-	p := n / 2
-	if p > 8 {
-		p = 8
+	maxOrder := lp.window / 4
+	if maxOrder < 1 {
+		maxOrder = 1
+	}
+	p := int(math.Sqrt(float64(n)))
+	if p > maxOrder {
+		p = maxOrder
 	}
 	if p < 1 || n < 2*p {
 		for k := range predicted {
@@ -187,7 +197,7 @@ func (lp *LoadPredictor) arPredictInto(vals []float64, horizon int) []float64 {
 		return predicted
 	}
 
-	coeffs := yuleWalker(vals, mean, p, lp.coeffBuf, lp.rBuf, lp.aOldBuf)
+	coeffs := lp.yuleWalker(vals, mean, p)
 	if coeffs == nil {
 		for k := range predicted {
 			predicted[k] = mean
@@ -231,10 +241,11 @@ func (lp *LoadPredictor) arPredictInto(vals []float64, horizon int) []float64 {
 }
 
 // yuleWalker estimates AR(p) coefficients via Levinson-Durbin recursion.
-// All buffers (coeffBuf, rBuf, aOldBuf) are pre-allocated to eliminate per-call allocations.
+// Uses pre-allocated struct buffers to eliminate per-call allocations.
 // Returns nil if zero variance.
-func yuleWalker(vals []float64, mean float64, p int, coeffBuf, rBuf, aOldBuf []float64) []float64 {
+func (lp *LoadPredictor) yuleWalker(vals []float64, mean float64, p int) []float64 {
 	n := len(vals)
+	coeffBuf, rBuf, aOldBuf := lp.coeffBuf, lp.rBuf, lp.aOldBuf
 
 	if len(rBuf) < p+1 {
 		rBuf = make([]float64, p+1)
@@ -286,11 +297,11 @@ func yuleWalker(vals []float64, mean float64, p int, coeffBuf, rBuf, aOldBuf []f
 	return a
 }
 
-// RingBuffer is a lock-free circular buffer for time-series data.
-// Push uses an atomic monotonic counter, enabling concurrent writes without mutex.
+// RingBuffer is a circular buffer for time-series data, safe for concurrent use.
 type RingBuffer struct {
+	mu       sync.Mutex
 	data     []float64
-	writeIdx atomic.Int64
+	writeIdx int64
 }
 
 func NewRingBuffer(size int) *RingBuffer {
@@ -298,13 +309,18 @@ func NewRingBuffer(size int) *RingBuffer {
 }
 
 func (rb *RingBuffer) Push(v float64) {
-	idx := rb.writeIdx.Add(1) - 1
-	rb.data[idx%int64(len(rb.data))] = v
+	rb.mu.Lock()
+	rb.data[rb.writeIdx%int64(len(rb.data))] = v
+	rb.writeIdx++
+	rb.mu.Unlock()
 }
 
 // Values allocates and returns a copy of the buffer contents in chronological order.
 func (rb *RingBuffer) Values() []float64 {
-	w := rb.writeIdx.Load()
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
+	w := rb.writeIdx
 	size := int64(len(rb.data))
 	if w == 0 {
 		return nil
@@ -322,7 +338,10 @@ func (rb *RingBuffer) Values() []float64 {
 // ValuesInto copies buffer contents into dst without allocating. Returns the
 // number of values written. dst must be at least as large as the ring size.
 func (rb *RingBuffer) ValuesInto(dst []float64) int {
-	w := rb.writeIdx.Load()
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
+	w := rb.writeIdx
 	size := int64(len(rb.data))
 	if w == 0 {
 		return 0

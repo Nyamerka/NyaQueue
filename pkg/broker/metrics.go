@@ -16,7 +16,7 @@ type BusinessMetrics struct {
 	Throughput  float64
 	ConsumeRate float64
 	AvgLatency  float64
-	SuccessRate float64
+	DeliveryRatio float64
 	MsgRate     float64
 	AvgMsgSize  float64
 }
@@ -53,6 +53,8 @@ type MetricsCollector struct {
 	consumeCount atomic.Int64
 	produceBytes atomic.Int64
 	lastSnap     atomic.Pointer[Metrics]
+
+	avgFlushLatencyNs atomic.Int64
 
 	mu          sync.Mutex
 	lastCollect time.Time
@@ -164,12 +166,11 @@ func (mc *MetricsCollector) Collect() Metrics {
 
 	throughput := float64(produced+consumed) / elapsed
 
-	mc.broker.mu.RLock()
-	topics := make([]*Topic, 0, len(mc.broker.topics))
-	for _, t := range mc.broker.topics {
+	var topics []*Topic
+	mc.broker.topics.Range(func(_ string, t *Topic) bool {
 		topics = append(topics, t)
-	}
-	mc.broker.mu.RUnlock()
+		return true
+	})
 
 	var loads []float64
 	var depths []int
@@ -215,9 +216,12 @@ func (mc *MetricsCollector) Collect() Metrics {
 	mc.savePrevCountersLocked()
 	mc.mu.Unlock()
 
-	successRate := 1.0
-	if produced > 0 && consumed == 0 {
-		successRate = 0.0
+	deliveryRatio := 1.0
+	if produced > 0 {
+		deliveryRatio = float64(consumed) / float64(produced)
+		if deliveryRatio > 1.0 {
+			deliveryRatio = 1.0
+		}
 	}
 
 	producedBytes := mc.produceBytes.Swap(0)
@@ -228,6 +232,8 @@ func (mc *MetricsCollector) Collect() Metrics {
 	if produced > 0 {
 		avgMsgSize = float64(producedBytes) / float64(produced)
 	}
+
+	avgLatencyMs := float64(mc.avgFlushLatencyNs.Load()) / float64(time.Millisecond)
 
 	var loadSD float64
 	if len(loads) >= 2 {
@@ -263,7 +269,8 @@ func (mc *MetricsCollector) Collect() Metrics {
 		BusinessMetrics: BusinessMetrics{
 			Throughput:  throughput,
 			ConsumeRate: consumeRate,
-			SuccessRate: successRate,
+			AvgLatency:  avgLatencyMs,
+			DeliveryRatio: deliveryRatio,
 			MsgRate:     msgRate,
 			AvgMsgSize:  avgMsgSize,
 		},
@@ -400,15 +407,14 @@ func (mc *MetricsCollector) updatePrometheus(snap Metrics) {
 	mc.promThroughput.Set(snap.Throughput)
 	mc.promLoadStdDev.Set(snap.LoadStdDev)
 
-	mc.broker.mu.RLock()
-	topics := make([]*Topic, 0, len(mc.broker.topics))
-	for _, t := range mc.broker.topics {
-		topics = append(topics, t)
-	}
-	mc.broker.mu.RUnlock()
+	var promTopics []*Topic
+	mc.broker.topics.Range(func(_ string, t *Topic) bool {
+		promTopics = append(promTopics, t)
+		return true
+	})
 
 	partIdx := 0
-	for _, t := range topics {
+	for _, t := range promTopics {
 		for _, p := range t.Partitions() {
 			pStr := strconv.Itoa(p.ID())
 			if partIdx < len(snap.PartitionLoads) {

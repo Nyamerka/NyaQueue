@@ -32,8 +32,8 @@ func AllAlgorithms() []AlgorithmConfig {
 			Mode:         broker.ModeFIFO,
 		},
 		{
-			Name:         "WRR+FIFO",
-			NewBalancer:  func(_ int) broker.Balancer { return balancer.NewWeightedRoundRobin() },
+			Name:         "P2C+FIFO",
+			NewBalancer:  func(_ int) broker.Balancer { return balancer.NewPowerOfTwoChoices() },
 			NewScheduler: func() broker.Scheduler { return scheduler.NewFIFO() },
 			Mode:         broker.ModeFIFO,
 		},

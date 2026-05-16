@@ -76,7 +76,7 @@ func (p *Partition) ID() int { return p.id }
 func (p *Partition) Append(msg *Message) (uint64, error) {
 	offsets, err := p.AppendBatch([]*Message{msg})
 	if err != nil {
-		return 0, err
+		return 0, oops.Wrapf(err, "append to partition %d", p.id)
 	}
 	return offsets[0], nil
 }
@@ -289,7 +289,7 @@ func (p *Partition) readFromBatchData(data []byte, index int) (*Message, error) 
 			}
 			msg, err := UnmarshalMessage(payload[off : off+msgLen])
 			if err != nil {
-				return nil, err
+				return nil, oops.Wrapf(err, "unmarshal message %d in batch", i)
 			}
 			msg.BatchDecoded = true
 			return msg, nil

@@ -7,6 +7,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/samber/oops"
 	"gonum.org/v1/gonum/stat"
 
 	"github.com/Nyamerka/NyaQueue/pkg/transport"
@@ -15,7 +16,7 @@ import (
 type exporterMetrics struct {
 	throughput         prometheus.Gauge
 	avgLatency         prometheus.Gauge
-	successRate        prometheus.Gauge
+	deliveryRatio      prometheus.Gauge
 	partitionLoad      *prometheus.GaugeVec
 	queueDepth         *prometheus.GaugeVec
 	partitionLoadStdev prometheus.Gauge
@@ -36,10 +37,10 @@ func registerMetrics(reg prometheus.Registerer) *exporterMetrics {
 			Name:      "avg_latency_seconds",
 			Help:      "Average internal broker latency.",
 		}),
-		successRate: f.NewGauge(prometheus.GaugeOpts{
+		deliveryRatio: f.NewGauge(prometheus.GaugeOpts{
 			Namespace: "nyaqueue_broker",
-			Name:      "success_rate",
-			Help:      "Fraction of deliveries that succeeded.",
+			Name:      "delivery_ratio",
+			Help:      "Ratio of consumed to produced messages.",
 		}),
 		partitionLoad: f.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: "nyaqueue_broker",
@@ -94,12 +95,12 @@ func Run(ctx context.Context, cfg Config, client *transport.Client, m *exporterM
 func scrape(ctx context.Context, client *transport.Client, m *exporterMetrics) error {
 	resp, err := client.GetMetrics(ctx)
 	if err != nil {
-		return err
+		return oops.Wrapf(err, "scrape broker metrics")
 	}
 
 	m.throughput.Set(resp.Throughput)
 	m.avgLatency.Set(resp.AvgLatency)
-	m.successRate.Set(resp.SuccessRate)
+	m.deliveryRatio.Set(resp.SuccessRate)
 
 	for i, load := range resp.PartitionLoads {
 		m.partitionLoad.WithLabelValues(strconv.Itoa(i)).Set(load)

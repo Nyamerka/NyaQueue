@@ -176,7 +176,7 @@ func allFailed(results []broker.PublishResult) bool {
 
 // Consume fetches messages up to maxBytes, tracking the offset locally within
 // the batch. A single Commit at the end avoids per-message offset store writes.
-func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.ConsumeResponse, error) {
+func (s *Server) Consume(ctx context.Context, req *pb.ConsumeRequest) (*pb.ConsumeResponse, error) {
 	cfg := s.broker.Config()
 
 	maxBytes := int(req.MaxBytes)
@@ -204,7 +204,7 @@ func (s *Server) Consume(_ context.Context, req *pb.ConsumeRequest) (*pb.Consume
 	)
 
 	for totalBytes < maxBytes {
-		msg, nextOffset, err := s.broker.ConsumeFrom(req.Topic, req.Group, int(req.Partition), currentOffset)
+		msg, nextOffset, err := s.broker.ConsumeFrom(ctx, req.Topic, req.Group, int(req.Partition), currentOffset)
 		if err != nil {
 			if errors.Is(err, broker.ErrNoMessages) {
 				if totalBytes < fetchMinBytes && time.Now().Before(deadline) {
@@ -319,7 +319,7 @@ func (s *Server) GetMetrics(_ context.Context, _ *pb.MetricsRequest) (*pb.Metric
 		Throughput:     m.Throughput,
 		AvgLatency:     m.AvgLatency,
 		PartitionLoads: m.PartitionLoads,
-		SuccessRate:    m.SuccessRate,
+		SuccessRate:    m.DeliveryRatio,
 		QueueDepth:     depths,
 		LoadStddev:     m.LoadStdDev,
 		MsgRate:        m.MsgRate,

@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/puzpuzpuz/xsync/v3"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 )
@@ -30,9 +31,8 @@ type PSA struct {
 	mu              sync.RWMutex
 	bindings        *lru.Cache[string, int]
 	partitionToKeys map[int]map[string]struct{}
-	free            map[int]struct{}
+	free            *xsync.MapOf[int, struct{}]
 	loads           []float64
-	freeSliceBuf    []int
 
 	evictionCount atomic.Int64
 }
@@ -40,7 +40,7 @@ type PSA struct {
 func NewPSA(numPartitions int) *PSA {
 	p := &PSA{
 		partitionToKeys: make(map[int]map[string]struct{}, numPartitions),
-		free:            make(map[int]struct{}, numPartitions),
+		free:            xsync.NewMapOf[int, struct{}](),
 	}
 
 	cache, _ := lru.NewWithEvict[string, int](defaultPSAMaxBindings, func(key string, partID int) {
@@ -50,7 +50,7 @@ func NewPSA(numPartitions int) *PSA {
 	p.bindings = cache
 
 	for i := 0; i < numPartitions; i++ {
-		p.free[i] = struct{}{}
+		p.free.Store(i, struct{}{})
 	}
 	return p
 }
@@ -60,7 +60,7 @@ func (p *PSA) removeFromReverseIndex(key string, partID int) {
 		delete(keys, key)
 		if len(keys) == 0 {
 			delete(p.partitionToKeys, partID)
-			p.free[partID] = struct{}{}
+			p.free.Store(partID, struct{}{})
 		}
 	}
 }
@@ -87,11 +87,11 @@ func (p *PSA) SelectPartition(_ string, key []byte, numPartitions int) int {
 		return part
 	}
 
-	freeList := p.freeSliceLocked()
+	freeList := p.collectFree()
 	if len(freeList) > 0 {
 		part := p.leastLoadedFree(freeList)
 		p.bind(keyStr, part)
-		delete(p.free, part)
+		p.free.Delete(part)
 		return part
 	}
 
@@ -153,7 +153,7 @@ func (p *PSA) OnMetrics(m broker.Metrics) {
 func (p *PSA) releasePartition(id int) {
 	keys, ok := p.partitionToKeys[id]
 	if !ok {
-		p.free[id] = struct{}{}
+		p.free.Store(id, struct{}{})
 		return
 	}
 	toRemove := make([]string, 0, len(keys))
@@ -164,7 +164,7 @@ func (p *PSA) releasePartition(id int) {
 	for _, k := range toRemove {
 		p.bindings.Remove(k)
 	}
-	p.free[id] = struct{}{}
+	p.free.Store(id, struct{}{})
 }
 
 func (p *PSA) EvictionCount() int64 {
@@ -182,16 +182,13 @@ func avgLoad(loads []float64) float64 {
 	return sum / float64(len(loads))
 }
 
-// freeSliceLocked reuses a pre-allocated buffer for the free partition list.
-func (p *PSA) freeSliceLocked() []int {
-	if cap(p.freeSliceBuf) < len(p.free) {
-		p.freeSliceBuf = make([]int, 0, len(p.free))
-	}
-	p.freeSliceBuf = p.freeSliceBuf[:0]
-	for id := range p.free {
-		p.freeSliceBuf = append(p.freeSliceBuf, id)
-	}
-	return p.freeSliceBuf
+func (p *PSA) collectFree() []int {
+	var out []int
+	p.free.Range(func(id int, _ struct{}) bool {
+		out = append(out, id)
+		return true
+	})
+	return out
 }
 
 func hashKey(key []byte) uint64 {

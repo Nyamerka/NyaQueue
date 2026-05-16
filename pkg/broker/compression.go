@@ -8,6 +8,7 @@ import (
 
 	"github.com/klauspost/compress/snappy"
 	"github.com/pierrec/lz4/v4"
+	"github.com/samber/oops"
 )
 
 const (
@@ -70,13 +71,13 @@ func (g *gzipCodec) Encode(data []byte) ([]byte, error) {
 		w.Reset(io.Discard)
 		gzipWriterPool.Put(w)
 		bufferPool.Put(buf)
-		return nil, err
+		return nil, oops.Wrapf(err, "gzip write")
 	}
 	if err := w.Close(); err != nil {
 		w.Reset(io.Discard)
 		gzipWriterPool.Put(w)
 		bufferPool.Put(buf)
-		return nil, err
+		return nil, oops.Wrapf(err, "gzip close")
 	}
 
 	result := make([]byte, buf.Len())
@@ -91,10 +92,14 @@ func (g *gzipCodec) Encode(data []byte) ([]byte, error) {
 func (g *gzipCodec) Decode(data []byte) ([]byte, error) {
 	r, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
-		return nil, err
+		return nil, oops.Wrapf(err, "gzip new reader")
 	}
 	defer r.Close()
-	return io.ReadAll(r)
+	out, err := io.ReadAll(r)
+	if err != nil {
+		return nil, oops.Wrapf(err, "gzip read all")
+	}
+	return out, nil
 }
 
 type lz4Codec struct{}
@@ -103,10 +108,10 @@ func (lz4Codec) Encode(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	w := lz4.NewWriter(&buf)
 	if _, err := w.Write(data); err != nil {
-		return nil, err
+		return nil, oops.Wrapf(err, "lz4 write")
 	}
 	if err := w.Close(); err != nil {
-		return nil, err
+		return nil, oops.Wrapf(err, "lz4 close")
 	}
 	return buf.Bytes(), nil
 }

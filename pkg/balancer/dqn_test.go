@@ -45,18 +45,22 @@ func (s *DQNSuite) TestFallbackWatchdog() {
 	defer dqn.Stop()
 	dqn.SetBaseThroughput(1000)
 
-	dqn.OnMetrics(broker.Metrics{
+	badMetrics := broker.Metrics{
 		BusinessMetrics: broker.BusinessMetrics{Throughput: 500},
 		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
-	})
-
+	}
+	for i := 0; i < fallbackEnterTicks; i++ {
+		dqn.OnMetrics(badMetrics)
+	}
 	require.True(s.T(), dqn.IsFallbackActive())
 
-	dqn.OnMetrics(broker.Metrics{
+	goodMetrics := broker.Metrics{
 		BusinessMetrics: broker.BusinessMetrics{Throughput: 900},
 		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
-	})
-
+	}
+	for i := 0; i < fallbackExitTicks; i++ {
+		dqn.OnMetrics(goodMetrics)
+	}
 	require.False(s.T(), dqn.IsFallbackActive())
 }
 
@@ -64,19 +68,23 @@ func (s *DQNSuite) TestProactiveWatchdog() {
 	dqn := NewDQNBalancer(4, WithDQNLoadThreshold(0.7))
 	defer dqn.Stop()
 
-	dqn.OnMetrics(broker.Metrics{
+	lowLoad := broker.Metrics{
 		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.3, 0.3, 0.3, 0.3}},
-	})
+	}
+	dqn.OnMetrics(lowLoad)
 	require.False(s.T(), dqn.IsFallbackActive(), "low load should not trigger fallback")
 
-	dqn.OnMetrics(broker.Metrics{
+	highLoad := broker.Metrics{
 		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.8, 0.9, 0.7, 0.85}},
-	})
+	}
+	for i := 0; i < fallbackEnterTicks; i++ {
+		dqn.OnMetrics(highLoad)
+	}
 	require.True(s.T(), dqn.IsFallbackActive(), "high mean load should trigger proactive fallback")
 
-	dqn.OnMetrics(broker.Metrics{
-		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.3, 0.3, 0.3, 0.3}},
-	})
+	for i := 0; i < fallbackExitTicks; i++ {
+		dqn.OnMetrics(lowLoad)
+	}
 	require.False(s.T(), dqn.IsFallbackActive(), "load recovery should deactivate fallback")
 }
 

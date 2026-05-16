@@ -82,7 +82,7 @@ func NewOffsetStore(dataDir string, dumpInterval ...time.Duration) (*OffsetStore
 				}
 				return nil
 			}); err != nil {
-				return err
+				return oops.Wrapf(err, "read offset value for key %q", key)
 			}
 		}
 		return nil

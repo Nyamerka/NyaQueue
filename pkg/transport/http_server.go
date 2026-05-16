@@ -257,7 +257,7 @@ func (s *HTTPServer) handleConsume(w http.ResponseWriter, r *http.Request) {
 	)
 
 	for totalBytes < maxBytes {
-		msg, nextOffset, err := s.broker.ConsumeFrom(topic, group, partition, currentOffset)
+		msg, nextOffset, err := s.broker.ConsumeFrom(r.Context(), topic, group, partition, currentOffset)
 		if err != nil {
 			if errors.Is(err, broker.ErrNoMessages) {
 				if totalBytes < fetchMinBytes && time.Now().Before(deadline) {

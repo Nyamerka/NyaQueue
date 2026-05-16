@@ -45,7 +45,7 @@ type HTTPMetricsResponse struct {
 	Throughput     float64   `json:"Throughput"`
 	PartitionLoads []float64 `json:"PartitionLoads"`
 	PredictedLoads []float64 `json:"PredictedLoads"`
-	SuccessRate    float64   `json:"SuccessRate"`
+	DeliveryRatio  float64   `json:"DeliveryRatio"`
 	LoadStdDev     float64   `json:"LoadStdDev"`
 	MsgRate        float64   `json:"MsgRate"`
 	AvgMsgSize     float64   `json:"AvgMsgSize"`
@@ -77,7 +77,7 @@ func (c *HTTPClient) GetMetrics(ctx context.Context) (*HTTPMetricsResponse, erro
 func (c *HTTPClient) Produce(ctx context.Context, topic string, key, value []byte, priority uint32) (int, int64, error) {
 	results, err := c.ProduceBatch(ctx, topic, []HTTPProduceRecord{{Key: key, Value: value, Priority: priority}})
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, oops.Wrapf(err, "produce topic=%q", topic)
 	}
 	if len(results) == 0 {
 		return 0, 0, oops.Errorf("empty produce response")

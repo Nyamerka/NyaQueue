@@ -138,21 +138,57 @@ func (s *LoadPredictorSuite) TestYuleWalkerCoefficients() {
 	}
 	mean /= float64(len(vals))
 
-	rBuf := make([]float64, 5)
-	aOldBuf := make([]float64, 4)
-	coeffBuf := make([]float64, 4)
-	coeffs := yuleWalker(vals, mean, 4, coeffBuf, rBuf, aOldBuf)
+	lp := NewLoadPredictor(20, 1, time.Second)
+	coeffs := lp.yuleWalker(vals, mean, 4)
 	require.NotNil(s.T(), coeffs)
 	require.Len(s.T(), coeffs, 4)
 }
 
 func (s *LoadPredictorSuite) TestYuleWalkerZeroVariance() {
 	vals := []float64{1, 1, 1, 1, 1}
-	rBuf := make([]float64, 3)
-	aOldBuf := make([]float64, 2)
-	coeffBuf := make([]float64, 2)
-	coeffs := yuleWalker(vals, 1.0, 2, coeffBuf, rBuf, aOldBuf)
+	lp := NewLoadPredictor(10, 1, time.Second)
+	coeffs := lp.yuleWalker(vals, 1.0, 2)
 	require.Nil(s.T(), coeffs, "zero-variance series should return nil coefficients")
+}
+
+func (s *LoadPredictorSuite) TestAROrderDerivation() {
+	lp := NewLoadPredictor(20, 3, time.Second)
+
+	pred := lp.arPredictInto([]float64{0.7}, 3)
+	for _, p := range pred {
+		require.InDelta(s.T(), 0.7, p, 0.01, "single-point series should predict mean")
+	}
+
+	trend := make([]float64, 30)
+	for i := range trend {
+		trend[i] = float64(i) * 0.01
+	}
+
+	pred = lp.arPredictInto(trend, 3)
+	mean := 0.0
+	for _, v := range trend {
+		mean += v
+	}
+	mean /= float64(len(trend))
+	for _, p := range pred {
+		require.Greater(s.T(), p, mean,
+			"AR on upward trend must extrapolate above mean")
+	}
+}
+
+func (s *LoadPredictorSuite) TestAROrderCapAtWindowQuarter() {
+	lp := NewLoadPredictor(8, 1, time.Second)
+	vals := make([]float64, 100)
+	for i := range vals {
+		vals[i] = float64(i) * 0.001
+	}
+
+	pred := lp.arPredictInto(vals, 5)
+	require.Len(s.T(), pred, 5)
+	for _, p := range pred {
+		require.GreaterOrEqual(s.T(), p, 0.0)
+		require.LessOrEqual(s.T(), p, 1.0)
+	}
 }
 
 func (s *LoadPredictorSuite) TestPredictAll() {

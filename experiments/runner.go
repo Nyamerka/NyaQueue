@@ -10,7 +10,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"os"
-	"sync"
 	"syscall"
 	"time"
 
@@ -196,7 +195,7 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		HTTPBrokerAddr: r.HTTPBrokerAddr,
 	})
 	if err != nil {
-		return ExperimentResult{}, err
+		return ExperimentResult{}, oops.Wrapf(err, "create harness for %s/%s", sc.Name, alg.Name)
 	}
 	defer h.Close()
 
@@ -264,7 +263,7 @@ func (r *Runner) runKafka(ctx context.Context, sc benchmarks.Scenario, dur time.
 		KafkaBrokers: r.KafkaBrokers,
 	})
 	if err != nil {
-		return ExperimentResult{}, err
+		return ExperimentResult{}, oops.Wrapf(err, "create kafka harness for %s", sc.Name)
 	}
 	defer h.Close()
 
@@ -307,10 +306,9 @@ func runScenario(
 	consumeCtx, stopConsumers := context.WithCancel(ctx)
 	defer stopConsumers()
 
-	var samplerWG sync.WaitGroup
-	samplerWG.Add(1)
+	samplerDone := make(chan struct{})
 	go func() {
-		defer samplerWG.Done()
+		defer close(samplerDone)
 		sampleLoadsFromHarness(consumeCtx, h, collector, loadSampleInterval)
 	}()
 
@@ -357,7 +355,7 @@ func runScenario(
 
 	stopConsumers()
 	consumerPool.StopAndWait()
-	samplerWG.Wait()
+	<-samplerDone
 
 	collector.Stop()
 	return collector.Snapshot(sc.Name, algName, system, mode.String())
@@ -376,7 +374,13 @@ func runProducer(ctx context.Context, h *Harness, sc benchmarks.Scenario, msgSiz
 	}
 }
 
-const produceLingerInterval = 5 * time.Millisecond
+func lingerInterval(sc benchmarks.Scenario) time.Duration {
+	ms := sc.LingerMs
+	if ms <= 0 {
+		ms = 1
+	}
+	return time.Duration(ms) * time.Millisecond
+}
 
 func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenario, msgSize int, c *MetricsCollector, topic string) {
 	perProducer := sc.RatePerSec / sc.Producers
@@ -397,6 +401,7 @@ func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scena
 		targetBytes = defaultBatchBytes
 	}
 
+	produceLingerInterval := lingerInterval(sc)
 	batch := make([]BatchItem, 0, produceBatchSize)
 	accumulatedBytes := 0
 	linger := time.NewTimer(produceLingerInterval)

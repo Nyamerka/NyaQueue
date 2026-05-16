@@ -32,7 +32,7 @@ func DefaultOptimizerConfig() OptimizerConfig {
 	return OptimizerConfig{
 		Interval:     250 * time.Millisecond,
 		BatchSize:    32,
-		WarmupTicks:  64,
+		WarmupTicks:  DefaultOptimizerWarmupTicks,
 		LearningRate: 0.0003,
 		Hysteresis:   0.10,
 		NoiseDecay:   0.999,
@@ -101,8 +101,6 @@ func NewOptimizer(b *broker.Broker, params []TunableParam, optCfg OptimizerConfi
 		optCfg.NoiseFloor = 0.05
 	}
 
-	const rewardWindowCap = 20
-
 	ddpg := NewDDPG(stateSize, actionSize, optCfg.LearningRate, optCfg.BatchSize)
 	ddpg.SetNoiseDecay(optCfg.NoiseDecay, optCfg.NoiseFloor)
 
@@ -115,8 +113,8 @@ func NewOptimizer(b *broker.Broker, params []TunableParam, optCfg OptimizerConfi
 		warmup:           optCfg.WarmupTicks,
 		hysteresis:       optCfg.Hysteresis,
 		currentVals:      currentVals,
-		windowCap:        rewardWindowCap,
-		throughputWindow: make([]float64, 0, rewardWindowCap),
+		windowCap:        DefaultOptimizerWindowCap,
+		throughputWindow: make([]float64, 0, DefaultOptimizerWindowCap),
 	}
 }
 
@@ -170,8 +168,9 @@ func (o *Optimizer) step() {
 
 	if o.ticks > o.warmup {
 		safe := true
-		if metrics.MsgRate > 0 && metrics.ConsumeRate > 0 {
-			if metrics.ConsumeRate/metrics.MsgRate < 0.7 {
+		if metrics.MsgRate > 0 {
+			ratio := metrics.ConsumeRate / metrics.MsgRate
+			if ratio < 0.7 {
 				safe = false
 			}
 		}
@@ -259,16 +258,17 @@ func (o *Optimizer) computeReward(m *broker.Metrics) float64 {
 		latencyPenalty = -m.AvgLatency / 1000.0
 	}
 
-	queuePenalty := 0.0
 	totalDepth := 0
 	for _, d := range m.QueueDepth {
 		totalDepth += d
 	}
-	if totalDepth > 1000 {
-		queuePenalty = -float64(totalDepth) / 10000.0
+	normalized := float64(totalDepth) / DefaultQueueSoftThreshold
+	queuePenalty := -(normalized * normalized)
+	if queuePenalty < DefaultQueuePenaltyClamp {
+		queuePenalty = DefaultQueuePenaltyClamp
 	}
 
-	reward := throughputReward + 0.3*latencyPenalty + 1.5*queuePenalty
+	reward := throughputReward + DefaultLatencyPenaltyWeight*latencyPenalty + DefaultQueuePenaltyWeight*queuePenalty
 
 	if reward < -2.0 {
 		reward = -2.0
@@ -285,6 +285,6 @@ func (o *Optimizer) buildState(m *broker.Metrics) []float64 {
 	state = append(state, o.currentVals...)
 	state = append(state, m.Throughput/100000) // normalize
 	state = append(state, m.AvgLatency/1000)
-	state = append(state, m.SuccessRate)
+	state = append(state, m.DeliveryRatio)
 	return state
 }

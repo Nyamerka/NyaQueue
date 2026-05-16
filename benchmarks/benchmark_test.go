@@ -54,7 +54,7 @@ func BenchmarkConsumeFIFO(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, err := brk.Consume("bench", "group", 0)
+		_, _, err := brk.Consume(context.Background(), "bench", "group", 0)
 		if err != nil {
 			// expected: messages spread across partitions
 			continue
@@ -72,9 +72,9 @@ func BenchmarkRoundRobinSelect(b *testing.B) {
 	}
 }
 
-func BenchmarkWRRSelect(b *testing.B) {
-	wrr := balancer.NewWeightedRoundRobin()
-	wrr.OnMetrics(broker.Metrics{
+func BenchmarkP2CSelect(b *testing.B) {
+	p2c := balancer.NewPowerOfTwoChoices()
+	p2c.OnMetrics(broker.Metrics{
 		DerivedMetrics: broker.DerivedMetrics{
 			PartitionLoads: []float64{0.1, 0.5, 0.3, 0.8, 0.2, 0.6, 0.4, 0.7},
 		},
@@ -83,7 +83,7 @@ func BenchmarkWRRSelect(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		wrr.SelectPartition("topic", key, 8)
+		p2c.SelectPartition("topic", key, 8)
 	}
 }
 

@@ -236,7 +236,7 @@ func (h *Harness) DeleteTopic(ctx context.Context, topic string) error {
 		if errors.Is(err, kafkadriver.ErrTopicNotFound) {
 			return broker.ErrTopicNotFound
 		}
-		return err
+		return oops.Wrapf(err, "delete topic %q via kafka", topic)
 	}
 	return oops.Errorf("unsupported mode")
 }
@@ -247,13 +247,22 @@ func (h *Harness) Publish(ctx context.Context, topic string, key, value []byte, 
 	case ModeInProcess:
 		msg := broker.NewMessage(priority, key, value)
 		_, _, err := h.app.Broker().Publish(ctx, topic, msg)
-		return err
+		if err != nil {
+			return oops.Wrapf(err, "publish in-process topic=%q", topic)
+		}
+		return nil
 	case ModeGRPC:
 		_, _, err := h.grpc.Produce(ctx, topic, key, value, uint32(priority))
-		return err
+		if err != nil {
+			return oops.Wrapf(err, "produce gRPC topic=%q", topic)
+		}
+		return nil
 	case ModeHTTP:
 		_, _, err := h.httpClient.Produce(ctx, topic, key, value, uint32(priority))
-		return err
+		if err != nil {
+			return oops.Wrapf(err, "produce HTTP topic=%q", topic)
+		}
+		return nil
 	case ModeKafka:
 		return h.kfk.Produce(ctx, topic, key, value)
 	}
@@ -303,7 +312,7 @@ func (h *Harness) PublishBatch(ctx context.Context, topic string, items []BatchI
 		}
 		results, err := h.grpc.ProduceBatch(ctx, topic, pbmsgs)
 		if err != nil {
-			return 0, err
+			return 0, oops.Wrapf(err, "produce batch gRPC topic=%q", topic)
 		}
 		return len(results), nil
 
@@ -318,7 +327,7 @@ func (h *Harness) PublishBatch(ctx context.Context, topic string, items []BatchI
 		}
 		results, err := h.httpClient.ProduceBatch(ctx, topic, records)
 		if err != nil {
-			return 0, err
+			return 0, oops.Wrapf(err, "produce batch HTTP topic=%q", topic)
 		}
 		return len(results), nil
 
@@ -328,7 +337,7 @@ func (h *Harness) PublishBatch(ctx context.Context, topic string, items []BatchI
 			kmsgs[i] = kafka.Message{Key: it.Key, Value: it.Value}
 		}
 		if err := h.kfk.ProduceBatch(ctx, topic, kmsgs); err != nil {
-			return 0, err
+			return 0, oops.Wrapf(err, "produce batch kafka topic=%q", topic)
 		}
 		return len(items), nil
 	}
@@ -348,7 +357,7 @@ func (h *Harness) ConsumeBatch(ctx context.Context, topic, group string, partiti
 	switch h.mode {
 	case ModeInProcess:
 		brk := h.app.Broker()
-		msgs, _, err := brk.ConsumeBatch(topic, group, partition, 16)
+		msgs, _, err := brk.ConsumeBatch(ctx, topic, group, partition, 16)
 		if err != nil {
 			if errors.Is(err, broker.ErrNoMessages) {
 				return nil, ErrNoMessage
@@ -442,7 +451,7 @@ func (h *Harness) GetMetricsSnapshot(ctx context.Context) (*MetricsSnapshot, err
 	case ModeGRPC:
 		resp, err := h.grpc.GetMetrics(ctx)
 		if err != nil {
-			return nil, err
+			return nil, oops.Wrapf(err, "get metrics gRPC")
 		}
 		return &MetricsSnapshot{
 			PartitionLoads: resp.PartitionLoads,
@@ -452,7 +461,7 @@ func (h *Harness) GetMetricsSnapshot(ctx context.Context) (*MetricsSnapshot, err
 	case ModeHTTP:
 		resp, err := h.httpClient.GetMetrics(ctx)
 		if err != nil {
-			return nil, err
+			return nil, oops.Wrapf(err, "get metrics HTTP")
 		}
 		return &MetricsSnapshot{
 			PartitionLoads: resp.PartitionLoads,
@@ -469,7 +478,7 @@ func (h *Harness) GetMetricsSnapshot(ctx context.Context) (*MetricsSnapshot, err
 func (h *Harness) GetPartitionLoads(ctx context.Context) ([]float64, error) {
 	snap, err := h.GetMetricsSnapshot(ctx)
 	if err != nil {
-		return nil, err
+		return nil, oops.Wrapf(err, "get metrics snapshot")
 	}
 	return snap.PartitionLoads, nil
 }

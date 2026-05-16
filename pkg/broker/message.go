@@ -8,11 +8,7 @@ import (
 	"github.com/samber/oops"
 )
 
-// Wire layout v1: [version:1][priority:1][timestamp:8][keyLen:4][key:keyLen][value:...]
-// Version 0 (legacy): [priority:1][timestamp:8][keyLen:4][key:keyLen][value:...]
-//
-// On read, version is detected by checking if the first byte is a known version tag.
-// Version 1+ use byte 0 as version; version 0 (legacy) has priority in byte 0.
+// Wire layout: [version:1][priority:1][timestamp:8][keyLen:4][key:keyLen][value:...]
 const (
 	currentVersion     = 1
 	versionFieldSize   = 1
@@ -20,25 +16,16 @@ const (
 	timestampFieldSize = 8
 	keyLenFieldSize    = 4
 
-	// v1 offsets
-	v1PriorityOffset = versionFieldSize                                                            // 1
-	v1TimestampOff   = versionFieldSize + priorityFieldSize                                        // 2
-	v1KeyLenOff      = versionFieldSize + priorityFieldSize + timestampFieldSize                   // 10
-	v1KeyOff         = versionFieldSize + priorityFieldSize + timestampFieldSize + keyLenFieldSize // 14
+	priorityOffset = versionFieldSize                                                            // 1
+	timestampOff   = versionFieldSize + priorityFieldSize                                        // 2
+	keyLenOff      = versionFieldSize + priorityFieldSize + timestampFieldSize                   // 10
+	keyOff         = versionFieldSize + priorityFieldSize + timestampFieldSize + keyLenFieldSize // 14
 
-	// v0 (legacy) offsets — version field is absent
-	timestampOffset = priorityFieldSize                      // 1
-	keyLenOffset    = priorityFieldSize + timestampFieldSize // 9 (== HeaderSize)
-	keyOffset       = keyLenOffset + keyLenFieldSize         // 13
+	// HeaderSize is the fixed-width prefix before key/value data.
+	HeaderSize = keyLenOff
 
-	// HeaderSize covers the fixed-width prefix (v0 format).
-	HeaderSize = keyLenOffset
-
-	// metadataSize for v0 format
-	metadataSize = keyOffset
-
-	// v1MetadataSize includes version byte
-	v1MetadataSize = v1KeyOff
+	// MetadataSize includes version, priority, timestamp, and key length fields.
+	MetadataSize = keyOff
 )
 
 // marshalPool holds reusable encode buffers as *[]byte to avoid the
@@ -51,7 +38,6 @@ var marshalPool = sync.Pool{
 }
 
 type MessageHeader struct {
-	Version     uint8
 	Priority    uint8
 	Timestamp   int64 // unix nanos — client enqueue time
 	ProduceTime int64 // unix nanos — time when broker receives the message
@@ -109,68 +95,42 @@ func ReleaseMarshalBuf(buf []byte) {
 }
 
 func (m *Message) encodedSize() int {
-	return v1MetadataSize + len(m.Key) + len(m.Value)
+	return MetadataSize + len(m.Key) + len(m.Value)
 }
 
 func (m *Message) marshalInto(buf []byte) {
 	keyLen := len(m.Key)
 	buf[0] = currentVersion
-	buf[v1PriorityOffset] = m.Header.Priority
-	binary.BigEndian.PutUint64(buf[v1TimestampOff:v1KeyLenOff], uint64(m.Header.Timestamp))
-	binary.BigEndian.PutUint32(buf[v1KeyLenOff:v1KeyOff], uint32(keyLen))
-	copy(buf[v1KeyOff:v1KeyOff+keyLen], m.Key)
-	copy(buf[v1KeyOff+keyLen:], m.Value)
+	buf[priorityOffset] = m.Header.Priority
+	binary.BigEndian.PutUint64(buf[timestampOff:keyLenOff], uint64(m.Header.Timestamp))
+	binary.BigEndian.PutUint32(buf[keyLenOff:keyOff], uint32(keyLen))
+	copy(buf[keyOff:keyOff+keyLen], m.Key)
+	copy(buf[keyOff+keyLen:], m.Value)
 }
 
 func UnmarshalMessage(data []byte) (*Message, error) {
-	if len(data) < metadataSize {
-		return nil, oops.Errorf("message data too short: got %d bytes, need at least %d", len(data), metadataSize)
+	if len(data) < MetadataSize {
+		return nil, oops.Errorf("message data too short: got %d bytes, need at least %d", len(data), MetadataSize)
 	}
 
 	version := data[0]
-
-	if version == currentVersion {
-		if len(data) < v1MetadataSize {
-			return nil, oops.Errorf("v1 message data too short: got %d bytes, need at least %d", len(data), v1MetadataSize)
-		}
-		priority := data[v1PriorityOffset]
-		timestamp := int64(binary.BigEndian.Uint64(data[v1TimestampOff:v1KeyLenOff]))
-		keyLen := int(binary.BigEndian.Uint32(data[v1KeyLenOff:v1KeyOff]))
-
-		if len(data) < v1MetadataSize+keyLen {
-			return nil, oops.Errorf("v1 message truncated: got %d bytes, need %d (keyLen=%d)", len(data), v1MetadataSize+keyLen, keyLen)
-		}
-
-		key := make([]byte, keyLen)
-		copy(key, data[v1KeyOff:v1KeyOff+keyLen])
-
-		value := make([]byte, len(data)-(v1KeyOff+keyLen))
-		copy(value, data[v1KeyOff+keyLen:])
-
-		return &Message{
-			Header: MessageHeader{
-				Version:   version,
-				Priority:  priority,
-				Timestamp: timestamp,
-			},
-			Key:   key,
-			Value: value,
-		}, nil
+	if version != currentVersion {
+		return nil, oops.Errorf("unsupported message version %d (expected %d)", version, currentVersion)
 	}
 
-	priority := data[0]
-	timestamp := int64(binary.BigEndian.Uint64(data[timestampOffset:keyLenOffset]))
-	keyLen := int(binary.BigEndian.Uint32(data[keyLenOffset:keyOffset]))
+	priority := data[priorityOffset]
+	timestamp := int64(binary.BigEndian.Uint64(data[timestampOff:keyLenOff]))
+	keyLen := int(binary.BigEndian.Uint32(data[keyLenOff:keyOff]))
 
-	if len(data) < metadataSize+keyLen {
-		return nil, oops.Errorf("v0 message truncated: got %d bytes, need %d (keyLen=%d)", len(data), metadataSize+keyLen, keyLen)
+	if len(data) < MetadataSize+keyLen {
+		return nil, oops.Errorf("message truncated: got %d bytes, need %d (keyLen=%d)", len(data), MetadataSize+keyLen, keyLen)
 	}
 
 	key := make([]byte, keyLen)
-	copy(key, data[keyOffset:keyOffset+keyLen])
+	copy(key, data[keyOff:keyOff+keyLen])
 
-	value := make([]byte, len(data)-(keyOffset+keyLen))
-	copy(value, data[keyOffset+keyLen:])
+	value := make([]byte, len(data)-(keyOff+keyLen))
+	copy(value, data[keyOff+keyLen:])
 
 	return &Message{
 		Header: MessageHeader{
@@ -183,26 +143,18 @@ func UnmarshalMessage(data []byte) (*Message, error) {
 }
 
 // UnmarshalHeader reads the fixed header for fast PriorityIndex rebuild.
-// Handles both v0 and v1 formats.
 func UnmarshalHeader(data []byte) (MessageHeader, error) {
 	if len(data) < HeaderSize {
 		return MessageHeader{}, oops.Errorf("data too short for header: got %d bytes, need at least %d", len(data), HeaderSize)
 	}
 
 	version := data[0]
-	if version == currentVersion {
-		if len(data) < v1TimestampOff+timestampFieldSize {
-			return MessageHeader{}, oops.Errorf("v1 header too short: got %d bytes, need at least %d", len(data), v1TimestampOff+timestampFieldSize)
-		}
-		return MessageHeader{
-			Version:   version,
-			Priority:  data[v1PriorityOffset],
-			Timestamp: int64(binary.BigEndian.Uint64(data[v1TimestampOff : v1TimestampOff+timestampFieldSize])),
-		}, nil
+	if version != currentVersion {
+		return MessageHeader{}, oops.Errorf("unsupported message version %d", version)
 	}
 
 	return MessageHeader{
-		Priority:  data[0],
-		Timestamp: int64(binary.BigEndian.Uint64(data[timestampOffset:keyLenOffset])),
+		Priority:  data[priorityOffset],
+		Timestamp: int64(binary.BigEndian.Uint64(data[timestampOff : timestampOff+timestampFieldSize])),
 	}, nil
 }

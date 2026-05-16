@@ -50,7 +50,7 @@ func (s *PSASuite) TestReleaseBindingsOnEmptyQueue() {
 	})
 
 	require.Equal(s.T(), 0, psa.bindings.Len(), "bindings should be released for empty partitions")
-	require.Len(s.T(), psa.free, 4, "all partitions should be free")
+	require.Equal(s.T(), 4, psa.free.Size(), "all partitions should be free")
 }
 
 func (s *PSASuite) TestNoFreePartitions() {

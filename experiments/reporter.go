@@ -7,18 +7,20 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/samber/oops"
 )
 
 // ExportCSV writes results as a flat CSV table.
 func ExportCSV(results []ExperimentResult, dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+		return oops.Wrapf(err, "mkdir %q", dir)
 	}
 
 	path := filepath.Join(dir, fmt.Sprintf("results-%s.csv", time.Now().Format("20060102-150405")))
 	f, err := os.Create(path)
 	if err != nil {
-		return err
+		return oops.Wrapf(err, "create %q", path)
 	}
 	defer f.Close()
 
@@ -36,7 +38,7 @@ func ExportCSV(results []ExperimentResult, dir string) error {
 		"low_prio_p50_us", "low_prio_p99_us",
 	}
 	if err := w.Write(header); err != nil {
-		return err
+		return oops.Wrapf(err, "write CSV header")
 	}
 
 	for _, r := range results {
@@ -69,7 +71,7 @@ func ExportCSV(results []ExperimentResult, dir string) error {
 			fmt.Sprintf("%.2f", lowP99),
 		}
 		if err := w.Write(row); err != nil {
-			return err
+			return oops.Wrapf(err, "write CSV row for %s/%s", r.Scenario, r.Algorithm)
 		}
 	}
 
@@ -96,17 +98,20 @@ func prioGroupStats(stats []PriorityStats, from, to int) (p50us, p99us float64) 
 // ExportJSON writes results as a structured JSON file.
 func ExportJSON(results []ExperimentResult, dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+		return oops.Wrapf(err, "mkdir %q", dir)
 	}
 
 	path := filepath.Join(dir, fmt.Sprintf("results-%s.json", time.Now().Format("20060102-150405")))
 	f, err := os.Create(path)
 	if err != nil {
-		return err
+		return oops.Wrapf(err, "create %q", path)
 	}
 	defer f.Close()
 
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
-	return enc.Encode(results)
+	if err := enc.Encode(results); err != nil {
+		return oops.Wrapf(err, "encode results JSON")
+	}
+	return nil
 }

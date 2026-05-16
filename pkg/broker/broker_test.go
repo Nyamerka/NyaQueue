@@ -77,7 +77,7 @@ func (s *BrokerSuite) TestPublishAndConsume() {
 	require.Equal(s.T(), 0, part)
 	require.Equal(s.T(), uint64(1), off)
 
-	got, nextOff, err := b.Consume("t", "grp", 0)
+	got, nextOff, err := b.Consume(context.Background(), "t", "grp", 0)
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), []byte("hello"), got.Value)
 	require.Equal(s.T(), uint64(2), nextOff)
@@ -131,7 +131,7 @@ func (s *BrokerSuite) TestConsumeNoScheduler() {
 	cfg.NumPartitions = 1
 	require.NoError(s.T(), b.CreateTopic("t", cfg))
 
-	_, _, err := b.Consume("t", "grp", 0)
+	_, _, err := b.Consume(context.Background(), "t", "grp", 0)
 	require.Error(s.T(), err)
 }
 
@@ -211,7 +211,7 @@ func (s *BrokerSuite) TestDeleteAndRecreateTopic() {
 	_, _, err = b.Publish(context.Background(), "recreate", msg2)
 	require.NoError(s.T(), err)
 
-	got, _, err := b.Consume("recreate", "grp", 0)
+	got, _, err := b.Consume(context.Background(), "recreate", "grp", 0)
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), []byte("new"), got.Value, "should see only the new message, not stale data")
 }
@@ -290,7 +290,7 @@ func (s *BrokerSuite) TestCompressionRoundTrip() {
 			_, _, err = b.Publish(context.Background(), "t", msg)
 			require.NoError(s.T(), err)
 
-			got, _, err := b.Consume("t", "grp", 0)
+			got, _, err := b.Consume(context.Background(), "t", "grp", 0)
 			require.NoError(s.T(), err)
 			require.Equal(s.T(), original, got.Value)
 		})

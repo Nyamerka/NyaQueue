@@ -9,8 +9,10 @@ import (
 
 	pb "github.com/Nyamerka/NyaQueue/pkg/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 )
 
 type Client struct {
@@ -45,28 +47,62 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) Produce(ctx context.Context, topic string, key, value []byte, priority uint32) (int32, int64, error) {
-	resp, err := c.client.Produce(ctx, &pb.ProduceRequest{
-		Topic:    topic,
-		Key:      key,
-		Value:    value,
-		Priority: priority,
-	})
-	if err != nil {
-		return 0, 0, oops.Wrapf(err, "produce topic=%s", topic)
+	var lastErr error
+	delay := produceRetryBaseDelay
+	for attempt := 0; attempt < produceMaxRetries; attempt++ {
+		resp, err := c.client.Produce(ctx, &pb.ProduceRequest{
+			Topic:    topic,
+			Key:      key,
+			Value:    value,
+			Priority: priority,
+		})
+		if err == nil {
+			return resp.Partition, resp.Offset, nil
+		}
+		if status.Code(err) != codes.ResourceExhausted {
+			return 0, 0, oops.Wrapf(err, "produce topic=%s", topic)
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return 0, 0, ctx.Err()
+		case <-time.After(delay):
+		}
+		delay *= 2
 	}
-	return resp.Partition, resp.Offset, nil
+	return 0, 0, oops.Wrapf(lastErr, "produce topic=%s (exhausted retries)", topic)
 }
 
+const (
+	produceMaxRetries     = 3
+	produceRetryBaseDelay = 1 * time.Millisecond
+)
+
 // ProduceBatch sends a batch of messages in a single RPC.
+// Retries up to produceMaxRetries times on ResourceExhausted with exponential backoff.
 func (c *Client) ProduceBatch(ctx context.Context, topic string, msgs []*pb.ProduceMessage) ([]*pb.ProduceResult, error) {
-	resp, err := c.client.Produce(ctx, &pb.ProduceRequest{
-		Topic:    topic,
-		Messages: msgs,
-	})
-	if err != nil {
-		return nil, oops.Wrapf(err, "produce-batch topic=%s count=%d", topic, len(msgs))
+	var lastErr error
+	delay := produceRetryBaseDelay
+	for attempt := 0; attempt < produceMaxRetries; attempt++ {
+		resp, err := c.client.Produce(ctx, &pb.ProduceRequest{
+			Topic:    topic,
+			Messages: msgs,
+		})
+		if err == nil {
+			return resp.Results, nil
+		}
+		if status.Code(err) != codes.ResourceExhausted {
+			return nil, oops.Wrapf(err, "produce-batch topic=%s count=%d", topic, len(msgs))
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+		delay *= 2
 	}
-	return resp.Results, nil
+	return nil, oops.Wrapf(lastErr, "produce-batch topic=%s count=%d (exhausted retries)", topic, len(msgs))
 }
 
 func (c *Client) Consume(ctx context.Context, topic, group string, partition int32, maxBytes int32) ([]*pb.MessageEnvelope, error) {
@@ -191,7 +227,7 @@ func (p *BufferedProducer) Send(ctx context.Context, key, value []byte, priority
 	if err := p.asyncErr; err != nil {
 		p.asyncErr = nil
 		p.mu.Unlock()
-		return err
+		return oops.Wrapf(err, "buffered producer async error")
 	}
 
 	msgBytes := len(key) + len(value)
@@ -203,7 +239,7 @@ func (p *BufferedProducer) Send(ctx context.Context, key, value []byte, priority
 		p.stopTimerLocked()
 		p.mu.Unlock()
 		if err := p.send(ctx, batch); err != nil {
-			return err
+			return oops.Wrapf(err, "buffered producer flush on memory pressure")
 		}
 		return p.Send(ctx, key, value, priority)
 	}
@@ -286,7 +322,10 @@ func (p *BufferedProducer) flushFromTimer() {
 
 func (p *BufferedProducer) send(ctx context.Context, batch []*pb.ProduceMessage) error {
 	_, err := p.client.ProduceBatch(ctx, p.topic, batch)
-	return err
+	if err != nil {
+		return oops.Wrapf(err, "send batch topic=%q count=%d", p.topic, len(batch))
+	}
+	return nil
 }
 
 func (p *BufferedProducer) stopTimerLocked() {

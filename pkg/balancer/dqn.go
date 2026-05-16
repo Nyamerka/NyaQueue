@@ -3,6 +3,9 @@ package balancer
 import (
 	stdctx "context"
 	"log"
+	"math"
+	"math/rand"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -77,11 +80,13 @@ type DQNBalancer struct {
 
 	lastProcessedGen atomic.Int64
 
-	epsilonCounter atomic.Uint64
+	rngMu sync.Mutex
+	rng   *rand.Rand
+
+	consecutiveFallbackTicks int
+	consecutiveRecoveryTicks int
 
 	policyStateBuf []float64
-	policySnapBuf  [2]policySnap
-	policySnapIdx  int
 }
 
 // DQNOption configures a DQNBalancer.
@@ -126,10 +131,9 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 		opt(d)
 	}
 
+	d.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	d.stateSize = numPartitions*2 + 2
 	d.policyStateBuf = make([]float64, d.stateSize)
-	d.policySnapBuf[0].state = make([]float64, d.stateSize)
-	d.policySnapBuf[1].state = make([]float64, d.stateSize)
 	d.initGoMLX()
 
 	ctx, cancel := stdctx.WithCancel(stdctx.Background())
@@ -218,17 +222,23 @@ func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions in
 		return d.fallbackRR.SelectPartition(topic, key, numPartitions)
 	}
 
-	n := d.epsilonCounter.Add(1)
-	epsilonThresh := uint64(d.epsilon * 65536)
-	if n&0xFFFF < epsilonThresh {
-		return int(n/65536) % numPartitions
+	d.rngMu.Lock()
+	explore := d.rng.Float64() < d.epsilon
+	var randomPart int
+	if explore {
+		randomPart = d.rng.Intn(numPartitions)
+	}
+	d.rngMu.Unlock()
+
+	if explore {
+		return randomPart
 	}
 
 	if cached := d.cachedQValues.Load(); cached != nil && len(*cached) >= numPartitions {
 		return argmax((*cached)[:numPartitions])
 	}
 
-	return int(n) % numPartitions
+	return d.fallbackRR.SelectPartition(topic, key, numPartitions)
 }
 
 func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
@@ -271,7 +281,19 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 		}
 	}
 
-	d.fallbackActive.Store(shouldFallback)
+	if shouldFallback {
+		d.consecutiveRecoveryTicks = 0
+		d.consecutiveFallbackTicks++
+		if d.consecutiveFallbackTicks >= fallbackEnterTicks {
+			d.fallbackActive.Store(true)
+		}
+	} else {
+		d.consecutiveFallbackTicks = 0
+		d.consecutiveRecoveryTicks++
+		if d.consecutiveRecoveryTicks >= fallbackExitTicks {
+			d.fallbackActive.Store(false)
+		}
+	}
 	d.stateMu.Unlock()
 
 	prev := d.prevSnap.Load()
@@ -362,12 +384,13 @@ func (d *DQNBalancer) policyLoop(ctx stdctx.Context) {
 			d.cachedQValues.Store(&qValues)
 
 			gen := d.snapGen.Add(1)
-			idx := d.policySnapIdx & 1
-			d.policySnapIdx++
-			snap := &d.policySnapBuf[idx]
-			copy(snap.state, d.policyStateBuf)
-			snap.action = argmax(qValues[:d.numPartitions])
-			snap.gen = gen
+			stateCopy := make([]float64, len(d.policyStateBuf))
+			copy(stateCopy, d.policyStateBuf)
+			snap := &policySnap{
+				state:  stateCopy,
+				action: argmax(qValues[:d.numPartitions]),
+				gen:    gen,
+			}
 
 			d.prevSnap.Store(d.currSnap.Load())
 			d.currSnap.Store(snap)
@@ -403,10 +426,7 @@ func computeReward(m broker.Metrics) float64 {
 
 	var throughputReward float64
 	if m.Throughput > 0 {
-		throughputReward = m.Throughput / 100000.0
-		if throughputReward > 1.0 {
-			throughputReward = 1.0
-		}
+		throughputReward = math.Log1p(m.Throughput/10_000.0) / dqnThroughputLogNorm
 	}
 
 	meanLoad := 0.0

@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/samber/oops"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
@@ -47,12 +48,13 @@ type configSnapshot struct {
 }
 
 type Broker struct {
-	mu         sync.RWMutex
-	snap       atomic.Pointer[configSnapshot]
+	mu   sync.RWMutex // protects balancer, backpressure, schedulerFactory
+	snap atomic.Pointer[configSnapshot]
+
 	dataDir    string
-	topics     map[string]*Topic
+	topics     *xsync.MapOf[string, *Topic]
+	schedulers *xsync.MapOf[string, Scheduler]
 	balancer   Balancer
-	schedulers map[string]Scheduler
 
 	schedulerFactory func(TopicConfig) Scheduler
 
@@ -78,9 +80,9 @@ func New(cfg Config, dataDir string, bal Balancer, offsetStore *OffsetStore) *Br
 
 	b := &Broker{
 		dataDir:     dataDir,
-		topics:      make(map[string]*Topic),
+		topics:      xsync.NewMapOf[string, *Topic](),
 		balancer:    bal,
-		schedulers:  make(map[string]Scheduler),
+		schedulers:  xsync.NewMapOf[string, Scheduler](),
 		offsetStore: offsetStore,
 	}
 
@@ -112,10 +114,8 @@ func (b *Broker) SetBalancer(bal Balancer) {
 }
 
 func (b *Broker) SetScheduler(topic string, sched Scheduler) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.stopScheduler(topic)
-	b.schedulers[topic] = sched
+	b.schedulers.Store(topic, sched)
 }
 
 func (b *Broker) SetSchedulerFactory(fn func(TopicConfig) Scheduler) {
@@ -134,60 +134,54 @@ func (b *Broker) CreateTopic(name string, cfg TopicConfig) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if _, exists := b.topics[name]; exists {
+	if _, exists := b.topics.Load(name); exists {
 		return oops.Wrapf(ErrTopicAlreadyExists, "create topic %q", name)
 	}
 
 	snap := b.snap.Load()
 	t, err := NewTopic(name, b.dataDir, cfg, snap.cfg.SyncPolicy)
 	if err != nil {
-		return err
+		return oops.Wrapf(err, "create topic %q", name)
 	}
 	if snap.cfg.CompressionType != CompressionNone {
 		for _, p := range t.Partitions() {
 			p.SetBatchCodec(snap.codec)
 		}
 	}
-	b.topics[name] = t
+	b.topics.Store(name, t)
 
 	if b.schedulerFactory != nil {
-		b.schedulers[name] = b.schedulerFactory(cfg)
+		b.schedulers.Store(name, b.schedulerFactory(cfg))
 	}
 
 	return nil
 }
 
 func (b *Broker) stopScheduler(name string) {
-	sched, ok := b.schedulers[name]
+	sched, ok := b.schedulers.LoadAndDelete(name)
 	if !ok {
 		return
 	}
 	if s, ok := sched.(Stopper); ok {
 		s.Stop()
 	}
-	delete(b.schedulers, name)
 }
 
 func (b *Broker) DeleteTopic(name string) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	t, exists := b.topics[name]
+	t, exists := b.topics.LoadAndDelete(name)
 	if !exists {
 		return oops.Wrapf(ErrTopicNotFound, "delete topic %q", name)
 	}
 
-	// Collect partition IDs before closing to clean up predictor/metrics.
 	partIDs := make([]int, 0, len(t.Partitions()))
 	for _, p := range t.Partitions() {
 		partIDs = append(partIDs, p.ID())
 	}
 
-	delete(b.topics, name)
 	b.stopScheduler(name)
 
 	if err := t.Close(); err != nil {
-		return err
+		return oops.Wrapf(err, "close topic %q", name)
 	}
 
 	// Clean up partition-level state to prevent memory leaks in long-lived brokers.
@@ -208,10 +202,7 @@ func (b *Broker) DeleteTopic(name string) error {
 }
 
 func (b *Broker) GetTopic(name string) (*Topic, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	t, exists := b.topics[name]
+	t, exists := b.topics.Load(name)
 	if !exists {
 		return nil, oops.Errorf("topic %q not found", name)
 	}
@@ -219,13 +210,11 @@ func (b *Broker) GetTopic(name string) (*Topic, error) {
 }
 
 func (b *Broker) ListTopics() []*Topic {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	topics := make([]*Topic, 0, len(b.topics))
-	for _, t := range b.topics {
+	var topics []*Topic
+	b.topics.Range(func(_ string, t *Topic) bool {
 		topics = append(topics, t)
-	}
+		return true
+	})
 	return topics
 }
 
@@ -259,18 +248,18 @@ func (b *Broker) Publish(ctx context.Context, topicName string, msg *Message) (p
 	}
 
 	if err := b.compressMessage(msg, snap.codec); err != nil {
-		return 0, 0, err
+		return 0, 0, oops.Wrapf(err, "compress message for topic %q", topicName)
 	}
 
-	b.mu.RLock()
-	t, exists := b.topics[topicName]
-	bal := b.balancer
-	bp := b.backpressure
-	b.mu.RUnlock()
-
+	t, exists := b.topics.Load(topicName)
 	if !exists {
 		return 0, 0, oops.Errorf("topic %q not found", topicName)
 	}
+
+	b.mu.RLock()
+	bal := b.balancer
+	bp := b.backpressure
+	b.mu.RUnlock()
 
 	numParts := t.NumPartitions()
 	partIdx := bal.SelectPartition(topicName, msg.Key, numParts)
@@ -284,13 +273,13 @@ func (b *Broker) Publish(ctx context.Context, topicName string, msg *Message) (p
 
 	p, err := t.Partition(partIdx)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, oops.Wrapf(err, "get partition %d for topic %q", partIdx, topicName)
 	}
 
 	msg.Header.ProduceTime = time.Now().UnixNano()
 	offset, err = p.Append(msg)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, oops.Wrapf(err, "append to partition %d", partIdx)
 	}
 
 	b.metrics.RecordProduce(topicName, partIdx)
@@ -307,18 +296,18 @@ type PublishResult struct {
 func (b *Broker) PublishBatch(ctx context.Context, topicName string, msgs []*Message) []PublishResult {
 	results := make([]PublishResult, len(msgs))
 
-	b.mu.RLock()
-	t, exists := b.topics[topicName]
-	bal := b.balancer
-	bp := b.backpressure
-	b.mu.RUnlock()
-
+	t, exists := b.topics.Load(topicName)
 	if !exists {
 		for i := range results {
 			results[i].Err = oops.Errorf("topic %q not found", topicName)
 		}
 		return results
 	}
+
+	b.mu.RLock()
+	bal := b.balancer
+	bp := b.backpressure
+	b.mu.RUnlock()
 
 	numParts := t.NumPartitions()
 
@@ -405,30 +394,28 @@ func (b *Broker) PublishBatch(ctx context.Context, topicName string, msgs []*Mes
 		return results
 	}
 
-	var wg sync.WaitGroup
+	var eg errgroup.Group
 	for partIdx, batch := range groups {
-		wg.Add(1)
-		go func(partIdx int, batch []indexed) {
-			defer wg.Done()
-
+		eg.Go(func() error {
 			gate := snap.gate
 			if err := gate.sem.Acquire(ctx, 1); err != nil {
 				for _, item := range batch {
 					results[item.idx].Err = err
 				}
-				return
+				return nil
 			}
 			defer gate.sem.Release(1)
 
 			appendPartitionBatch(partIdx, batch)
-		}(partIdx, batch)
+			return nil
+		})
 	}
-	wg.Wait()
+	_ = eg.Wait()
 
 	return results
 }
 
-func (b *Broker) Consume(topicName, group string, partIdx int) (*Message, uint64, error) {
+func (b *Broker) Consume(ctx context.Context, topicName, group string, partIdx int) (*Message, uint64, error) {
 	var consumerOffset uint64
 	if b.offsetStore != nil {
 		off, err := b.offsetStore.Load(group, topicName, partIdx)
@@ -438,17 +425,15 @@ func (b *Broker) Consume(topicName, group string, partIdx int) (*Message, uint64
 			consumerOffset = uint64(off)
 		}
 	}
-	return b.ConsumeFrom(topicName, group, partIdx, consumerOffset)
+	return b.ConsumeFrom(ctx, topicName, group, partIdx, consumerOffset)
 }
 
 // ConsumeFrom reads a message starting from the given offset. Used by the
 // transport layer's batch-consume loop which tracks offsets locally and commits
 // once at the end of the batch, rather than after every message.
-func (b *Broker) ConsumeFrom(topicName, group string, partIdx int, offset uint64) (*Message, uint64, error) {
-	b.mu.RLock()
-	t, exists := b.topics[topicName]
-	sched := b.schedulers[topicName]
-	b.mu.RUnlock()
+func (b *Broker) ConsumeFrom(ctx context.Context, topicName, group string, partIdx int, offset uint64) (*Message, uint64, error) {
+	t, exists := b.topics.Load(topicName)
+	sched, _ := b.schedulers.Load(topicName)
 
 	if !exists {
 		return nil, 0, oops.Errorf("topic %q not found", topicName)
@@ -456,7 +441,7 @@ func (b *Broker) ConsumeFrom(topicName, group string, partIdx int, offset uint64
 
 	p, err := t.Partition(partIdx)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, oops.Wrapf(err, "get partition %d for topic %q", partIdx, topicName)
 	}
 
 	if sched == nil {
@@ -465,11 +450,11 @@ func (b *Broker) ConsumeFrom(topicName, group string, partIdx int, offset uint64
 
 	msg, nextOffset, err := sched.Next(p, offset)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, oops.Wrapf(err, "scheduler.Next topic=%q part=%d", topicName, partIdx)
 	}
 
 	if err := b.decompressMessage(msg); err != nil {
-		return nil, 0, err
+		return nil, 0, oops.Wrapf(err, "decompress message topic=%q part=%d", topicName, partIdx)
 	}
 
 	b.metrics.RecordConsume(topicName, partIdx, group)
@@ -477,7 +462,7 @@ func (b *Broker) ConsumeFrom(topicName, group string, partIdx int, offset uint64
 	return msg, nextOffset, nil
 }
 
-func (b *Broker) ConsumeBatch(topicName, group string, partIdx int, maxMessages int) ([]*Message, uint64, error) {
+func (b *Broker) ConsumeBatch(ctx context.Context, topicName, group string, partIdx int, maxMessages int) ([]*Message, uint64, error) {
 	var msgs []*Message
 	var lastOffset uint64
 
@@ -493,7 +478,7 @@ func (b *Broker) ConsumeBatch(topicName, group string, partIdx int, maxMessages 
 	}
 
 	for i := 0; i < maxMessages; i++ {
-		msg, nextOff, err := b.ConsumeFrom(topicName, group, partIdx, currentOffset)
+		msg, nextOff, err := b.ConsumeFrom(ctx, topicName, group, partIdx, currentOffset)
 		if err != nil {
 			if errors.Is(err, ErrNoMessages) {
 				break
@@ -513,7 +498,7 @@ func (b *Broker) ConsumeBatch(topicName, group string, partIdx int, maxMessages 
 	}
 
 	if err := b.Commit(group, topicName, partIdx, int64(lastOffset)); err != nil {
-		return msgs, lastOffset, err
+		return msgs, lastOffset, oops.Wrapf(err, "commit offset topic=%q part=%d", topicName, partIdx)
 	}
 	return msgs, lastOffset, nil
 }
@@ -525,7 +510,7 @@ func (b *Broker) LoadOffset(group, topicName string, partIdx int) (uint64, error
 	}
 	off, err := b.offsetStore.Load(group, topicName, partIdx)
 	if err != nil {
-		return 1, err
+		return 1, oops.Wrapf(err, "load offset group=%q topic=%q part=%d", group, topicName, partIdx)
 	}
 	return uint64(off), nil
 }
@@ -551,7 +536,7 @@ func (b *Broker) Config() Config {
 
 func (b *Broker) ApplyConfig(cfg Config) error {
 	if err := cfg.Validate(); err != nil {
-		return err
+		return oops.Wrapf(err, "validate config")
 	}
 
 	old := b.snap.Load()
@@ -654,17 +639,24 @@ func (b *Broker) metricsLoop(ctx context.Context) {
 					avgPred /= float64(len(snap.PredictedLoads))
 				}
 
-				var maxFlushMs float64
-				b.mu.RLock()
-				for _, t := range b.topics {
-					for _, p := range t.Partitions() {
-						flushMs := float64(p.LastFlushLatency()) / float64(time.Millisecond)
-						if flushMs > maxFlushMs {
-							maxFlushMs = flushMs
-						}
+			var maxFlushNs int64
+			var sumFlushNs int64
+			var partCount int64
+			b.topics.Range(func(_ string, t *Topic) bool {
+				for _, p := range t.Partitions() {
+					flushNs := int64(p.LastFlushLatency())
+					if flushNs > maxFlushNs {
+						maxFlushNs = flushNs
 					}
+					sumFlushNs += flushNs
+					partCount++
 				}
-				b.mu.RUnlock()
+				return true
+			})
+				if partCount > 0 {
+					b.metrics.avgFlushLatencyNs.Store(sumFlushNs / partCount)
+				}
+				maxFlushMs := float64(maxFlushNs) / float64(time.Millisecond)
 				bp.UpdateSystem(SystemSignal{AvgPredictedLoad: avgPred, WALFlushLatencyMs: maxFlushMs})
 			}
 
@@ -702,12 +694,11 @@ func (b *Broker) retentionLoop(ctx context.Context) {
 		case <-ticker.C:
 			cfg := &b.snap.Load().cfg
 
-			b.mu.RLock()
-			topics := make([]*Topic, 0, len(b.topics))
-			for _, t := range b.topics {
+			var topics []*Topic
+			b.topics.Range(func(_ string, t *Topic) bool {
 				topics = append(topics, t)
-			}
-			b.mu.RUnlock()
+				return true
+			})
 
 			for _, t := range topics {
 				if t.IsClosed() {
@@ -775,21 +766,22 @@ func (b *Broker) Stop() {
 	}
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	if s, ok := b.balancer.(Stopper); ok {
 		s.Stop()
 	}
+	b.mu.Unlock()
 
-	for name := range b.schedulers {
+	b.schedulers.Range(func(name string, _ Scheduler) bool {
 		b.stopScheduler(name)
-	}
+		return true
+	})
 
-	for _, t := range b.topics {
+	b.topics.Range(func(_ string, t *Topic) bool {
 		if err := t.Close(); err != nil {
 			log.Printf("error closing topic %s: %v", t.Name(), err)
 		}
-	}
+		return true
+	})
 
 	if b.offsetStore != nil {
 		b.offsetStore.Close()
