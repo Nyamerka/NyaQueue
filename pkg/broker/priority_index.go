@@ -2,6 +2,7 @@ package broker
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -12,10 +13,15 @@ type PendingEntry struct {
 	ArrivedAt time.Time
 }
 
+type priorityLevel struct {
+	mu      sync.Mutex
+	entries []PendingEntry
+	count   atomic.Int32
+}
+
 type PriorityIndex struct {
-	mu     sync.RWMutex
-	levels [MaxPriority][]PendingEntry // 0=lowest, 9=highest
-	count  int
+	levels [MaxPriority]priorityLevel
+	total  atomic.Int64
 }
 
 func NewPriorityIndex() *PriorityIndex {
@@ -30,100 +36,121 @@ func (pi *PriorityIndex) Add(priority int, offset int64, arrivedAt time.Time) {
 		priority = MaxPriority - 1
 	}
 
-	pi.mu.Lock()
-	defer pi.mu.Unlock()
-
-	pi.levels[priority] = append(pi.levels[priority], PendingEntry{
+	lv := &pi.levels[priority]
+	lv.mu.Lock()
+	lv.entries = append(lv.entries, PendingEntry{
 		WalOffset: offset,
 		ArrivedAt: arrivedAt,
 	})
-	pi.count++
+	lv.count.Add(1)
+	lv.mu.Unlock()
+	pi.total.Add(1)
 }
 
-// PopHighest returns the offset of the highest-priority pending message (FIFO within level).
 func (pi *PriorityIndex) PopHighest() (PendingEntry, bool) {
-	pi.mu.Lock()
-	defer pi.mu.Unlock()
-
 	for p := MaxPriority - 1; p >= 0; p-- {
-		if len(pi.levels[p]) > 0 {
-			entry := pi.levels[p][0]
-			pi.levels[p] = pi.levels[p][1:]
-			pi.count--
+		lv := &pi.levels[p]
+		lv.mu.Lock()
+		if len(lv.entries) > 0 {
+			entry := lv.entries[0]
+			lv.entries = lv.entries[1:]
+			lv.count.Add(-1)
+			lv.mu.Unlock()
+			pi.total.Add(-1)
 			return entry, true
 		}
+		lv.mu.Unlock()
 	}
 	return PendingEntry{}, false
 }
 
-// PopWithThreshold pops: priority >= threshold by priority order, below threshold by FIFO.
 func (pi *PriorityIndex) PopWithThreshold(threshold int) (PendingEntry, bool) {
-	pi.mu.Lock()
-	defer pi.mu.Unlock()
-
-	// First try high-priority entries
 	for p := MaxPriority - 1; p >= threshold; p-- {
-		if len(pi.levels[p]) > 0 {
-			entry := pi.levels[p][0]
-			pi.levels[p] = pi.levels[p][1:]
-			pi.count--
+		lv := &pi.levels[p]
+		lv.mu.Lock()
+		if len(lv.entries) > 0 {
+			entry := lv.entries[0]
+			lv.entries = lv.entries[1:]
+			lv.count.Add(-1)
+			lv.mu.Unlock()
+			pi.total.Add(-1)
 			return entry, true
 		}
+		lv.mu.Unlock()
 	}
 
-	// Below threshold: oldest entry across all remaining levels (FIFO-like)
-	bestIdx := -1
-	var bestEntry PendingEntry
+	// Below threshold: oldest entry across remaining levels (FIFO-like).
+	// Hold lock on current-best level while scanning; acquire in ascending
+	// order to prevent deadlock.
+	bestPriority := -1
+	var bestTime time.Time
 	for p := 0; p < threshold && p < MaxPriority; p++ {
-		if len(pi.levels[p]) > 0 {
-			e := pi.levels[p][0]
-			if bestIdx == -1 || e.ArrivedAt.Before(bestEntry.ArrivedAt) {
-				bestIdx = p
-				bestEntry = e
+		lv := &pi.levels[p]
+		lv.mu.Lock()
+		if len(lv.entries) > 0 {
+			e := lv.entries[0]
+			if bestPriority == -1 || e.ArrivedAt.Before(bestTime) {
+				if bestPriority >= 0 {
+					pi.levels[bestPriority].mu.Unlock()
+				}
+				bestPriority = p
+				bestTime = e.ArrivedAt
+			} else {
+				lv.mu.Unlock()
 			}
+		} else {
+			lv.mu.Unlock()
 		}
 	}
-	if bestIdx >= 0 {
-		pi.levels[bestIdx] = pi.levels[bestIdx][1:]
-		pi.count--
-		return bestEntry, true
+	if bestPriority >= 0 {
+		lv := &pi.levels[bestPriority]
+		entry := lv.entries[0]
+		lv.entries = lv.entries[1:]
+		lv.count.Add(-1)
+		lv.mu.Unlock()
+		pi.total.Add(-1)
+		return entry, true
 	}
 	return PendingEntry{}, false
 }
 
 func (pi *PriorityIndex) Len() int {
-	pi.mu.RLock()
-	defer pi.mu.RUnlock()
-	return pi.count
+	return int(pi.total.Load())
 }
 
 func (pi *PriorityIndex) LevelDistribution() [MaxPriority]int {
-	pi.mu.RLock()
-	defer pi.mu.RUnlock()
-
 	var dist [MaxPriority]int
 	for i := range pi.levels {
-		dist[i] = len(pi.levels[i])
+		dist[i] = int(pi.levels[i].count.Load())
 	}
 	return dist
 }
 
-// PromoteStale bumps entries older than ttl to the next priority level (anti-starvation).
 func (pi *PriorityIndex) PromoteStale(ttl time.Duration) {
-	pi.mu.Lock()
-	defer pi.mu.Unlock()
-
 	now := time.Now()
-	// Iterate from high to low to avoid cascading promotions within a single call.
 	for p := MaxPriority - 2; p >= 0; p-- {
-		fresh := pi.levels[p][:0]
-		for _, e := range pi.levels[p] {
+		lv := &pi.levels[p]
+		lv.mu.Lock()
+
+		var stale []PendingEntry
+		fresh := lv.entries[:0]
+		for _, e := range lv.entries {
 			if now.Sub(e.ArrivedAt) > ttl {
-				pi.levels[p+1] = append(pi.levels[p+1], e)
+				stale = append(stale, e)
 			} else {
 				fresh = append(fresh, e)
 			}
 		}
-		pi.levels[p] = fresh
+		lv.entries = fresh
+		lv.count.Store(int32(len(fresh)))
+		lv.mu.Unlock()
+
+		if len(stale) > 0 {
+			up := &pi.levels[p+1]
+			up.mu.Lock()
+			up.entries = append(up.entries, stale...)
+			up.count.Store(int32(len(up.entries)))
+			up.mu.Unlock()
+		}
 	}
 }

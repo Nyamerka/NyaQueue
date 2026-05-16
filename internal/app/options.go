@@ -25,11 +25,25 @@ func WithBalancerFactory(fn func() broker.Balancer) Option {
 	}
 }
 
-// WithDefaultBalancer uses RoundRobin.
+// WithDefaultBalancer uses PowerOfTwoChoices with default settings.
 func WithDefaultBalancer() Option {
+	return WithP2CBalancer()
+}
+
+// WithP2CBalancer uses PowerOfTwoChoices with the given options.
+func WithP2CBalancer(opts ...balancer.P2COption) Option {
 	return func(a *BrokerApp) {
 		a.balancerFactory = func() broker.Balancer {
-			return balancer.NewRoundRobin()
+			return balancer.NewPowerOfTwoChoices(opts...)
+		}
+	}
+}
+
+// WithRoundRobinBalancer uses RoundRobin with the given options.
+func WithRoundRobinBalancer(opts ...balancer.RROption) Option {
+	return func(a *BrokerApp) {
+		a.balancerFactory = func() broker.Balancer {
+			return balancer.NewRoundRobin(opts...)
 		}
 	}
 }

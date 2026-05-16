@@ -1,7 +1,6 @@
 package broker
 
 import (
-	"sync"
 	"sync/atomic"
 )
 
@@ -24,9 +23,8 @@ type SystemSignal struct {
 // (no direct predictor reference to avoid dual sources).
 // Also supports system-wide backpressure when avg predicted load exceeds threshold.
 type BackpressureController struct {
-	threshold      float64
-	predictedLoads []float64
-	predictedMu    sync.RWMutex
+	threshold float64
+	predicted atomic.Pointer[[]float64]
 
 	systemSignal atomic.Pointer[SystemSignal]
 
@@ -37,7 +35,7 @@ type BackpressureController struct {
 
 func NewBackpressureController(threshold float64) *BackpressureController {
 	if threshold <= 0 {
-		threshold = 0.85
+		threshold = DefaultBPThreshold
 	}
 	return &BackpressureController{
 		threshold: threshold,
@@ -45,13 +43,9 @@ func NewBackpressureController(threshold float64) *BackpressureController {
 }
 
 func (bp *BackpressureController) UpdatePredictions(predicted []float64) {
-	bp.predictedMu.Lock()
-	if cap(bp.predictedLoads) < len(predicted) {
-		bp.predictedLoads = make([]float64, len(predicted))
-	}
-	bp.predictedLoads = bp.predictedLoads[:len(predicted)]
-	copy(bp.predictedLoads, predicted)
-	bp.predictedMu.Unlock()
+	cp := make([]float64, len(predicted))
+	copy(cp, predicted)
+	bp.predicted.Store(&cp)
 }
 
 func (bp *BackpressureController) UpdateSystem(sig SystemSignal) {
@@ -77,23 +71,21 @@ func (bp *BackpressureController) evaluate(partitionID int) BackpressureState {
 		if sig.AvgPredictedLoad > bp.threshold {
 			return BPClosed
 		}
-		if sig.WALFlushLatencyMs > 100 {
+		if sig.WALFlushLatencyMs > bpFlushLatencyWarnMs {
 			return BPWarn
 		}
 	}
 
-	bp.predictedMu.RLock()
-	defer bp.predictedMu.RUnlock()
-
-	if partitionID >= len(bp.predictedLoads) {
+	loads := bp.predicted.Load()
+	if loads == nil || partitionID >= len(*loads) {
 		return BPOpen
 	}
 
-	load := bp.predictedLoads[partitionID]
+	load := (*loads)[partitionID]
 	switch {
 	case load > bp.threshold:
 		return BPClosed
-	case load > bp.threshold*0.9:
+	case load > bp.threshold*bpWarnRatio:
 		return BPWarn
 	default:
 		return BPOpen

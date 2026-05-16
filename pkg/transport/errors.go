@@ -3,6 +3,7 @@ package transport
 import (
 	"errors"
 
+	"github.com/samber/oops"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -21,7 +22,7 @@ func mapBrokerError(err error) error {
 	case errors.Is(err, broker.ErrTopicNotFound):
 		return status.Error(codes.NotFound, err.Error())
 	}
-	return err
+	return oops.Wrapf(err, "unmapped broker error")
 }
 
 func mapClientError(err error) error {
@@ -34,5 +35,5 @@ func mapClientError(err error) error {
 	case codes.NotFound:
 		return errors.Join(broker.ErrTopicNotFound, err)
 	}
-	return err
+	return oops.Wrapf(err, "unmapped gRPC status %s", status.Code(err))
 }

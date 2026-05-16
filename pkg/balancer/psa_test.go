@@ -100,6 +100,40 @@ func (s *PSASuite) TestConcurrentSelectAndOnMetrics() {
 	wg.Wait()
 }
 
+func (s *PSASuite) TestConcurrentBindRelease() {
+	const np = 8
+	psa := NewPSA(np)
+	var wg sync.WaitGroup
+
+	for g := 0; g < 10; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				key := []byte{byte(g), byte(j >> 8), byte(j)}
+				psa.SelectPartition("t", key, np)
+			}
+		}(g)
+	}
+
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				psa.OnMetrics(broker.Metrics{
+					DerivedMetrics: broker.DerivedMetrics{
+						PartitionLoads: make([]float64, np),
+						QueueDepth:     make([]int, np),
+					},
+				})
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
 func (s *PSASuite) TestEvictionCountIncrementsOnOverflow() {
 	numParts := 128
 	psa := NewPSA(numParts)

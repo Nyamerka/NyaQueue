@@ -2,7 +2,6 @@ package nn
 
 import (
 	"math/rand/v2"
-	"sync"
 	"sync/atomic"
 )
 
@@ -19,25 +18,12 @@ type ReplayBuffer struct {
 	slots    []atomic.Pointer[Transition]
 	capacity int64
 	writeIdx atomic.Int64
-
-	rngMu sync.Mutex
-	rng   *rand.Rand
 }
 
 func NewReplayBuffer(capacity int) *ReplayBuffer {
 	rb := &ReplayBuffer{
 		slots:    make([]atomic.Pointer[Transition], capacity),
 		capacity: int64(capacity),
-		rng:      rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
-	}
-	return rb
-}
-
-func NewReplayBufferWithSeed(capacity int, seed int64) *ReplayBuffer {
-	rb := &ReplayBuffer{
-		slots:    make([]atomic.Pointer[Transition], capacity),
-		capacity: int64(capacity),
-		rng:      rand.New(rand.NewPCG(uint64(seed), uint64(seed)^0xDEAD)),
 	}
 	return rb
 }
@@ -82,15 +68,13 @@ func (rb *ReplayBuffer) SampleInto(dst []Transition) int {
 		count = n
 	}
 
-	rb.rngMu.Lock()
 	for i := 0; i < count; i++ {
-		idx := rb.rng.IntN(n)
+		idx := rand.IntN(n)
 		ptr := rb.slots[idx].Load()
 		if ptr != nil {
 			dst[i] = *ptr
 		}
 	}
-	rb.rngMu.Unlock()
 	return count
 }
 

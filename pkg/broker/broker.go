@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -47,21 +46,23 @@ type configSnapshot struct {
 	gate  *ioGate
 }
 
+type runtimeSnap struct {
+	balancer         Balancer
+	backpressure     *BackpressureController
+	schedulerFactory func(TopicConfig) Scheduler
+}
+
 type Broker struct {
-	mu   sync.RWMutex // protects balancer, backpressure, schedulerFactory
-	snap atomic.Pointer[configSnapshot]
+	snap    atomic.Pointer[configSnapshot]
+	runtime atomic.Pointer[runtimeSnap]
 
 	dataDir    string
 	topics     *xsync.MapOf[string, *Topic]
 	schedulers *xsync.MapOf[string, Scheduler]
-	balancer   Balancer
 
-	schedulerFactory func(TopicConfig) Scheduler
-
-	metrics      *MetricsCollector
-	predictor    *LoadPredictor
-	backpressure *BackpressureController
-	offsetStore  *OffsetStore
+	metrics     *MetricsCollector
+	predictor   *LoadPredictor
+	offsetStore *OffsetStore
 
 	eg     *errgroup.Group
 	cancel context.CancelFunc
@@ -81,7 +82,6 @@ func New(cfg Config, dataDir string, bal Balancer, offsetStore *OffsetStore) *Br
 	b := &Broker{
 		dataDir:     dataDir,
 		topics:      xsync.NewMapOf[string, *Topic](),
-		balancer:    bal,
 		schedulers:  xsync.NewMapOf[string, Scheduler](),
 		offsetStore: offsetStore,
 	}
@@ -93,22 +93,32 @@ func New(cfg Config, dataDir string, bal Balancer, offsetStore *OffsetStore) *Br
 		gate:  &ioGate{sem: semaphore.NewWeighted(ioPoolSize), cap: ioPoolSize},
 	})
 
-	b.predictor = NewLoadPredictor(100, 8, 100*time.Millisecond)
+	b.runtime.Store(&runtimeSnap{
+		balancer:     bal,
+		backpressure: NewBackpressureController(DefaultBPThreshold),
+	})
+
+	b.predictor = NewLoadPredictor(defaultPredictorWindowCap, defaultPredictorHorizon, defaultPredictorInterval)
 	b.metrics = NewMetricsCollector(b)
-	b.backpressure = NewBackpressureController(0.85)
 
 	return b
 }
 
 func (b *Broker) SetBalancer(bal Balancer) {
-	b.mu.Lock()
-	old := b.balancer
-	b.balancer = bal
-	b.mu.Unlock()
-
-	if old != nil {
-		if s, ok := old.(Stopper); ok {
-			go s.Stop()
+	for {
+		old := b.runtime.Load()
+		next := &runtimeSnap{
+			balancer:         bal,
+			backpressure:     old.backpressure,
+			schedulerFactory: old.schedulerFactory,
+		}
+		if b.runtime.CompareAndSwap(old, next) {
+			if old.balancer != nil {
+				if s, ok := old.balancer.(Stopper); ok {
+					go s.Stop()
+				}
+			}
+			return
 		}
 	}
 }
@@ -119,25 +129,34 @@ func (b *Broker) SetScheduler(topic string, sched Scheduler) {
 }
 
 func (b *Broker) SetSchedulerFactory(fn func(TopicConfig) Scheduler) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.schedulerFactory = fn
+	for {
+		old := b.runtime.Load()
+		next := &runtimeSnap{
+			balancer:         old.balancer,
+			backpressure:     old.backpressure,
+			schedulerFactory: fn,
+		}
+		if b.runtime.CompareAndSwap(old, next) {
+			return
+		}
+	}
 }
 
 func (b *Broker) SetBackpressure(bp *BackpressureController) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.backpressure = bp
+	for {
+		old := b.runtime.Load()
+		next := &runtimeSnap{
+			balancer:         old.balancer,
+			backpressure:     bp,
+			schedulerFactory: old.schedulerFactory,
+		}
+		if b.runtime.CompareAndSwap(old, next) {
+			return
+		}
+	}
 }
 
 func (b *Broker) CreateTopic(name string, cfg TopicConfig) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if _, exists := b.topics.Load(name); exists {
-		return oops.Wrapf(ErrTopicAlreadyExists, "create topic %q", name)
-	}
-
 	snap := b.snap.Load()
 	t, err := NewTopic(name, b.dataDir, cfg, snap.cfg.SyncPolicy)
 	if err != nil {
@@ -148,10 +167,15 @@ func (b *Broker) CreateTopic(name string, cfg TopicConfig) error {
 			p.SetBatchCodec(snap.codec)
 		}
 	}
-	b.topics.Store(name, t)
 
-	if b.schedulerFactory != nil {
-		b.schedulers.Store(name, b.schedulerFactory(cfg))
+	if _, loaded := b.topics.LoadOrStore(name, t); loaded {
+		_ = t.Close()
+		return oops.Wrapf(ErrTopicAlreadyExists, "create topic %q", name)
+	}
+
+	rt := b.runtime.Load()
+	if rt.schedulerFactory != nil {
+		b.schedulers.Store(name, rt.schedulerFactory(cfg))
 	}
 
 	return nil
@@ -256,17 +280,13 @@ func (b *Broker) Publish(ctx context.Context, topicName string, msg *Message) (p
 		return 0, 0, oops.Errorf("topic %q not found", topicName)
 	}
 
-	b.mu.RLock()
-	bal := b.balancer
-	bp := b.backpressure
-	b.mu.RUnlock()
+	rt := b.runtime.Load()
 
 	numParts := t.NumPartitions()
-	partIdx := bal.SelectPartition(topicName, msg.Key, numParts)
+	partIdx := rt.balancer.SelectPartition(topicName, msg.Key, numParts)
 
-	if bp != nil {
-		state := bp.Check(partIdx)
-		if state == BPClosed {
+	if rt.backpressure != nil {
+		if rt.backpressure.Check(partIdx) == BPClosed {
 			return 0, 0, ErrThrottled
 		}
 	}
@@ -304,10 +324,9 @@ func (b *Broker) PublishBatch(ctx context.Context, topicName string, msgs []*Mes
 		return results
 	}
 
-	b.mu.RLock()
-	bal := b.balancer
-	bp := b.backpressure
-	b.mu.RUnlock()
+	rt := b.runtime.Load()
+	bal := rt.balancer
+	bp := rt.backpressure
 
 	numParts := t.NumPartitions()
 
@@ -603,11 +622,8 @@ func (b *Broker) Start() {
 }
 
 func (b *Broker) metricsLoop(ctx context.Context) {
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(metricsTickInterval)
 	defer ticker.Stop()
-
-	const warmupTicks = 50
-	const historyCapacity = 100
 
 	for {
 		select {
@@ -620,10 +636,9 @@ func (b *Broker) metricsLoop(ctx context.Context) {
 				b.metrics.lastSnap.Store(&snap)
 			}
 
-			b.mu.RLock()
-			bal := b.balancer
-			bp := b.backpressure
-			b.mu.RUnlock()
+			rt := b.runtime.Load()
+			bal := rt.balancer
+			bp := rt.backpressure
 
 			if bal != nil {
 				bal.OnMetrics(snap)
@@ -662,13 +677,13 @@ func (b *Broker) metricsLoop(ctx context.Context) {
 
 			b.metrics.historyMu.Lock()
 			b.metrics.throughputHistory = append(b.metrics.throughputHistory, snap.Throughput)
-			if len(b.metrics.throughputHistory) > historyCapacity {
+			if len(b.metrics.throughputHistory) > metricsHistoryCap {
 				b.metrics.throughputHistory = b.metrics.throughputHistory[1:]
 			}
 			th := b.metrics.throughputHistory
 			b.metrics.historyMu.Unlock()
 
-			if len(th) >= warmupTicks {
+			if len(th) >= metricsWarmupTicks {
 				if setter, ok := bal.(BaseThroughputSetter); ok {
 					baseWindow := th[:len(th)*4/5]
 					sum := 0.0
@@ -765,11 +780,11 @@ func (b *Broker) Stop() {
 		_ = b.eg.Wait()
 	}
 
-	b.mu.Lock()
-	if s, ok := b.balancer.(Stopper); ok {
-		s.Stop()
+	if rt := b.runtime.Load(); rt.balancer != nil {
+		if s, ok := rt.balancer.(Stopper); ok {
+			s.Stop()
+		}
 	}
-	b.mu.Unlock()
 
 	b.schedulers.Range(func(name string, _ Scheduler) bool {
 		b.stopScheduler(name)

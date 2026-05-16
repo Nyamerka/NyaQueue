@@ -77,14 +77,25 @@ func BenchmarkP2CSelect(b *testing.B) {
 	p2c.OnMetrics(broker.Metrics{
 		DerivedMetrics: broker.DerivedMetrics{
 			PartitionLoads: []float64{0.1, 0.5, 0.3, 0.8, 0.2, 0.6, 0.4, 0.7},
+			QueueDepth:     []int{10, 50, 30, 80, 20, 60, 40, 70},
 		},
 	})
 	key := []byte("test-key")
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		p2c.SelectPartition("topic", key, 8)
-	}
+	b.Run("serial", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			p2c.SelectPartition("topic", key, 8)
+		}
+	})
+
+	b.Run("parallel", func(b *testing.B) {
+		b.RunParallel(func(pb *testing.PB) {
+			k := []byte("test-key")
+			for pb.Next() {
+				p2c.SelectPartition("topic", k, 8)
+			}
+		})
+	})
 }
 
 func BenchmarkMessageMarshalUnmarshal(b *testing.B) {

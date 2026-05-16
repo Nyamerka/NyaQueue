@@ -1,8 +1,7 @@
 package nn
 
 import (
-	"math/rand"
-	"time"
+	"math/rand/v2"
 )
 
 // OUNoise implements Ornstein-Uhlenbeck process for DDPG exploration
@@ -32,7 +31,7 @@ func NewOUNoise(size int, mu, theta, sigma float64) *OUNoise {
 		sigmaDecay: 1.0,
 		sigmaFloor: 0.0,
 		state:      state,
-		rng:        rand.New(rand.NewSource(time.Now().UnixNano())),
+		rng:        rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 	}
 }
 

@@ -248,10 +248,9 @@ func (mc *MetricsCollector) Collect() Metrics {
 	}
 
 	var obs ObservabilityMetrics
-	mc.broker.mu.RLock()
-	bp := mc.broker.backpressure
-	bal := mc.broker.balancer
-	mc.broker.mu.RUnlock()
+	rt := mc.broker.runtime.Load()
+	bp := rt.backpressure
+	bal := rt.balancer
 
 	if bp != nil {
 		obs.BackpressureClosedCount = bp.ClosedCount()

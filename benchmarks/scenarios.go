@@ -3,7 +3,7 @@ package benchmarks
 import (
 	"crypto/rand"
 	"math/big"
-	mrand "math/rand"
+	mrand "math/rand/v2"
 	"time"
 )
 

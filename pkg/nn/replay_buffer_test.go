@@ -136,23 +136,6 @@ func (s *ReplayBufferSuite) TestDeepCopyOnPush() {
 	require.Equal(s.T(), 1.0, batch[0].State[0], "push must deep-copy to prevent aliasing")
 }
 
-func (s *ReplayBufferSuite) TestDeterministicWithSeed() {
-	rb1 := NewReplayBufferWithSeed(100, 12345)
-	rb2 := NewReplayBufferWithSeed(100, 12345)
-	for i := 0; i < 50; i++ {
-		t := Transition{State: []float64{float64(i)}, Action: []float64{0}, Reward: float64(i)}
-		rb1.Push(t)
-		rb2.Push(t)
-	}
-
-	b1 := rb1.Sample(10)
-	b2 := rb2.Sample(10)
-	require.Equal(s.T(), len(b1), len(b2))
-	for i := range b1 {
-		require.Equal(s.T(), b1[i].Reward, b2[i].Reward)
-	}
-}
-
 func (s *ReplayBufferSuite) TestConcurrentPushAndSample() {
 	rb := NewReplayBuffer(1000)
 	var wg sync.WaitGroup

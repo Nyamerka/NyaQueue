@@ -4,8 +4,7 @@ import (
 	stdctx "context"
 	"log"
 	"math"
-	"math/rand"
-	"sync"
+	"math/rand/v2"
 	"sync/atomic"
 	"time"
 
@@ -80,9 +79,6 @@ type DQNBalancer struct {
 
 	lastProcessedGen atomic.Int64
 
-	rngMu sync.Mutex
-	rng   *rand.Rand
-
 	consecutiveFallbackTicks int
 	consecutiveRecoveryTicks int
 
@@ -131,7 +127,6 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 		opt(d)
 	}
 
-	d.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	d.stateSize = numPartitions*2 + 2
 	d.policyStateBuf = make([]float64, d.stateSize)
 	d.initGoMLX()
@@ -222,16 +217,8 @@ func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions in
 		return d.fallbackRR.SelectPartition(topic, key, numPartitions)
 	}
 
-	d.rngMu.Lock()
-	explore := d.rng.Float64() < d.epsilon
-	var randomPart int
-	if explore {
-		randomPart = d.rng.Intn(numPartitions)
-	}
-	d.rngMu.Unlock()
-
-	if explore {
-		return randomPart
+	if rand.Float64() < d.epsilon {
+		return rand.IntN(numPartitions)
 	}
 
 	if cached := d.cachedQValues.Load(); cached != nil && len(*cached) >= numPartitions {
@@ -367,7 +354,7 @@ func (d *DQNBalancer) trainLoop(ctx stdctx.Context) {
 }
 
 func (d *DQNBalancer) policyLoop(ctx stdctx.Context) {
-	ticker := newTicker100ms()
+	ticker := newPolicyTicker()
 	defer ticker.Stop()
 
 	for {
@@ -411,34 +398,49 @@ func (d *DQNBalancer) buildStateInto(dst []float64) {
 	copy(dst[d.numPartitions:], d.predictedLoads)
 	idx := d.numPartitions * 2
 	if idx < len(dst) {
-		dst[idx] = d.msgRate / 100000
+		dst[idx] = d.msgRate / dqnMsgRateScale
 	}
 	if idx+1 < len(dst) {
-		dst[idx+1] = d.avgMsgSize / 1024
+		dst[idx+1] = d.avgMsgSize / dqnMsgSizeScale
 	}
 }
 
+// computeReward produces a scalar signal for the DQN.
+//
+// Two orthogonal signals:
+//
+//	balance  = -CV(loads) ∈ [-1, 0], where CV = σ/μ (coefficient of variation).
+//	           CV is scale-invariant: a 10% spread at mean 0.2 is penalised the
+//	           same as a 10% spread at mean 0.8, which raw StdDev does not give.
+//	utility  = log1p(throughput/scale) / log1p(max/scale) ∈ [0, 1].
+//
+// Adaptive weighting via load pressure (smooth, no discontinuity):
+//
+//	pressure = clamp(meanLoad / overloadThreshold, 0, 1)
+//	w_bal    = 0.5 + 0.45·pressure   (at zero load: 50/50; at overload: 95/5)
+//	reward   = w_bal·balance + (1 − w_bal)·utility
 func computeReward(m broker.Metrics) float64 {
 	if len(m.PartitionLoads) == 0 {
 		return 0
 	}
-	imbalancePenalty := -stat.StdDev(m.PartitionLoads, nil)
 
-	var throughputReward float64
+	meanLoad := stat.Mean(m.PartitionLoads, nil)
+
+	var balancePenalty float64
+	if meanLoad > 0 {
+		cv := stat.StdDev(m.PartitionLoads, nil) / meanLoad
+		balancePenalty = -math.Min(cv, 1.0)
+	}
+
+	var utilityReward float64
 	if m.Throughput > 0 {
-		throughputReward = math.Log1p(m.Throughput/10_000.0) / dqnThroughputLogNorm
+		utilityReward = math.Log1p(m.Throughput/dqnThroughputScale) / dqnThroughputLogNorm
 	}
 
-	meanLoad := 0.0
-	for _, l := range m.PartitionLoads {
-		meanLoad += l
-	}
-	meanLoad /= float64(len(m.PartitionLoads))
+	pressure := math.Min(meanLoad/dqnOverloadThreshold, 1.0)
+	balanceW := dqnBaseBalanceWeight + (dqnMaxBalanceWeight-dqnBaseBalanceWeight)*pressure
 
-	if meanLoad > 0.7 {
-		return 1.5*imbalancePenalty + 0.1*throughputReward
-	}
-	return 0.5*imbalancePenalty + 0.5*throughputReward
+	return balanceW*balancePenalty + (1-balanceW)*utilityReward
 }
 
 func (d *DQNBalancer) trainStep() {
@@ -513,8 +515,8 @@ func argmax(s []float64) int {
 	return best
 }
 
-func newTicker100ms() *time.Ticker {
-	return time.NewTicker(100 * time.Millisecond)
+func newPolicyTicker() *time.Ticker {
+	return time.NewTicker(dqnPolicyTickInterval)
 }
 
 func tensorToFloat64Slice(t *tensors.Tensor) []float64 {

@@ -2,7 +2,7 @@ package preprocessing
 
 import (
 	"cmp"
-	"math/rand"
+	"math/rand/v2"
 	"slices"
 )
 

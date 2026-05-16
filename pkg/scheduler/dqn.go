@@ -69,8 +69,6 @@ type DQNScheduler struct {
 
 	latencySums   [broker.MaxPriority]atomic.Uint64
 	latencyCounts [broker.MaxPriority]atomic.Uint64
-
-	rng *rand.Rand
 }
 
 const (
@@ -111,7 +109,6 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 		opt(d)
 	}
 
-	d.rng = rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
 	d.cachedThreshold.Store(int32(d.threshold))
 	d.initGoMLX()
 
@@ -212,11 +209,11 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 		return d.fifoFallback(partition, consumerOffset)
 	}
 
-	explore := d.rng.Float64() < d.epsilon
+	explore := rand.Float64() < d.epsilon
 
 	var threshold int
 	if explore {
-		threshold = d.rng.IntN(d.numActions)
+		threshold = rand.IntN(d.numActions)
 	} else {
 		threshold = int(d.cachedThreshold.Load())
 	}

@@ -17,8 +17,13 @@ import (
 )
 
 const (
-	ddpgHiddenSize = 128
-	ddpgTau        = 0.005
+	ddpgHiddenSize       = 128
+	ddpgTau              = 0.005
+	ddpgDefaultGamma     = 0.99
+	ddpgDefaultBatchSize = 32
+	ddpgReplayBufSize    = 1_000_000
+	ddpgOUTheta          = 0.15
+	ddpgOUSigma          = 0.2
 )
 
 // DDPG implements Deep Deterministic Policy Gradient.
@@ -57,16 +62,16 @@ type DDPG struct {
 
 func NewDDPG(stateSize, actionSize int, lr float64, batchSize int) *DDPG {
 	if batchSize <= 0 {
-		batchSize = 32
+		batchSize = ddpgDefaultBatchSize
 	}
 	d := &DDPG{
 		stateSize:    stateSize,
 		actionSize:   actionSize,
 		lr:           lr,
-		gamma:        0.99,
+		gamma:        ddpgDefaultGamma,
 		batchSize:    batchSize,
-		replayBuffer: nn.NewReplayBuffer(1000000),
-		noise:        nn.NewOUNoise(actionSize, 0, 0.15, 0.2),
+		replayBuffer: nn.NewReplayBuffer(ddpgReplayBufSize),
+		noise:        nn.NewOUNoise(actionSize, 0, ddpgOUTheta, ddpgOUSigma),
 
 		statesBuf:     make([]float64, batchSize*stateSize),
 		nextStatesBuf: make([]float64, batchSize*stateSize),

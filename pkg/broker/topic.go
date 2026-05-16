@@ -1,14 +1,12 @@
 package broker
 
 import (
-	"sync"
 	"sync/atomic"
 
 	"github.com/samber/oops"
 )
 
 type Topic struct {
-	mu         sync.RWMutex
 	name       string
 	partitions []*Partition
 	config     TopicConfig
@@ -41,21 +39,14 @@ func NewTopic(name, dataDir string, cfg TopicConfig, syncPolicy SyncPolicy) (*To
 func (t *Topic) Name() string { return t.name }
 
 func (t *Topic) NumPartitions() int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
 	return len(t.partitions)
 }
 
 func (t *Topic) Config() TopicConfig {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
 	return t.config
 }
 
 func (t *Topic) Partition(id int) (*Partition, error) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
 	if id < 0 || id >= len(t.partitions) {
 		return nil, oops.Errorf("partition %d out of range [0, %d)", id, len(t.partitions))
 	}
@@ -63,8 +54,6 @@ func (t *Topic) Partition(id int) (*Partition, error) {
 }
 
 func (t *Topic) Partitions() []*Partition {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
 	out := make([]*Partition, len(t.partitions))
 	copy(out, t.partitions)
 	return out
@@ -76,8 +65,6 @@ func (t *Topic) IsClosed() bool {
 
 func (t *Topic) Close() error {
 	t.closed.Store(true)
-	t.mu.Lock()
-	defer t.mu.Unlock()
 
 	var firstErr error
 	for _, p := range t.partitions {

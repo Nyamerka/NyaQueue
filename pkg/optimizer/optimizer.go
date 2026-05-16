@@ -170,7 +170,7 @@ func (o *Optimizer) step() {
 		safe := true
 		if metrics.MsgRate > 0 {
 			ratio := metrics.ConsumeRate / metrics.MsgRate
-			if ratio < 0.7 {
+			if ratio < DefaultSafetyConsumeRatio {
 				safe = false
 			}
 		}
@@ -189,7 +189,7 @@ func (o *Optimizer) step() {
 
 	o.prevMetrics = &metrics
 
-	if o.ticks%20 == 0 {
+	if o.ticks%DefaultLogEveryTicks == 0 {
 		log.Printf("[optimizer] tick=%d throughput=%.1f latency=%.2fms params_snapshot=%v",
 			o.ticks, metrics.Throughput, metrics.AvgLatency, o.currentVals[:min(3, len(o.currentVals))])
 	}
@@ -255,7 +255,7 @@ func (o *Optimizer) computeReward(m *broker.Metrics) float64 {
 
 	latencyPenalty := 0.0
 	if m.AvgLatency > 0 {
-		latencyPenalty = -m.AvgLatency / 1000.0
+		latencyPenalty = -m.AvgLatency / optimizerLatencyScale
 	}
 
 	totalDepth := 0
@@ -270,11 +270,11 @@ func (o *Optimizer) computeReward(m *broker.Metrics) float64 {
 
 	reward := throughputReward + DefaultLatencyPenaltyWeight*latencyPenalty + DefaultQueuePenaltyWeight*queuePenalty
 
-	if reward < -2.0 {
-		reward = -2.0
+	if reward < -DefaultRewardClamp {
+		reward = -DefaultRewardClamp
 	}
-	if reward > 2.0 {
-		reward = 2.0
+	if reward > DefaultRewardClamp {
+		reward = DefaultRewardClamp
 	}
 
 	return reward
@@ -283,8 +283,8 @@ func (o *Optimizer) computeReward(m *broker.Metrics) float64 {
 func (o *Optimizer) buildState(m *broker.Metrics) []float64 {
 	state := make([]float64, 0, len(o.currentVals)+3)
 	state = append(state, o.currentVals...)
-	state = append(state, m.Throughput/100000) // normalize
-	state = append(state, m.AvgLatency/1000)
+	state = append(state, m.Throughput/optimizerThroughputScale)
+	state = append(state, m.AvgLatency/optimizerLatencyScale)
 	state = append(state, m.DeliveryRatio)
 	return state
 }

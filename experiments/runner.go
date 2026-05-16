@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	mrand "math/rand"
 	"math/rand/v2"
 	"net"
 	"os"
@@ -394,7 +393,6 @@ func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scena
 		seed = 42
 	}
 	rng := rand.New(rand.NewPCG(uint64(seed), uint64(seed)^0xCAFE))
-	legacyRng := mrand.New(mrand.NewSource(int64(rng.Uint64())))
 
 	targetBytes := sc.BatchBytes
 	if targetBytes <= 0 {
@@ -442,7 +440,7 @@ func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scena
 		item := BatchItem{
 			Key:      generateKeySeeded(keyBuf, sc.SkewRatio, rng),
 			Value:    encodeValue(msgSize),
-			Priority: sc.SamplePrioritySeeded(legacyRng),
+			Priority: sc.SamplePrioritySeeded(rng),
 		}
 		batch = append(batch, item)
 		accumulatedBytes += len(item.Key) + len(item.Value)
@@ -473,7 +471,6 @@ func runUnlimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenari
 		seed = 42
 	}
 	rng := rand.New(rand.NewPCG(uint64(seed), uint64(seed)^0xBEEF))
-	legacyRng := mrand.New(mrand.NewSource(int64(rng.Uint64())))
 
 	targetBytes := sc.BatchBytes
 	if targetBytes <= 0 {
@@ -517,7 +514,7 @@ func runUnlimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenari
 		item := BatchItem{
 			Key:      generateKeySeeded(keyBuf, sc.SkewRatio, rng),
 			Value:    encodeValue(msgSize),
-			Priority: sc.SamplePrioritySeeded(legacyRng),
+			Priority: sc.SamplePrioritySeeded(rng),
 		}
 		batch = append(batch, item)
 		accumulatedBytes += len(item.Key) + len(item.Value)

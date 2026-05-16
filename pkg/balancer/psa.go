@@ -16,31 +16,29 @@ const (
 	defaultPSAMaxBindings = 100_000
 )
 
-// PSA implements the Partition Selection Algorithm from Paper 2 (DMSCO).
-//
-// Algorithm:
-//  1. If key is bound to a partition -> route there (ordering guarantee)
-//  2. If free partitions exist (m > 0) -> hash(key) % (m+1), bind
-//  3. No free partitions -> hash(key) % n
-//  4. Background: if partition becomes empty -> release bindings, m++
-//
-// Uses an LRU cache for bindings to prevent unbounded memory growth.
-// SelectPartition uses a two-phase locking strategy: RLock for cache hits,
-// full Lock only for new bindings.
-type PSA struct {
-	mu              sync.RWMutex
-	bindings        *lru.Cache[string, int]
-	partitionToKeys map[int]map[string]struct{}
-	free            *xsync.MapOf[int, struct{}]
-	loads           []float64
+type psaShard struct {
+	mu   sync.Mutex
+	keys map[string]struct{}
+}
 
+type PSA struct {
+	bindings *lru.Cache[string, int]
+	shards   []psaShard
+	free     *xsync.MapOf[int, struct{}]
+	loads    atomic.Pointer[[]float64]
+
+	numPartitions int
 	evictionCount atomic.Int64
 }
 
 func NewPSA(numPartitions int) *PSA {
 	p := &PSA{
-		partitionToKeys: make(map[int]map[string]struct{}, numPartitions),
-		free:            xsync.NewMapOf[int, struct{}](),
+		shards:        make([]psaShard, numPartitions),
+		free:          xsync.NewMapOf[int, struct{}](),
+		numPartitions: numPartitions,
+	}
+	for i := range p.shards {
+		p.shards[i].keys = make(map[string]struct{})
 	}
 
 	cache, _ := lru.NewWithEvict[string, int](defaultPSAMaxBindings, func(key string, partID int) {
@@ -56,33 +54,26 @@ func NewPSA(numPartitions int) *PSA {
 }
 
 func (p *PSA) removeFromReverseIndex(key string, partID int) {
-	if keys, ok := p.partitionToKeys[partID]; ok {
-		delete(keys, key)
-		if len(keys) == 0 {
-			delete(p.partitionToKeys, partID)
-			p.free.Store(partID, struct{}{})
-		}
+	if partID < 0 || partID >= len(p.shards) {
+		return
 	}
+	sh := &p.shards[partID]
+	sh.mu.Lock()
+	delete(sh.keys, key)
+	if len(sh.keys) == 0 {
+		p.free.Store(partID, struct{}{})
+	}
+	sh.mu.Unlock()
 }
 
 func (p *PSA) SelectPartition(_ string, key []byte, numPartitions int) int {
 	keyStr := string(key)
 
-	// Fast path: RLock for already-bound keys.
-	// Uses Peek (not Get) because Get mutates the LRU internal list,
-	// which is not safe under a read lock with concurrent readers.
-	p.mu.RLock()
 	if part, ok := p.bindings.Peek(keyStr); ok {
-		p.mu.RUnlock()
 		return part
 	}
-	p.mu.RUnlock()
 
-	// Slow path: need to create a new binding.
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// Double-check after acquiring write lock.
+	// Double-check via Get (promotes in LRU).
 	if part, ok := p.bindings.Get(keyStr); ok {
 		return part
 	}
@@ -100,22 +91,25 @@ func (p *PSA) SelectPartition(_ string, key []byte, numPartitions int) int {
 }
 
 func (p *PSA) bind(key string, part int) {
+	// Add first — may trigger eviction which locks a (potentially different) shard.
 	p.bindings.Add(key, part)
-	if p.partitionToKeys[part] == nil {
-		p.partitionToKeys[part] = make(map[string]struct{})
-	}
-	p.partitionToKeys[part][key] = struct{}{}
+	sh := &p.shards[part]
+	sh.mu.Lock()
+	sh.keys[key] = struct{}{}
+	sh.mu.Unlock()
 }
 
 func (p *PSA) leastLoadedFree(freeList []int) int {
-	if len(p.loads) == 0 {
+	loads := p.loads.Load()
+	if loads == nil || len(*loads) == 0 {
 		return freeList[0]
 	}
+	ld := *loads
 	best := freeList[0]
 	bestLoad := math.MaxFloat64
 	for _, id := range freeList {
-		if id < len(p.loads) && p.loads[id] < bestLoad {
-			bestLoad = p.loads[id]
+		if id < len(ld) && ld[id] < bestLoad {
+			bestLoad = ld[id]
 			best = id
 		}
 	}
@@ -123,14 +117,9 @@ func (p *PSA) leastLoadedFree(freeList []int) int {
 }
 
 func (p *PSA) OnMetrics(m broker.Metrics) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if cap(p.loads) < len(m.PartitionLoads) {
-		p.loads = make([]float64, len(m.PartitionLoads))
-	}
-	p.loads = p.loads[:len(m.PartitionLoads)]
-	copy(p.loads, m.PartitionLoads)
+	cp := make([]float64, len(m.PartitionLoads))
+	copy(cp, m.PartitionLoads)
+	p.loads.Store(&cp)
 
 	for i, depth := range m.QueueDepth {
 		if depth == 0 {
@@ -148,21 +137,30 @@ func (p *PSA) OnMetrics(m broker.Metrics) {
 	}
 }
 
-// releasePartition uses the reverse index for O(|keys for partition|) cleanup.
-// Collects keys first to avoid mutating partitionToKeys during eviction callback iteration.
 func (p *PSA) releasePartition(id int) {
-	keys, ok := p.partitionToKeys[id]
-	if !ok {
+	if id < 0 || id >= len(p.shards) {
+		return
+	}
+	sh := &p.shards[id]
+	sh.mu.Lock()
+	if len(sh.keys) == 0 {
+		sh.mu.Unlock()
 		p.free.Store(id, struct{}{})
 		return
 	}
-	toRemove := make([]string, 0, len(keys))
-	for k := range keys {
+	toRemove := make([]string, 0, len(sh.keys))
+	for k := range sh.keys {
 		toRemove = append(toRemove, k)
 	}
-	delete(p.partitionToKeys, id)
+	clear(sh.keys)
+	sh.mu.Unlock()
+
 	for _, k := range toRemove {
-		p.bindings.Remove(k)
+		// Only remove from cache if it still points to this partition,
+		// to avoid invalidating a concurrent re-bind to a different partition.
+		if cur, ok := p.bindings.Peek(k); ok && cur == id {
+			p.bindings.Remove(k)
+		}
 	}
 	p.free.Store(id, struct{}{})
 }

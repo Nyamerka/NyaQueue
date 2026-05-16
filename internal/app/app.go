@@ -68,7 +68,7 @@ func New(cfg broker.Config, dataDir string, opts ...Option) (*BrokerApp, error) 
 		dataDir:    dataDir,
 		schedulers: make(map[string]broker.Scheduler),
 		balancerFactory: func() broker.Balancer {
-			return balancer.NewRoundRobin()
+			return balancer.NewPowerOfTwoChoices()
 		},
 	}
 	for _, opt := range opts {
