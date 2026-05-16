@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"math"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,7 +29,7 @@ type LoadPredictor struct {
 	eg          *errgroup.Group
 	cancel      context.CancelFunc
 
-	predictMu sync.Mutex // serializes predict() which reuses scratch buffers
+	predictMu xsync.RBMutex // serializes predict() which reuses scratch buffers
 	predBuf   []float64
 	centerBuf []float64
 	arBuf     []float64
@@ -299,7 +298,7 @@ func (lp *LoadPredictor) yuleWalker(vals []float64, mean float64, p int) []float
 
 // RingBuffer is a circular buffer for time-series data, safe for concurrent use.
 type RingBuffer struct {
-	mu       sync.Mutex
+	mu       xsync.RBMutex
 	data     []float64
 	writeIdx int64
 }
@@ -317,8 +316,8 @@ func (rb *RingBuffer) Push(v float64) {
 
 // Values allocates and returns a copy of the buffer contents in chronological order.
 func (rb *RingBuffer) Values() []float64 {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
+	t := rb.mu.RLock()
+	defer rb.mu.RUnlock(t)
 
 	w := rb.writeIdx
 	size := int64(len(rb.data))
@@ -338,8 +337,8 @@ func (rb *RingBuffer) Values() []float64 {
 // ValuesInto copies buffer contents into dst without allocating. Returns the
 // number of values written. dst must be at least as large as the ring size.
 func (rb *RingBuffer) ValuesInto(dst []float64) int {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
+	t := rb.mu.RLock()
+	defer rb.mu.RUnlock(t)
 
 	w := rb.writeIdx
 	size := int64(len(rb.data))

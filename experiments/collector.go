@@ -3,11 +3,10 @@ package experiments
 import (
 	"math/rand/v2"
 	"slices"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	hdrhistogram "github.com/HdrHistogram/hdrhistogram-go"
+	"github.com/puzpuzpuz/xsync/v3"
 	"gonum.org/v1/gonum/stat"
 )
 
@@ -16,7 +15,7 @@ const maxPrioritySamples = 10_000
 
 // prioritySampler holds a reservoir of latency samples for one priority level.
 type prioritySampler struct {
-	mu      sync.Mutex
+	mu      xsync.RBMutex
 	samples []time.Duration
 	total   int64 // total observations, including those not in reservoir
 }
@@ -39,8 +38,8 @@ func (s *prioritySampler) record(d time.Duration) {
 }
 
 func (s *prioritySampler) snapshot() PriorityStats {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	t := s.mu.RLock()
+	defer s.mu.RUnlock(t)
 	ps := PriorityStats{Count: s.total}
 	if len(s.samples) == 0 {
 		return ps
@@ -65,7 +64,7 @@ const defaultNumShards = 16
 
 // latencyShard holds a per-partition HDR histogram, avoiding cross-goroutine contention.
 type latencyShard struct {
-	mu      sync.Mutex
+	mu      xsync.RBMutex
 	latency *hdrhistogram.Histogram
 }
 
@@ -75,20 +74,20 @@ type latencyShard struct {
 type MetricsCollector struct {
 	shards []latencyShard
 
-	mu          sync.Mutex
+	mu          xsync.RBMutex
 	loadStddevs []float64
 	byPriority  [10]prioritySampler
 
-	multiStageMu    sync.Mutex
+	multiStageMu    xsync.RBMutex
 	enqueueToFlush  *hdrhistogram.Histogram
 	flushToAppend   *hdrhistogram.Histogram
 	appendToConsume *hdrhistogram.Histogram
 
-	produced         atomic.Int64
-	consumed         atomic.Int64
-	publishErrors    atomic.Int64
-	publishThrottled atomic.Int64
-	consumeErrors    atomic.Int64
+	produced         *xsync.Counter
+	consumed         *xsync.Counter
+	publishErrors    *xsync.Counter
+	publishThrottled *xsync.Counter
+	consumeErrors    *xsync.Counter
 	startTime        time.Time
 	endTime          time.Time
 }
@@ -99,10 +98,15 @@ func NewMetricsCollector() *MetricsCollector {
 		shards[i].latency = hdrhistogram.New(1, 30_000_000, 4)
 	}
 	return &MetricsCollector{
-		shards:          shards,
-		enqueueToFlush:  hdrhistogram.New(1, 30_000_000, 4),
-		flushToAppend:   hdrhistogram.New(1, 30_000_000, 4),
-		appendToConsume: hdrhistogram.New(1, 30_000_000, 4),
+		shards:           shards,
+		enqueueToFlush:   hdrhistogram.New(1, 30_000_000, 4),
+		flushToAppend:    hdrhistogram.New(1, 30_000_000, 4),
+		appendToConsume:  hdrhistogram.New(1, 30_000_000, 4),
+		produced:         xsync.NewCounter(),
+		consumed:         xsync.NewCounter(),
+		publishErrors:    xsync.NewCounter(),
+		publishThrottled: xsync.NewCounter(),
+		consumeErrors:    xsync.NewCounter(),
 	}
 }
 
@@ -239,24 +243,24 @@ type ExperimentResult struct {
 }
 
 func (c *MetricsCollector) Snapshot(scenario, algorithm, system, mode string) ExperimentResult {
-	c.mu.Lock()
+	rt := c.mu.RLock()
 
 	duration := c.endTime.Sub(c.startTime)
 	if duration <= 0 {
 		duration = time.Since(c.startTime)
 	}
 
-	consumed := c.consumed.Load()
+	consumed := c.consumed.Value()
 	result := ExperimentResult{
 		Scenario:          scenario,
 		Algorithm:         algorithm,
 		System:            system,
 		Mode:              mode,
-		Produced:          c.produced.Load(),
+		Produced:          c.produced.Value(),
 		Consumed:          consumed,
-		PublishErrors:     c.publishErrors.Load(),
-		MessagesThrottled: c.publishThrottled.Load(),
-		ConsumeErrors:     c.consumeErrors.Load(),
+		PublishErrors:     c.publishErrors.Value(),
+		MessagesThrottled: c.publishThrottled.Value(),
+		ConsumeErrors:     c.consumeErrors.Value(),
 		Duration:          duration,
 	}
 
@@ -268,13 +272,13 @@ func (c *MetricsCollector) Snapshot(scenario, algorithm, system, mode string) Ex
 		result.LoadStdDev = stat.Mean(c.loadStddevs, nil)
 	}
 
-	c.mu.Unlock()
+	c.mu.RUnlock(rt)
 
 	merged := hdrhistogram.New(1, 30_000_000, 4)
 	for i := range c.shards {
-		c.shards[i].mu.Lock()
+		st := c.shards[i].mu.RLock()
 		merged.Merge(c.shards[i].latency)
-		c.shards[i].mu.Unlock()
+		c.shards[i].mu.RUnlock(st)
 	}
 
 	if merged.TotalCount() > 0 {
@@ -283,7 +287,7 @@ func (c *MetricsCollector) Snapshot(scenario, algorithm, system, mode string) Ex
 		result.LatencyP99 = time.Duration(merged.ValueAtQuantile(99)) * time.Microsecond
 	}
 
-	c.multiStageMu.Lock()
+	mt := c.multiStageMu.RLock()
 	if c.enqueueToFlush.TotalCount() > 0 {
 		result.LatencyEnqueueToFlushP50 = time.Duration(c.enqueueToFlush.ValueAtQuantile(50)) * time.Microsecond
 	}
@@ -294,7 +298,7 @@ func (c *MetricsCollector) Snapshot(scenario, algorithm, system, mode string) Ex
 		result.LatencyAppendToConsumeP50 = time.Duration(c.appendToConsume.ValueAtQuantile(50)) * time.Microsecond
 		result.LatencyAppendToConsumeP95 = time.Duration(c.appendToConsume.ValueAtQuantile(95)) * time.Microsecond
 	}
-	c.multiStageMu.Unlock()
+	c.multiStageMu.RUnlock(mt)
 
 	for i := range result.LatencyByPriority {
 		result.LatencyByPriority[i] = c.byPriority[i].snapshot()

@@ -1,9 +1,10 @@
 package broker
 
 import (
-	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/puzpuzpuz/xsync/v3"
 )
 
 const MaxPriority = 10
@@ -13,22 +14,130 @@ type PendingEntry struct {
 	ArrivedAt time.Time
 }
 
+// entryRing is a circular buffer of PendingEntry with optional fixed capacity.
+// When cap > 0, the buffer never grows beyond cap; pushBack evicts the oldest
+// entry once full. When cap == 0, the buffer grows dynamically.
+type entryRing struct {
+	buf  []PendingEntry
+	head int
+	size int
+	cap  int
+}
+
+func (r *entryRing) pushBack(e PendingEntry) (evicted PendingEntry, didEvict bool) {
+	if r.cap > 0 && r.size >= r.cap {
+		evicted = r.buf[r.head]
+		didEvict = true
+		r.buf[r.head] = e
+		r.head = (r.head + 1) % r.cap
+		return
+	}
+	if r.size == len(r.buf) {
+		r.grow()
+	}
+	idx := (r.head + r.size) % len(r.buf)
+	r.buf[idx] = e
+	r.size++
+	return
+}
+
+func (r *entryRing) grow() {
+	newCap := max(len(r.buf)*2, 16)
+	if r.cap > 0 && newCap > r.cap {
+		newCap = r.cap
+	}
+	newBuf := make([]PendingEntry, newCap)
+	for i := range r.size {
+		newBuf[i] = r.buf[(r.head+i)%len(r.buf)]
+	}
+	r.buf = newBuf
+	r.head = 0
+}
+
+func (r *entryRing) popFront() (PendingEntry, bool) {
+	if r.size == 0 {
+		return PendingEntry{}, false
+	}
+	e := r.buf[r.head]
+	r.buf[r.head] = PendingEntry{}
+	r.head = (r.head + 1) % len(r.buf)
+	r.size--
+	return e, true
+}
+
+func (r *entryRing) peekFront() (PendingEntry, bool) {
+	if r.size == 0 {
+		return PendingEntry{}, false
+	}
+	return r.buf[r.head], true
+}
+
+// linearize returns a contiguous copy of all entries, oldest first.
+func (r *entryRing) linearize() []PendingEntry {
+	out := make([]PendingEntry, r.size)
+	for i := range r.size {
+		out[i] = r.buf[(r.head+i)%len(r.buf)]
+	}
+	return out
+}
+
+// resetFrom replaces ring contents. Entries exceeding cap are silently truncated
+// (keeping the newest).
+func (r *entryRing) resetFrom(entries []PendingEntry) {
+	if r.cap > 0 && len(entries) > r.cap {
+		entries = entries[len(entries)-r.cap:]
+	}
+	need := len(entries)
+	if need > len(r.buf) {
+		r.buf = make([]PendingEntry, need)
+	}
+	copy(r.buf, entries)
+	// Zero out trailing slots so stale pointers don't prevent GC.
+	for i := need; i < len(r.buf); i++ {
+		r.buf[i] = PendingEntry{}
+	}
+	r.head = 0
+	r.size = need
+}
+
 type priorityLevel struct {
-	mu      sync.Mutex
-	entries []PendingEntry
-	count   atomic.Int32
+	mu    xsync.RBMutex
+	ring  entryRing
+	count atomic.Int32
 }
 
 type PriorityIndex struct {
-	levels [MaxPriority]priorityLevel
-	total  atomic.Int64
+	levels      [MaxPriority]priorityLevel
+	total       atomic.Int64
+	maxPerLevel int
 }
 
-func NewPriorityIndex() *PriorityIndex {
-	return &PriorityIndex{}
+type PriorityIndexOption func(*PriorityIndex)
+
+func WithMaxPerLevel(n int) PriorityIndexOption {
+	return func(pi *PriorityIndex) { pi.maxPerLevel = n }
 }
 
-func (pi *PriorityIndex) Add(priority int, offset int64, arrivedAt time.Time) {
+func NewPriorityIndex(opts ...PriorityIndexOption) *PriorityIndex {
+	pi := &PriorityIndex{}
+	for _, opt := range opts {
+		opt(pi)
+	}
+	if pi.maxPerLevel > 0 {
+		for i := range pi.levels {
+			pi.levels[i].ring = entryRing{
+				buf: make([]PendingEntry, pi.maxPerLevel),
+				cap: pi.maxPerLevel,
+			}
+		}
+	}
+	return pi
+}
+
+// Add inserts an entry into the priority level. Returns true if the entry was
+// added to a free slot, false if the level was at capacity and the oldest entry
+// was evicted to make room.
+func (pi *PriorityIndex) Add(priority int, offset int64, arrivedAt time.Time) bool {
 	if priority < 0 {
 		priority = 0
 	}
@@ -38,22 +147,26 @@ func (pi *PriorityIndex) Add(priority int, offset int64, arrivedAt time.Time) {
 
 	lv := &pi.levels[priority]
 	lv.mu.Lock()
-	lv.entries = append(lv.entries, PendingEntry{
+	_, evicted := lv.ring.pushBack(PendingEntry{
 		WalOffset: offset,
 		ArrivedAt: arrivedAt,
 	})
+	if evicted {
+		lv.mu.Unlock()
+		return false
+	}
 	lv.count.Add(1)
 	lv.mu.Unlock()
 	pi.total.Add(1)
+	return true
 }
 
 func (pi *PriorityIndex) PopHighest() (PendingEntry, bool) {
 	for p := MaxPriority - 1; p >= 0; p-- {
 		lv := &pi.levels[p]
 		lv.mu.Lock()
-		if len(lv.entries) > 0 {
-			entry := lv.entries[0]
-			lv.entries = lv.entries[1:]
+		entry, ok := lv.ring.popFront()
+		if ok {
 			lv.count.Add(-1)
 			lv.mu.Unlock()
 			pi.total.Add(-1)
@@ -68,9 +181,8 @@ func (pi *PriorityIndex) PopWithThreshold(threshold int) (PendingEntry, bool) {
 	for p := MaxPriority - 1; p >= threshold; p-- {
 		lv := &pi.levels[p]
 		lv.mu.Lock()
-		if len(lv.entries) > 0 {
-			entry := lv.entries[0]
-			lv.entries = lv.entries[1:]
+		entry, ok := lv.ring.popFront()
+		if ok {
 			lv.count.Add(-1)
 			lv.mu.Unlock()
 			pi.total.Add(-1)
@@ -79,16 +191,13 @@ func (pi *PriorityIndex) PopWithThreshold(threshold int) (PendingEntry, bool) {
 		lv.mu.Unlock()
 	}
 
-	// Below threshold: oldest entry across remaining levels (FIFO-like).
-	// Hold lock on current-best level while scanning; acquire in ascending
-	// order to prevent deadlock.
 	bestPriority := -1
 	var bestTime time.Time
 	for p := 0; p < threshold && p < MaxPriority; p++ {
 		lv := &pi.levels[p]
 		lv.mu.Lock()
-		if len(lv.entries) > 0 {
-			e := lv.entries[0]
+		e, ok := lv.ring.peekFront()
+		if ok {
 			if bestPriority == -1 || e.ArrivedAt.Before(bestTime) {
 				if bestPriority >= 0 {
 					pi.levels[bestPriority].mu.Unlock()
@@ -104,8 +213,7 @@ func (pi *PriorityIndex) PopWithThreshold(threshold int) (PendingEntry, bool) {
 	}
 	if bestPriority >= 0 {
 		lv := &pi.levels[bestPriority]
-		entry := lv.entries[0]
-		lv.entries = lv.entries[1:]
+		entry, _ := lv.ring.popFront()
 		lv.count.Add(-1)
 		lv.mu.Unlock()
 		pi.total.Add(-1)
@@ -132,24 +240,29 @@ func (pi *PriorityIndex) PromoteStale(ttl time.Duration) {
 		lv := &pi.levels[p]
 		lv.mu.Lock()
 
-		var stale []PendingEntry
-		fresh := lv.entries[:0]
-		for _, e := range lv.entries {
+		all := lv.ring.linearize()
+		var stale, fresh []PendingEntry
+		for _, e := range all {
 			if now.Sub(e.ArrivedAt) > ttl {
 				stale = append(stale, e)
 			} else {
 				fresh = append(fresh, e)
 			}
 		}
-		lv.entries = fresh
+		lv.ring.resetFrom(fresh)
 		lv.count.Store(int32(len(fresh)))
 		lv.mu.Unlock()
 
 		if len(stale) > 0 {
 			up := &pi.levels[p+1]
 			up.mu.Lock()
-			up.entries = append(up.entries, stale...)
-			up.count.Store(int32(len(up.entries)))
+			for _, e := range stale {
+				_, evicted := up.ring.pushBack(e)
+				if evicted {
+					pi.total.Add(-1)
+				}
+			}
+			up.count.Store(int32(up.ring.size))
 			up.mu.Unlock()
 		}
 	}

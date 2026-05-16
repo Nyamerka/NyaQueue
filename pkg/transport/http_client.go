@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/samber/oops"
+
+	"github.com/Nyamerka/NyaQueue/pkg/broker"
 )
 
 type HTTPClient struct {
@@ -213,6 +215,9 @@ func (c *HTTPClient) DeleteTopic(ctx context.Context, topic string) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return broker.ErrTopicNotFound
+	}
 	if resp.StatusCode != http.StatusNoContent {
 		return readHTTPError(resp)
 	}

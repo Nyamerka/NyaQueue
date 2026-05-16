@@ -205,3 +205,43 @@ func (s *PriorityIndexSuite) TestConcurrentPopWithThresholdAndAdd() {
 
 	wg.Wait()
 }
+
+func (s *PriorityIndexSuite) TestPriorityIndex_CapReject() {
+	pi := NewPriorityIndex(WithMaxPerLevel(10))
+	now := time.Now()
+
+	accepted := 0
+	for i := 0; i < 20; i++ {
+		if pi.Add(3, int64(i), now.Add(time.Duration(i)*time.Millisecond)) {
+			accepted++
+		}
+	}
+	require.Equal(s.T(), 10, accepted, "first 10 should be accepted (fresh slots)")
+
+	dist := pi.LevelDistribution()
+	require.Equal(s.T(), 10, dist[3])
+}
+
+func (s *PriorityIndexSuite) TestPriorityIndex_RingEviction() {
+	pi := NewPriorityIndex(WithMaxPerLevel(5))
+	now := time.Now()
+
+	for i := 0; i < 5; i++ {
+		ok := pi.Add(0, int64(i+1), now.Add(time.Duration(i)*time.Millisecond))
+		require.True(s.T(), ok)
+	}
+
+	// Add 3 more — should evict the 3 oldest (offsets 1, 2, 3).
+	for i := 5; i < 8; i++ {
+		ok := pi.Add(0, int64(i+1), now.Add(time.Duration(i)*time.Millisecond))
+		require.False(s.T(), ok, "level at cap, expect eviction signal")
+	}
+
+	// Remaining entries should be offsets 4,5,6,7,8 (oldest 1,2,3 evicted).
+	require.Equal(s.T(), 5, pi.Len())
+	for _, wantOff := range []int64{4, 5, 6, 7, 8} {
+		entry, ok := pi.PopHighest()
+		require.True(s.T(), ok)
+		require.Equal(s.T(), wantOff, entry.WalOffset)
+	}
+}

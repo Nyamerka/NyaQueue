@@ -2,9 +2,9 @@ package transport
 
 import (
 	"context"
-	"sync"
 	"time"
 
+	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/samber/oops"
 
 	pb "github.com/Nyamerka/NyaQueue/pkg/proto"
@@ -181,7 +181,7 @@ type BufferedProducer struct {
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
 
-	mu       sync.Mutex
+	mu       xsync.RBMutex
 	buf      []*pb.ProduceMessage
 	bufBytes int
 	timer    *time.Timer

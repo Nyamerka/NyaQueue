@@ -2,12 +2,12 @@ package broker
 
 import (
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/puzpuzpuz/xsync/v3"
 	"gonum.org/v1/gonum/stat"
 )
 
@@ -56,7 +56,7 @@ type MetricsCollector struct {
 
 	avgFlushLatencyNs atomic.Int64
 
-	mu          sync.Mutex
+	mu          xsync.RBMutex
 	lastCollect time.Time
 
 	partProduces []atomic.Int64
@@ -65,7 +65,7 @@ type MetricsCollector struct {
 	prevPartProduces []int64
 	prevPartConsumes []int64
 
-	historyMu         sync.Mutex
+	historyMu         xsync.RBMutex
 	throughputHistory []float64
 	loadStdDevHistory []float64
 

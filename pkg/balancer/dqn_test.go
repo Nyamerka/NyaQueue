@@ -251,3 +251,46 @@ func (s *DQNSuite) TestDroppedExperienceCounter() {
 
 	require.Equal(s.T(), int64(0), dqn.DroppedExperience())
 }
+
+func (s *DQNSuite) TestDQNBalancer_DepthPenalty() {
+	noDepth := computeReward(broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
+	})
+	withDepth := computeReward(broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
+		DerivedMetrics: broker.DerivedMetrics{
+			PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5},
+			QueueDepth:     []int{50000, 50000, 50000, 50000},
+		},
+	})
+	require.Greater(s.T(), noDepth, withDepth,
+		"large queue depth should penalise reward")
+}
+
+func (s *DQNSuite) TestDQNBalancer_NoExploreInFallback() {
+	dqn := NewDQNBalancer(4, WithDQNEpsilon(1.0), WithDQNLoadThreshold(0))
+	defer dqn.Stop()
+	dqn.SetBaseThroughput(1000)
+
+	badMetrics := broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 500},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
+	}
+	for i := 0; i < fallbackEnterTicks; i++ {
+		dqn.OnMetrics(badMetrics)
+	}
+	require.True(s.T(), dqn.IsFallbackActive())
+	require.True(s.T(), dqn.epsilonSuppressed.Load(),
+		"epsilon should be suppressed during fallback")
+
+	counts := map[int]int{}
+	for i := 0; i < 1000; i++ {
+		p := dqn.SelectPartition("t", []byte("k"), 4)
+		counts[p]++
+	}
+	for _, c := range counts {
+		require.Greater(s.T(), c, 200,
+			"under fallback (RR) all partitions should get roughly equal share, not random")
+	}
+}

@@ -4,10 +4,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/samber/oops"
 	"github.com/tidwall/wal"
 )
@@ -27,7 +27,7 @@ func walOptions(sp SyncPolicy) *wal.Options {
 }
 
 type Partition struct {
-	mu            sync.RWMutex
+	mu            xsync.RBMutex
 	id            int
 	topicName     string
 	log           *wal.Log
@@ -64,7 +64,7 @@ func NewPartition(id int, topicName, dataDir string, mode ScheduleMode, syncPoli
 	}
 
 	if mode != ModeFIFO {
-		p.priorityIndex = NewPriorityIndex()
+		p.priorityIndex = NewPriorityIndex(WithMaxPerLevel(50_000))
 	}
 
 	return p, nil
@@ -210,9 +210,9 @@ func (p *Partition) AppendBatchCompressed(msgs []*Message, codec Codec) ([]uint6
 }
 
 func (p *Partition) Read(offset uint64) (*Message, error) {
-	p.mu.RLock()
+	rt := p.mu.RLock()
 	data, err := p.log.Read(offset)
-	p.mu.RUnlock()
+	p.mu.RUnlock(rt)
 
 	if err != nil {
 		return nil, oops.Wrapf(err, "WAL read offset %d", offset)
@@ -240,9 +240,9 @@ func (p *Partition) Read(offset uint64) (*Message, error) {
 }
 
 func (p *Partition) readFromBatch(batchOffset uint64, index int) (*Message, error) {
-	p.mu.RLock()
+	rt := p.mu.RLock()
 	data, err := p.log.Read(batchOffset)
-	p.mu.RUnlock()
+	p.mu.RUnlock(rt)
 	if err != nil {
 		return nil, oops.Wrapf(err, "WAL read batch at offset %d", batchOffset)
 	}
@@ -300,8 +300,8 @@ func (p *Partition) readFromBatchData(data []byte, index int) (*Message, error) 
 }
 
 func (p *Partition) HighWaterMark() uint64 {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	rt := p.mu.RLock()
+	defer p.mu.RUnlock(rt)
 	if p.nextOffset == 0 {
 		return 0
 	}
@@ -327,14 +327,14 @@ func (p *Partition) Rebuild(startOffset uint64, isCommitted func(offset uint64) 
 		return nil
 	}
 
-	p.mu.RLock()
+	rt := p.mu.RLock()
 	hwm := p.nextOffset
-	p.mu.RUnlock()
+	p.mu.RUnlock(rt)
 
 	for off := startOffset; off < hwm; off++ {
-		p.mu.RLock()
+		rt := p.mu.RLock()
 		data, err := p.log.Read(off)
-		p.mu.RUnlock()
+		p.mu.RUnlock(rt)
 		if err != nil {
 			return oops.Wrapf(err, "rebuild read offset %d", off)
 		}

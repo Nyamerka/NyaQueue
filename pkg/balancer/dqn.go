@@ -57,11 +57,12 @@ type DQNBalancer struct {
 	eg     *errgroup.Group
 	cancel stdctx.CancelFunc
 
-	fallbackRR     *RoundRobin
-	fallbackRatio  float64
-	loadThreshold  float64
-	baseThroughput atomic.Int64
-	fallbackActive atomic.Bool
+	fallbackRR        *RoundRobin
+	fallbackRatio     float64
+	loadThreshold     float64
+	baseThroughput    atomic.Int64
+	fallbackActive    atomic.Bool
+	epsilonSuppressed atomic.Bool
 
 	stateMu        *xsync.RBMutex
 	loads          []float64
@@ -217,7 +218,7 @@ func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions in
 		return d.fallbackRR.SelectPartition(topic, key, numPartitions)
 	}
 
-	if rand.Float64() < d.epsilon {
+	if !d.epsilonSuppressed.Load() && rand.Float64() < d.epsilon {
 		return rand.IntN(numPartitions)
 	}
 
@@ -271,6 +272,7 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 	if shouldFallback {
 		d.consecutiveRecoveryTicks = 0
 		d.consecutiveFallbackTicks++
+		d.epsilonSuppressed.Store(true)
 		if d.consecutiveFallbackTicks >= fallbackEnterTicks {
 			d.fallbackActive.Store(true)
 		}
@@ -279,6 +281,7 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 		d.consecutiveRecoveryTicks++
 		if d.consecutiveRecoveryTicks >= fallbackExitTicks {
 			d.fallbackActive.Store(false)
+			d.epsilonSuppressed.Store(false)
 		}
 	}
 	d.stateMu.Unlock()
@@ -440,7 +443,19 @@ func computeReward(m broker.Metrics) float64 {
 	pressure := math.Min(meanLoad/dqnOverloadThreshold, 1.0)
 	balanceW := dqnBaseBalanceWeight + (dqnMaxBalanceWeight-dqnBaseBalanceWeight)*pressure
 
-	return balanceW*balancePenalty + (1-balanceW)*utilityReward
+	reward := balanceW*balancePenalty + (1-balanceW)*utilityReward
+
+	var totalDepth int
+	for _, d := range m.QueueDepth {
+		totalDepth += d
+	}
+	if totalDepth > 0 {
+		normalized := float64(totalDepth) / dqnDepthSoftCap
+		depthPenalty := -math.Min(normalized*normalized, 1.0)
+		reward += dqnDepthWeight * depthPenalty
+	}
+
+	return reward
 }
 
 func (d *DQNBalancer) trainStep() {

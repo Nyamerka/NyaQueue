@@ -389,9 +389,11 @@ func (h *Harness) ConsumeBatch(ctx context.Context, topic, group string, partiti
 		result := make([]*ConsumedMessage, len(envs))
 		for i, env := range envs {
 			result[i] = &ConsumedMessage{
-				Value:    env.Value,
-				Offset:   env.Offset,
-				Priority: uint8(env.Priority),
+				Value:       env.Value,
+				Offset:      env.Offset,
+				Priority:    uint8(env.Priority),
+				ProduceTime: env.ProduceTime,
+				AppendTime:  env.AppendTime,
 			}
 		}
 		return result, nil
@@ -407,9 +409,11 @@ func (h *Harness) ConsumeBatch(ctx context.Context, topic, group string, partiti
 		result := make([]*ConsumedMessage, len(envs))
 		for i, env := range envs {
 			result[i] = &ConsumedMessage{
-				Value:    env.Value,
-				Offset:   env.Offset,
-				Priority: uint8(env.Priority),
+				Value:       env.Value,
+				Offset:      env.Offset,
+				Priority:    uint8(env.Priority),
+				ProduceTime: env.ProduceTime,
+				AppendTime:  env.AppendTime,
 			}
 		}
 		return result, nil

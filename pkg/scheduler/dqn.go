@@ -62,6 +62,11 @@ type DQNScheduler struct {
 
 	fallbackFIFO bool
 
+	depthFallbackThreshold int
+	recoveryTicks          int
+	recoveryCount          int
+	autoFallbackLogged     bool
+
 	cachedThreshold atomic.Int32
 
 	prevSnap atomic.Pointer[schedPolicySnap]
@@ -86,23 +91,31 @@ func WithDQNSchedReplayBufSize(n int) DQNSchedOption {
 	return func(d *DQNScheduler) { d.replayBuffer = nn.NewReplayBuffer(n) }
 }
 func WithDQNSchedBatchSize(n int) DQNSchedOption { return func(d *DQNScheduler) { d.batchSize = n } }
+func WithDQNSchedDepthFallback(n int) DQNSchedOption {
+	return func(d *DQNScheduler) { d.depthFallbackThreshold = n }
+}
+func WithDQNSchedRecoveryTicks(n int) DQNSchedOption {
+	return func(d *DQNScheduler) { d.recoveryTicks = n }
+}
 
 func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 	d := &DQNScheduler{
-		weightsMu:    xsync.NewRBMutex(),
-		stateMu:      xsync.NewRBMutex(),
-		hiddenSize:   DefaultDQNSchedHiddenSize,
-		stateSize:    DefaultDQNSchedStateSize,
-		numActions:   DefaultDQNSchedActions,
-		epsilon:      DefaultDQNSchedEpsilon,
-		gamma:        DefaultDQNSchedGamma,
-		lr:           DefaultDQNSchedLearningRate,
-		batchSize:    DefaultDQNSchedBatchSize,
-		minReplay:    DefaultDQNSchedMinReplay,
-		trainEvery:   DefaultDQNSchedTrainEvery,
-		replayBuffer: nn.NewReplayBuffer(DefaultDQNSchedReplayBufSize),
-		threshold:    DefaultDQNSchedThreshold,
-		expCh:        make(chan nn.Transition, DefaultDQNSchedExpChSize),
+		weightsMu:              xsync.NewRBMutex(),
+		stateMu:                xsync.NewRBMutex(),
+		hiddenSize:             DefaultDQNSchedHiddenSize,
+		stateSize:              DefaultDQNSchedStateSize,
+		numActions:             DefaultDQNSchedActions,
+		epsilon:                DefaultDQNSchedEpsilon,
+		gamma:                  DefaultDQNSchedGamma,
+		lr:                     DefaultDQNSchedLearningRate,
+		batchSize:              DefaultDQNSchedBatchSize,
+		minReplay:              DefaultDQNSchedMinReplay,
+		trainEvery:             DefaultDQNSchedTrainEvery,
+		replayBuffer:           nn.NewReplayBuffer(DefaultDQNSchedReplayBufSize),
+		threshold:              DefaultDQNSchedThreshold,
+		depthFallbackThreshold: DefaultDQNSchedDepthFallback,
+		recoveryTicks:          DefaultDQNSchedRecoveryTicks,
+		expCh:                  make(chan nn.Transition, DefaultDQNSchedExpChSize),
 	}
 
 	for _, opt := range opts {
@@ -206,6 +219,10 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 	d.stateMu.RUnlock(srt)
 
 	if fallback {
+		return d.fifoFallback(partition, consumerOffset)
+	}
+
+	if d.depthFallbackThreshold > 0 && pi.Len() > d.depthFallbackThreshold {
 		return d.fifoFallback(partition, consumerOffset)
 	}
 
@@ -334,6 +351,29 @@ func (d *DQNScheduler) policyLoop(ctx stdctx.Context) {
 
 			d.stateMu.Lock()
 			d.threshold = threshold
+
+			depth := pi.Len()
+			if d.depthFallbackThreshold > 0 && depth > d.depthFallbackThreshold {
+				if !d.fallbackFIFO {
+					d.fallbackFIFO = true
+					if !d.autoFallbackLogged {
+						d.autoFallbackLogged = true
+						log.Printf("[dqn-scheduler] auto-fallback FIFO: depth %d > threshold %d", depth, d.depthFallbackThreshold)
+					}
+				}
+				d.recoveryCount = 0
+			} else if d.fallbackFIFO && d.depthFallbackThreshold > 0 && depth < d.depthFallbackThreshold/2 {
+				d.recoveryCount++
+				if d.recoveryCount >= d.recoveryTicks {
+					d.fallbackFIFO = false
+					d.recoveryCount = 0
+					d.autoFallbackLogged = false
+					log.Printf("[dqn-scheduler] recovered from auto-fallback: depth %d", depth)
+				}
+			} else if d.fallbackFIFO {
+				d.recoveryCount = 0
+			}
+
 			d.stateMu.Unlock()
 
 		case <-ctx.Done():

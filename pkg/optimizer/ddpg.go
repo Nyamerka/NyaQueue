@@ -3,7 +3,6 @@ package optimizer
 import (
 	"log"
 	"math"
-	"sync"
 
 	"github.com/Nyamerka/NyaQueue/pkg/nn"
 	"github.com/gomlx/gomlx/backends"
@@ -14,6 +13,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
 
 	_ "github.com/gomlx/gomlx/backends/simplego"
+	"github.com/puzpuzpuz/xsync/v3"
 )
 
 const (
@@ -29,7 +29,7 @@ const (
 // DDPG implements Deep Deterministic Policy Gradient.
 // Actor: state → action (tanh); Critic: (state, action) → Q-value.
 type DDPG struct {
-	mu sync.Mutex
+	mu xsync.RBMutex
 
 	stateSize  int
 	actionSize int

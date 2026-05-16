@@ -63,13 +63,19 @@ func NewServer(b *broker.Broker) *Server {
 		grpc.UnaryInterceptor(semaphoreInterceptor),
 	}
 
-	opts = append(opts, grpc.KeepaliveParams(keepalive.ServerParameters{
-		MaxConnectionAge:      4 * time.Minute,
-		MaxConnectionAgeGrace: 30 * time.Second,
-		MaxConnectionIdle:     5 * time.Minute,
-		Time:                  10 * time.Second,
-		Timeout:               1 * time.Second,
-	}))
+	opts = append(opts,
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionAge:      4 * time.Minute,
+			MaxConnectionAgeGrace: 30 * time.Second,
+			MaxConnectionIdle:     5 * time.Minute,
+			Time:                  10 * time.Second,
+			Timeout:               1 * time.Second,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             5 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	)
 
 	return &Server{
 		broker: b,
@@ -220,11 +226,13 @@ func (s *Server) Consume(ctx context.Context, req *pb.ConsumeRequest) (*pb.Consu
 		}
 
 		env := &pb.MessageEnvelope{
-			Offset:    int64(nextOffset) - 1,
-			Key:       msg.Key,
-			Value:     msg.Value,
-			Priority:  uint32(msg.Header.Priority),
-			Timestamp: msg.Header.Timestamp,
+			Offset:      int64(nextOffset) - 1,
+			Key:         msg.Key,
+			Value:       msg.Value,
+			Priority:    uint32(msg.Header.Priority),
+			Timestamp:   msg.Header.Timestamp,
+			ProduceTime: msg.Header.ProduceTime,
+			AppendTime:  msg.Header.AppendTime,
 		}
 		envelopes = append(envelopes, env)
 		totalBytes += len(msg.Key) + len(msg.Value)

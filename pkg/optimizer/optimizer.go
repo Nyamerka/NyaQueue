@@ -4,10 +4,10 @@ import (
 	"context"
 	"log"
 	"math"
-	"sync"
 	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	"github.com/puzpuzpuz/xsync/v3"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -42,7 +42,7 @@ func DefaultOptimizerConfig() OptimizerConfig {
 
 // Optimizer runs the DDPG training loop on Lasso-selected broker parameters.
 type Optimizer struct {
-	mu sync.Mutex
+	mu xsync.RBMutex
 
 	ddpg       *DDPG
 	params     []TunableParam
@@ -60,6 +60,12 @@ type Optimizer struct {
 
 	throughputWindow []float64
 	windowCap        int
+
+	lastApplyTime          time.Time
+	minApplyInterval       time.Duration
+	startConfig            broker.Config
+	lowDeliveryTicksInARow int
+	rolledBack             bool
 }
 
 func NewOptimizer(b *broker.Broker, params []TunableParam, optCfg OptimizerConfig, pilot ...PilotData) *Optimizer {
@@ -104,6 +110,11 @@ func NewOptimizer(b *broker.Broker, params []TunableParam, optCfg OptimizerConfi
 	ddpg := NewDDPG(stateSize, actionSize, optCfg.LearningRate, optCfg.BatchSize)
 	ddpg.SetNoiseDecay(optCfg.NoiseDecay, optCfg.NoiseFloor)
 
+	var startConfig broker.Config
+	if b != nil {
+		startConfig = b.Config()
+	}
+
 	return &Optimizer{
 		ddpg:             ddpg,
 		params:           active,
@@ -115,6 +126,8 @@ func NewOptimizer(b *broker.Broker, params []TunableParam, optCfg OptimizerConfi
 		currentVals:      currentVals,
 		windowCap:        DefaultOptimizerWindowCap,
 		throughputWindow: make([]float64, 0, DefaultOptimizerWindowCap),
+		minApplyInterval: time.Duration(DefaultMinApplyInterval),
+		startConfig:      startConfig,
 	}
 }
 
@@ -163,10 +176,12 @@ func (o *Optimizer) step() {
 	o.ticks++
 	metrics := o.broker.Metrics()
 
+	o.checkEmergencyRollback(&metrics)
+
 	state := o.buildState(&metrics)
 	action := o.ddpg.Act(state)
 
-	if o.ticks > o.warmup {
+	if o.ticks > o.warmup && !o.rolledBack {
 		safe := true
 		if metrics.MsgRate > 0 {
 			ratio := metrics.ConsumeRate / metrics.MsgRate
@@ -196,6 +211,11 @@ func (o *Optimizer) step() {
 }
 
 func (o *Optimizer) applyAction(action []float64) {
+	now := time.Now()
+	if !o.lastApplyTime.IsZero() && now.Sub(o.lastApplyTime) < o.minApplyInterval {
+		return
+	}
+
 	changed := false
 	for i, a := range action {
 		if i >= len(o.params) {
@@ -219,6 +239,8 @@ func (o *Optimizer) applyAction(action []float64) {
 	if !changed {
 		return
 	}
+
+	o.lastApplyTime = now
 
 	newCfg := o.broker.Config()
 	for i, p := range o.params {
@@ -270,6 +292,13 @@ func (o *Optimizer) computeReward(m *broker.Metrics) float64 {
 
 	reward := throughputReward + DefaultLatencyPenaltyWeight*latencyPenalty + DefaultQueuePenaltyWeight*queuePenalty
 
+	if m.ConsumeRate > 0 && m.MsgRate > 0 {
+		errorRatio := 1.0 - m.DeliveryRatio
+		if errorRatio > DefaultErrorPenaltyThresh {
+			reward -= DefaultErrorPenaltyWeight * errorRatio
+		}
+	}
+
 	if reward < -DefaultRewardClamp {
 		reward = -DefaultRewardClamp
 	}
@@ -278,6 +307,27 @@ func (o *Optimizer) computeReward(m *broker.Metrics) float64 {
 	}
 
 	return reward
+}
+
+func (o *Optimizer) checkEmergencyRollback(m *broker.Metrics) {
+	if o.rolledBack {
+		return
+	}
+	if m.DeliveryRatio < DefaultEmergencyRollbackDR && m.MsgRate > 0 {
+		o.lowDeliveryTicksInARow++
+	} else {
+		o.lowDeliveryTicksInARow = 0
+	}
+	if o.lowDeliveryTicksInARow >= DefaultEmergencyRollbackN {
+		log.Printf("[optimizer] emergency rollback: DeliveryRatio %.2f < %.2f for %d ticks",
+			m.DeliveryRatio, DefaultEmergencyRollbackDR, o.lowDeliveryTicksInARow)
+		if o.broker != nil {
+			if err := o.broker.ApplyConfig(o.startConfig); err != nil {
+				log.Printf("[optimizer] emergency rollback ApplyConfig failed: %v", err)
+			}
+		}
+		o.rolledBack = true
+	}
 }
 
 func (o *Optimizer) buildState(m *broker.Metrics) []float64 {

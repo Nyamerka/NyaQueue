@@ -46,6 +46,12 @@ const (
 	dqnPolicyTickInterval = 100 * time.Millisecond
 )
 
+// DQN queue-depth penalty in reward.
+const (
+	dqnDepthSoftCap = 100_000.0
+	dqnDepthWeight  = 0.3
+)
+
 // DQN fallback hysteresis: consecutive ticks required to enter/exit RR fallback.
 const (
 	fallbackEnterTicks = 3

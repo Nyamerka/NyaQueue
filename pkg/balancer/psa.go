@@ -3,7 +3,6 @@ package balancer
 import (
 	"hash/fnv"
 	"math"
-	"sync"
 	"sync/atomic"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -17,7 +16,7 @@ const (
 )
 
 type psaShard struct {
-	mu   sync.Mutex
+	mu   xsync.RBMutex
 	keys map[string]struct{}
 }
 

@@ -4,6 +4,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -306,4 +307,52 @@ func (s *DDPGSuite) TestConcurrentActAndTrain() {
 		}
 	}()
 	wg.Wait()
+}
+
+func (s *DDPGSuite) TestOptimizer_EmergencyRollback() {
+	opt := &Optimizer{
+		minApplyInterval: DefaultMinApplyInterval,
+	}
+
+	healthy := &broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.9, MsgRate: 100},
+	}
+	opt.checkEmergencyRollback(healthy)
+	require.Equal(s.T(), 0, opt.lowDeliveryTicksInARow)
+	require.False(s.T(), opt.rolledBack)
+
+	bad := &broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.3, MsgRate: 100},
+	}
+
+	opt.checkEmergencyRollback(bad)
+	require.Equal(s.T(), 1, opt.lowDeliveryTicksInARow)
+	require.False(s.T(), opt.rolledBack, "single bad tick should not rollback")
+
+	opt.checkEmergencyRollback(bad)
+	require.Equal(s.T(), 2, opt.lowDeliveryTicksInARow)
+	require.True(s.T(), opt.rolledBack, "two consecutive bad ticks should trigger rollback")
+
+	opt.checkEmergencyRollback(bad)
+	require.True(s.T(), opt.rolledBack, "should stay rolled back")
+	require.Equal(s.T(), 2, opt.lowDeliveryTicksInARow, "counter frozen after rollback")
+}
+
+func (s *DDPGSuite) TestOptimizer_EmergencyRollback_Recovery() {
+	opt := &Optimizer{
+		minApplyInterval: DefaultMinApplyInterval,
+	}
+
+	bad := &broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.3, MsgRate: 100},
+	}
+	opt.checkEmergencyRollback(bad)
+	require.Equal(s.T(), 1, opt.lowDeliveryTicksInARow)
+
+	healthy := &broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.9, MsgRate: 100},
+	}
+	opt.checkEmergencyRollback(healthy)
+	require.Equal(s.T(), 0, opt.lowDeliveryTicksInARow, "good tick should reset counter")
+	require.False(s.T(), opt.rolledBack)
 }

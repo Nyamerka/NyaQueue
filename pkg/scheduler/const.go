@@ -14,4 +14,7 @@ const (
 	DefaultDQNSchedBatchSize     = 32
 	DefaultDQNSchedMinReplay     = 64
 	DefaultDQNSchedThreshold     = 5
+
+	DefaultDQNSchedDepthFallback = 100_000
+	DefaultDQNSchedRecoveryTicks = 5
 )

@@ -77,6 +77,8 @@ type MessageEnvelope struct {
 	Value         []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
 	Priority      uint32                 `protobuf:"varint,4,opt,name=priority,proto3" json:"priority,omitempty"`
 	Timestamp     int64                  `protobuf:"varint,5,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	ProduceTime   int64                  `protobuf:"varint,6,opt,name=produce_time,json=produceTime,proto3" json:"produce_time,omitempty"`
+	AppendTime    int64                  `protobuf:"varint,7,opt,name=append_time,json=appendTime,proto3" json:"append_time,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -142,6 +144,20 @@ func (x *MessageEnvelope) GetPriority() uint32 {
 func (x *MessageEnvelope) GetTimestamp() int64 {
 	if x != nil {
 		return x.Timestamp
+	}
+	return 0
+}
+
+func (x *MessageEnvelope) GetProduceTime() int64 {
+	if x != nil {
+		return x.ProduceTime
+	}
+	return 0
+}
+
+func (x *MessageEnvelope) GetAppendTime() int64 {
+	if x != nil {
+		return x.AppendTime
 	}
 	return 0
 }
@@ -392,13 +408,16 @@ var File_model_proto protoreflect.FileDescriptor
 
 const file_model_proto_rawDesc = "" +
 	"\n" +
-	"\vmodel.proto\x12\bnyaqueue\"\x8b\x01\n" +
+	"\vmodel.proto\x12\bnyaqueue\"\xcf\x01\n" +
 	"\x0fMessageEnvelope\x12\x16\n" +
 	"\x06offset\x18\x01 \x01(\x03R\x06offset\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x12\x1a\n" +
 	"\bpriority\x18\x04 \x01(\rR\bpriority\x12\x1c\n" +
-	"\ttimestamp\x18\x05 \x01(\x03R\ttimestamp\"t\n" +
+	"\ttimestamp\x18\x05 \x01(\x03R\ttimestamp\x12!\n" +
+	"\fproduce_time\x18\x06 \x01(\x03R\vproduceTime\x12\x1f\n" +
+	"\vappend_time\x18\a \x01(\x03R\n" +
+	"appendTime\"t\n" +
 	"\tTopicInfo\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\x12%\n" +
 	"\x0enum_partitions\x18\x02 \x01(\x05R\rnumPartitions\x12*\n" +

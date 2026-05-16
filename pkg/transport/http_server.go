@@ -139,11 +139,13 @@ type HTTPProduceResponse struct {
 }
 
 type HTTPMessageEnvelope struct {
-	Offset    int64  `json:"offset"`
-	Key       []byte `json:"key"`
-	Value     []byte `json:"value"`
-	Priority  uint32 `json:"priority"`
-	Timestamp int64  `json:"timestamp"`
+	Offset      int64  `json:"offset"`
+	Key         []byte `json:"key"`
+	Value       []byte `json:"value"`
+	Priority    uint32 `json:"priority"`
+	Timestamp   int64  `json:"timestamp"`
+	ProduceTime int64  `json:"produce_time,omitempty"`
+	AppendTime  int64  `json:"append_time,omitempty"`
 }
 
 type HTTPConsumeResponse struct {
@@ -274,11 +276,13 @@ func (s *HTTPServer) handleConsume(w http.ResponseWriter, r *http.Request) {
 		}
 
 		envelopes = append(envelopes, HTTPMessageEnvelope{
-			Offset:    int64(nextOffset) - 1,
-			Key:       msg.Key,
-			Value:     msg.Value,
-			Priority:  uint32(msg.Header.Priority),
-			Timestamp: msg.Header.Timestamp,
+			Offset:      int64(nextOffset) - 1,
+			Key:         msg.Key,
+			Value:       msg.Value,
+			Priority:    uint32(msg.Header.Priority),
+			Timestamp:   msg.Header.Timestamp,
+			ProduceTime: msg.Header.ProduceTime,
+			AppendTime:  msg.Header.AppendTime,
 		})
 		totalBytes += len(msg.Key) + len(msg.Value)
 		lastOffset = int64(nextOffset)
