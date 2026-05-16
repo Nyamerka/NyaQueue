@@ -639,20 +639,20 @@ func (b *Broker) metricsLoop(ctx context.Context) {
 					avgPred /= float64(len(snap.PredictedLoads))
 				}
 
-			var maxFlushNs int64
-			var sumFlushNs int64
-			var partCount int64
-			b.topics.Range(func(_ string, t *Topic) bool {
-				for _, p := range t.Partitions() {
-					flushNs := int64(p.LastFlushLatency())
-					if flushNs > maxFlushNs {
-						maxFlushNs = flushNs
+				var maxFlushNs int64
+				var sumFlushNs int64
+				var partCount int64
+				b.topics.Range(func(_ string, t *Topic) bool {
+					for _, p := range t.Partitions() {
+						flushNs := int64(p.LastFlushLatency())
+						if flushNs > maxFlushNs {
+							maxFlushNs = flushNs
+						}
+						sumFlushNs += flushNs
+						partCount++
 					}
-					sumFlushNs += flushNs
-					partCount++
-				}
-				return true
-			})
+					return true
+				})
 				if partCount > 0 {
 					b.metrics.avgFlushLatencyNs.Store(sumFlushNs / partCount)
 				}

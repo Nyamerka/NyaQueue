@@ -13,12 +13,12 @@ import (
 
 // BusinessMetrics holds raw counters-derived metrics.
 type BusinessMetrics struct {
-	Throughput  float64
-	ConsumeRate float64
-	AvgLatency  float64
+	Throughput    float64
+	ConsumeRate   float64
+	AvgLatency    float64
 	DeliveryRatio float64
-	MsgRate     float64
-	AvgMsgSize  float64
+	MsgRate       float64
+	AvgMsgSize    float64
 }
 
 // DerivedMetrics holds pre-computed analytical metrics.
@@ -267,12 +267,12 @@ func (mc *MetricsCollector) Collect() Metrics {
 
 	snap := Metrics{
 		BusinessMetrics: BusinessMetrics{
-			Throughput:  throughput,
-			ConsumeRate: consumeRate,
-			AvgLatency:  avgLatencyMs,
+			Throughput:    throughput,
+			ConsumeRate:   consumeRate,
+			AvgLatency:    avgLatencyMs,
 			DeliveryRatio: deliveryRatio,
-			MsgRate:     msgRate,
-			AvgMsgSize:  avgMsgSize,
+			MsgRate:       msgRate,
+			AvgMsgSize:    avgMsgSize,
 		},
 		DerivedMetrics: DerivedMetrics{
 			PartitionLoads: loads,
