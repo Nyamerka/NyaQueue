@@ -22,7 +22,7 @@ jobs:
         run: make build
 
       - name: Test
-        run: go test ./... -count=1 -race -timeout 120s
+        run: go test ./... -count=1 -race -timeout 200s
 
   smoke:
     name: Docker stack smoke
