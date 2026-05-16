@@ -44,6 +44,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	ln, err := net.Listen("tcp", cfg.MetricsAddr)
 	if err != nil {
 		log.Fatalf("metrics listen: %v", err)
