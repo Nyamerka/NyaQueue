@@ -3,6 +3,7 @@ package balancer
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/stretchr/testify/require"
@@ -41,6 +42,9 @@ func (s *PSASuite) TestReleaseBindingsOnEmptyQueue() {
 
 	psa.SelectPartition("t", []byte("k1"), 4)
 	psa.SelectPartition("t", []byte("k2"), 4)
+
+	// Wait for grace period to expire before releasing.
+	time.Sleep(psaGracePeriod + 10*time.Millisecond)
 
 	psa.OnMetrics(broker.Metrics{
 		DerivedMetrics: broker.DerivedMetrics{
@@ -132,6 +136,64 @@ func (s *PSASuite) TestConcurrentBindRelease() {
 	}
 
 	wg.Wait()
+}
+
+func (s *PSASuite) TestConcurrentK16GrpcLike() {
+	const np = 16
+	psa := NewPSA(np)
+
+	var wg sync.WaitGroup
+	for g := 0; g < 200; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				key := []byte{byte(g >> 8), byte(g), byte(j >> 8), byte(j)}
+				p := psa.SelectPartition("t", key, np)
+				require.GreaterOrEqual(s.T(), p, 0)
+				require.Less(s.T(), p, np)
+			}
+		}(g)
+	}
+
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				loads := make([]float64, np)
+				depths := make([]int, np)
+				for i := range depths {
+					depths[i] = j % 3
+				}
+				psa.OnMetrics(broker.Metrics{
+					DerivedMetrics: broker.DerivedMetrics{
+						PartitionLoads: loads,
+						QueueDepth:     depths,
+					},
+				})
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+func (s *PSASuite) TestGracePeriodPreventsImmediateRelease() {
+	psa := NewPSA(4)
+
+	p1 := psa.SelectPartition("t", []byte("key-grace"), 4)
+
+	psa.OnMetrics(broker.Metrics{
+		DerivedMetrics: broker.DerivedMetrics{
+			PartitionLoads: []float64{0, 0, 0, 0},
+			QueueDepth:     []int{0, 0, 0, 0},
+		},
+	})
+
+	p2 := psa.SelectPartition("t", []byte("key-grace"), 4)
+	require.Equal(s.T(), p1, p2,
+		"binding should survive OnMetrics within grace period")
 }
 
 func (s *PSASuite) TestEvictionCountIncrementsOnOverflow() {

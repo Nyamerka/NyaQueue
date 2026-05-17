@@ -198,13 +198,15 @@ func (s *PrioritizedReplayBufferSuite) TestSampleSize() {
 		b.Push(Transition{State: []float64{float64(i)}, Action: []float64{0}, Reward: 1.0})
 	}
 
-	batch, indices := b.Sample(10)
+	batch, indices, weights := b.Sample(10, 1.0)
 	require.Len(s.T(), batch, 10)
 	require.Len(s.T(), indices, 10)
+	require.Len(s.T(), weights, 10)
 
-	batch, indices = b.Sample(100)
+	batch, indices, weights = b.Sample(100, 1.0)
 	require.Len(s.T(), batch, 50)
 	require.Len(s.T(), indices, 50)
+	require.Len(s.T(), weights, 50)
 }
 
 func (s *PrioritizedReplayBufferSuite) TestHighTDErrorSampledMore() {
@@ -225,13 +227,68 @@ func (s *PrioritizedReplayBufferSuite) TestHighTDErrorSampledMore() {
 	counts := make([]int, 100)
 	const trials = 10_000
 	for trial := 0; trial < trials; trial++ {
-		batch, indices := b.Sample(1)
+		batch, indices, _ := b.Sample(1, 1.0)
 		require.Len(s.T(), batch, 1)
 		counts[indices[0]]++
 	}
 
 	require.Greater(s.T(), counts[0], trials/10,
 		"index 0 with high TD error should be sampled much more frequently")
+}
+
+func (s *PrioritizedReplayBufferSuite) TestPERSampleReturnsISWeights() {
+	b := NewPrioritizedReplayBuffer(100, 0.6)
+	for i := 0; i < 50; i++ {
+		b.Push(Transition{State: []float64{float64(i)}, Action: []float64{0}, Reward: 1.0})
+	}
+
+	_, _, weights := b.Sample(10, 0.6)
+	require.Len(s.T(), weights, 10)
+
+	var maxW float64
+	for _, w := range weights {
+		require.Greater(s.T(), w, 0.0, "IS-weight must be > 0")
+		require.LessOrEqual(s.T(), w, 1.0, "IS-weight must be <= 1.0")
+		if w > maxW {
+			maxW = w
+		}
+	}
+	require.InDelta(s.T(), 1.0, maxW, 1e-9, "max IS-weight must be 1.0")
+}
+
+func (s *PrioritizedReplayBufferSuite) TestPERBetaOneGivesUniformWeights() {
+	b := NewPrioritizedReplayBuffer(100, 0.6)
+	for i := 0; i < 100; i++ {
+		b.Push(Transition{State: []float64{float64(i)}, Action: []float64{0}, Reward: 1.0})
+	}
+
+	_, _, weights := b.Sample(50, 1.0)
+	for _, w := range weights {
+		require.InDelta(s.T(), 1.0, w, 0.01,
+			"with uniform priorities and beta=1.0, all weights should be ~1.0")
+	}
+}
+
+func (s *PrioritizedReplayBufferSuite) TestBetaScheduleAnnealsProperly() {
+	bs := NewBetaSchedule(0.4, 1.0, 100)
+
+	first := bs.Next()
+	require.InDelta(s.T(), 0.4, first, 0.01, "first value should be ~start")
+
+	for i := 0; i < 49; i++ {
+		bs.Next()
+	}
+	mid := bs.Next()
+	require.InDelta(s.T(), 0.7, mid, 0.02, "halfway should be ~0.7")
+
+	for i := 0; i < 49; i++ {
+		bs.Next()
+	}
+	last := bs.Next()
+	require.InDelta(s.T(), 1.0, last, 0.02, "at end should be ~1.0")
+
+	beyond := bs.Next()
+	require.InDelta(s.T(), 1.0, beyond, 0.01, "beyond steps should stay at end")
 }
 
 func (s *PrioritizedReplayBufferSuite) TestUpdatePriority() {

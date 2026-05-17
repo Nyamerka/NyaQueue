@@ -11,7 +11,7 @@ services:
     volumes:
       - nyaqueue-data:/data
     cpus: "2.0"
-    mem_limit: "1.5g"
+    mem_limit: "3g"
     sysctls:
       net.ipv4.tcp_tw_reuse: 1
       net.ipv4.tcp_fin_timeout: 30
@@ -27,37 +27,40 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       target: broker-exporter
+    restart: on-failure
     ports:
       - "8083:8083"
     depends_on:
       - broker
-    cpus: "0.25"
-    mem_limit: "256m"
+    cpus: "0.5"
+    mem_limit: "1g"
 
   producer:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
       target: producer
+    restart: on-failure
     ports:
       - "8081:8081"
     depends_on:
       - broker
     cpus: "0.5"
-    mem_limit: "256m"
+    mem_limit: "1g"
 
   consumer:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
       target: consumer
+    restart: on-failure
     ports:
       - "8082:8082"
     depends_on:
       - broker
       - producer
     cpus: "0.5"
-    mem_limit: "256m"
+    mem_limit: "1g"
 
   prometheus:
     image: prom/prometheus:v2.55.1
@@ -72,8 +75,8 @@ services:
       - "--storage.tsdb.retention.time=24h"
     depends_on:
       - broker-exporter
-    cpus: "0.25"
-    mem_limit: "512m"
+    cpus: "0.5"
+    mem_limit: "1g"
 
   grafana:
     image: grafana/grafana:11.3.0
@@ -90,8 +93,8 @@ services:
       - grafana-data:/var/lib/grafana
     depends_on:
       - prometheus
-    cpus: "0.25"
-    mem_limit: "256m"
+    cpus: "0.5"
+    mem_limit: "1g"
 
   kafka:
     profiles: ["kafka"]
@@ -113,7 +116,7 @@ services:
     volumes:
       - kafka-data:/bitnami/kafka
     cpus: "1.5"
-    mem_limit: "1.5g"
+    mem_limit: "3g"
 
   experiment:
     profiles: ["experiment"]

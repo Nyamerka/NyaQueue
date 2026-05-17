@@ -475,14 +475,9 @@ func (h *Harness) GetMetricsSnapshot(ctx context.Context) (*MetricsSnapshot, err
 		snap := &MetricsSnapshot{
 			PartitionLoads: resp.PartitionLoads,
 		}
-		if h.external {
-			if sd, ok := h.publishStdDev(); ok {
-				snap.LoadStdDev = sd
-				snap.HasStdDev = true
-			}
-		} else {
-			snap.LoadStdDev = resp.LoadStddev
-			snap.HasStdDev = resp.LoadStddev > 0
+		if sd, ok := h.publishStdDev(); ok {
+			snap.LoadStdDev = sd
+			snap.HasStdDev = true
 		}
 		return snap, nil
 	case ModeHTTP:
@@ -493,14 +488,9 @@ func (h *Harness) GetMetricsSnapshot(ctx context.Context) (*MetricsSnapshot, err
 		snap := &MetricsSnapshot{
 			PartitionLoads: resp.PartitionLoads,
 		}
-		if h.external {
-			if sd, ok := h.publishStdDev(); ok {
-				snap.LoadStdDev = sd
-				snap.HasStdDev = true
-			}
-		} else {
-			snap.LoadStdDev = resp.LoadStdDev
-			snap.HasStdDev = resp.LoadStdDev > 0
+		if sd, ok := h.publishStdDev(); ok {
+			snap.LoadStdDev = sd
+			snap.HasStdDev = true
 		}
 		return snap, nil
 	case ModeKafka:

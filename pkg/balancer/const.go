@@ -7,9 +7,9 @@ import (
 
 // DQN hyperparameters (user-facing defaults).
 const (
-	DefaultDQNHiddenSize     = 64
+	DefaultDQNHiddenSize     = 128
 	DefaultDQNEpsilon        = 0.05
-	DefaultDQNGamma          = 0.99
+	DefaultDQNGamma          = 0.9
 	DefaultDQNLearningRate   = 0.001
 	DefaultDQNReplayBufSize  = 50_000
 	DefaultDQNBatchSize      = 32

@@ -3,8 +3,9 @@ package nn
 import (
 	"math"
 	"math/rand/v2"
-	"sync"
 	"sync/atomic"
+
+	"github.com/puzpuzpuz/xsync/v3"
 )
 
 type Transition struct {
@@ -91,7 +92,7 @@ func (rb *ReplayBuffer) Len() int {
 // PrioritizedReplayBuffer samples transitions proportional to priority^alpha.
 // Higher TD-error transitions are sampled more frequently.
 type PrioritizedReplayBuffer struct {
-	mu          sync.Mutex
+	mu          *xsync.RBMutex
 	transitions []Transition
 	priorities  []float64
 	capacity    int
@@ -104,6 +105,7 @@ type PrioritizedReplayBuffer struct {
 
 func NewPrioritizedReplayBuffer(capacity int, alpha float64) *PrioritizedReplayBuffer {
 	return &PrioritizedReplayBuffer{
+		mu:          xsync.NewRBMutex(),
 		transitions: make([]Transition, capacity),
 		priorities:  make([]float64, capacity),
 		capacity:    capacity,
@@ -134,12 +136,15 @@ func (b *PrioritizedReplayBuffer) Push(t Transition) {
 	}
 }
 
-func (b *PrioritizedReplayBuffer) Sample(batchSize int) ([]Transition, []int) {
+// Sample returns a batch of transitions sampled proportional to priority^alpha,
+// together with their buffer indices and importance-sampling weights.
+// IS-weights are computed as w_i = (N * P(i))^(-beta) / max(w) and normalized so max=1.0.
+func (b *PrioritizedReplayBuffer) Sample(batchSize int, beta float64) ([]Transition, []int, []float64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if b.size == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if batchSize > b.size {
 		batchSize = b.size
@@ -159,6 +164,10 @@ func (b *PrioritizedReplayBuffer) Sample(batchSize int) ([]Transition, []int) {
 
 	batch := make([]Transition, batchSize)
 	indices := make([]int, batchSize)
+	weights := make([]float64, batchSize)
+	n := float64(b.size)
+
+	var maxWeight float64
 	for i := 0; i < batchSize; i++ {
 		r := rand.Float64() * total
 		var cum float64
@@ -173,9 +182,22 @@ func (b *PrioritizedReplayBuffer) Sample(batchSize int) ([]Transition, []int) {
 		}
 		batch[i] = b.transitions[idx]
 		indices[i] = idx
+
+		prob := probs[idx] / total
+		w := math.Pow(n*prob, -beta)
+		weights[i] = w
+		if w > maxWeight {
+			maxWeight = w
+		}
 	}
 
-	return batch, indices
+	if maxWeight > 0 {
+		for i := range weights {
+			weights[i] /= maxWeight
+		}
+	}
+
+	return batch, indices, weights
 }
 
 func (b *PrioritizedReplayBuffer) UpdatePriority(idx int, tdError float64) {
@@ -193,7 +215,31 @@ func (b *PrioritizedReplayBuffer) UpdatePriority(idx int, tdError float64) {
 }
 
 func (b *PrioritizedReplayBuffer) Len() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	rt := b.mu.RLock()
+	defer b.mu.RUnlock(rt)
 	return b.size
+}
+
+// BetaSchedule linearly anneals beta from start to end over a given number of steps.
+type BetaSchedule struct {
+	start   float64
+	end     float64
+	steps   int
+	current int
+}
+
+func NewBetaSchedule(start, end float64, steps int) *BetaSchedule {
+	return &BetaSchedule{start: start, end: end, steps: steps}
+}
+
+func (b *BetaSchedule) Next() float64 {
+	if b.steps <= 0 {
+		return b.end
+	}
+	frac := float64(b.current) / float64(b.steps)
+	if frac > 1.0 {
+		frac = 1.0
+	}
+	b.current++
+	return b.start + (b.end-b.start)*frac
 }

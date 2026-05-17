@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -125,7 +126,10 @@ func (r *Runner) RunAll(ctx context.Context) ([]ExperimentResult, error) {
 	return results, nil
 }
 
-const warmupDuration = 10 * time.Second
+const (
+	warmupDuration    = 10 * time.Second
+	dqnWarmupDuration = 30 * time.Second
+)
 
 func (r *Runner) runWarmup(ctx context.Context) {
 	log.Printf("[warmup] running %v warmup run (results discarded)...", warmupDuration)
@@ -245,6 +249,11 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		brk.SetScheduler(topic, alg.NewScheduler())
 	}
 
+	if strings.Contains(alg.Name, "DQN") && mode == ModeInProcess {
+		log.Printf("  [dqn-warmup] running %v warmup for %s/%s ...", dqnWarmupDuration, sc.Name, alg.Name)
+		_ = runScenario(ctx, h, sc, alg.Name, "nyaqueue", mode, topicCfg.NumPartitions, dqnWarmupDuration, topic)
+	}
+
 	log.Printf("  running %s / %s / %s for %v (seed=%d) ...", sc.Name, alg.Name, mode, dur, sc.Seed)
 	result := runScenario(ctx, h, sc, alg.Name, "nyaqueue", mode, topicCfg.NumPartitions, dur, topic)
 
@@ -307,11 +316,10 @@ func runScenario(
 	consumeCtx, stopConsumers := context.WithCancel(ctx)
 	defer stopConsumers()
 
-	samplerDone := make(chan struct{})
-	go func() {
-		defer close(samplerDone)
+	samplerPool := pond.NewPool(1)
+	samplerPool.Submit(func() {
 		sampleLoadsFromHarness(consumeCtx, h, collector, loadSampleInterval)
-	}()
+	})
 
 	msgSize := sc.MsgSize
 	if msgSize == 0 {
@@ -356,7 +364,7 @@ func runScenario(
 
 	stopConsumers()
 	consumerPool.StopAndWait()
-	<-samplerDone
+	samplerPool.StopAndWait()
 
 	collector.Stop()
 	return collector.Snapshot(sc.Name, algName, system, mode.String())

@@ -4,11 +4,11 @@ import "github.com/Nyamerka/NyaQueue/pkg/broker"
 
 const (
 	DefaultDQNSchedStateSize  = broker.MaxPriority*2 + 3 // level dist + wait times + depth + velocity + ratio
-	DefaultDQNSchedHiddenSize = 64
+	DefaultDQNSchedHiddenSize = 128
 	DefaultDQNSchedActions    = broker.MaxPriority
 
 	DefaultDQNSchedEpsilon       = 0.05
-	DefaultDQNSchedGamma         = 0.99
+	DefaultDQNSchedGamma         = 0.9
 	DefaultDQNSchedLearningRate  = 0.001
 	DefaultDQNSchedReplayBufSize = 50_000
 	DefaultDQNSchedBatchSize     = 32

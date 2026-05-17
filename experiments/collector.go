@@ -122,6 +122,34 @@ func (c *MetricsCollector) Stop() {
 	c.endTime = time.Now()
 }
 
+// Reset clears latency histograms and per-priority samples so that
+// reconnection downtime latency does not pollute P99 measurements.
+// Throughput counters are intentionally preserved.
+func (c *MetricsCollector) Reset() {
+	for i := range c.shards {
+		c.shards[i].mu.Lock()
+		c.shards[i].latency.Reset()
+		c.shards[i].mu.Unlock()
+	}
+
+	for i := range c.byPriority {
+		c.byPriority[i].mu.Lock()
+		c.byPriority[i].samples = c.byPriority[i].samples[:0]
+		c.byPriority[i].total = 0
+		c.byPriority[i].mu.Unlock()
+	}
+
+	c.multiStageMu.Lock()
+	c.enqueueToFlush.Reset()
+	c.flushToAppend.Reset()
+	c.appendToConsume.Reset()
+	c.multiStageMu.Unlock()
+
+	c.mu.Lock()
+	c.loadStddevs = c.loadStddevs[:0]
+	c.mu.Unlock()
+}
+
 func (c *MetricsCollector) RecordProduce() {
 	c.produced.Add(1)
 }

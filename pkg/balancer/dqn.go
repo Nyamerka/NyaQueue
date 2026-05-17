@@ -17,6 +17,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/layers"
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
+	"github.com/gomlx/gomlx/pkg/ml/train/losses"
 	"github.com/puzpuzpuz/xsync/v3"
 	"golang.org/x/sync/errgroup"
 	"gonum.org/v1/gonum/stat"
@@ -40,19 +41,24 @@ type DQNBalancer struct {
 	epsilon       float64
 	gamma         float64
 	lr            float64
+	huberDelta    float64
 	batchSize     int
 	minReplay     int
 	trainEvery    int
 
-	backend    backends.Backend
-	ctx        *context.Context
-	fwdExec    *context.Exec
-	nextQExec  *context.Exec
-	batchQExec *context.Exec
-	trainExec  *context.Exec
-	stateSize  int
+	backend               backends.Backend
+	ctx                   *context.Context
+	targetNet             *nn.TargetNetwork
+	fwdExec               *context.Exec
+	bestActionsExec       *context.Exec
+	targetQForActionsExec *context.Exec
+	batchQExec            *context.Exec
+	trainExec             *context.Exec
+	stateSize             int
 
 	replayBuffer *nn.PrioritizedReplayBuffer
+	betaSchedule *nn.BetaSchedule
+	normalizer   *nn.RunningNormalizer
 
 	expCh  chan nn.Transition
 	eg     *errgroup.Group
@@ -92,10 +98,11 @@ type DQNBalancer struct {
 // DQNOption configures a DQNBalancer.
 type DQNOption func(*DQNBalancer)
 
-func WithDQNEpsilon(e float64) DQNOption       { return func(d *DQNBalancer) { d.epsilon = e } }
-func WithDQNGamma(g float64) DQNOption         { return func(d *DQNBalancer) { d.gamma = g } }
-func WithDQNLearningRate(lr float64) DQNOption { return func(d *DQNBalancer) { d.lr = lr } }
-func WithDQNHiddenSize(n int) DQNOption        { return func(d *DQNBalancer) { d.hiddenSize = n } }
+func WithDQNEpsilon(e float64) DQNOption        { return func(d *DQNBalancer) { d.epsilon = e } }
+func WithDQNGamma(g float64) DQNOption          { return func(d *DQNBalancer) { d.gamma = g } }
+func WithDQNLearningRate(lr float64) DQNOption  { return func(d *DQNBalancer) { d.lr = lr } }
+func WithDQNHiddenSize(n int) DQNOption         { return func(d *DQNBalancer) { d.hiddenSize = n } }
+func WithDQNHuberDelta(delta float64) DQNOption { return func(d *DQNBalancer) { d.huberDelta = delta } }
 func WithDQNReplayBufSize(n int) DQNOption {
 	return func(d *DQNBalancer) { d.replayBuffer = nn.NewPrioritizedReplayBuffer(n, 0.6) }
 }
@@ -114,6 +121,7 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 		epsilon:       DefaultDQNEpsilon,
 		gamma:         DefaultDQNGamma,
 		lr:            DefaultDQNLearningRate,
+		huberDelta:    1.0,
 		batchSize:     DefaultDQNBatchSize,
 		minReplay:     DefaultDQNMinReplay,
 		trainEvery:    DefaultDQNTrainEvery,
@@ -134,6 +142,8 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 	d.stateSize = numPartitions*3 + 2
 	d.policyStateBuf = make([]float64, d.stateSize)
 	d.adaptiveEpsilon.Store(math.Float64bits(d.epsilon))
+	d.betaSchedule = nn.NewBetaSchedule(0.4, 1.0, DefaultDQNReplayBufSize/d.batchSize)
+	d.normalizer = nn.NewRunningNormalizer(d.stateSize)
 	d.initGoMLX()
 
 	ctx, cancel := stdctx.WithCancel(stdctx.Background())
@@ -171,33 +181,36 @@ func (d *DQNBalancer) initGoMLX() {
 	dummyState := make([]float64, d.stateSize)
 	d.fwdExec.MustExec(dummyState)
 
-	d.nextQExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
+	d.targetNet = nn.NewTargetNetwork(d.ctx)
+
+	d.bestActionsExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
 		func(ctx *context.Context, states *Node) *Node {
-			h := layers.Dense(ctx.In("hidden"), states, true, d.hiddenSize)
-			h = activations.Relu(h)
-			q := layers.Dense(ctx.In("output"), h, true, d.numPartitions)
-			return ReduceMax(q, -1)
+			q := d.qNetworkBatch(ctx, states)
+			return ArgMax(q, -1, dtypes.Int32)
 		})
 
-	d.batchQExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
+	d.targetQForActionsExec = context.MustNewExec(d.backend, d.targetNet.TargetCtx().Reuse(),
 		func(ctx *context.Context, states, actionIdx *Node) *Node {
-			h := layers.Dense(ctx.In("hidden"), states, true, d.hiddenSize)
-			h = activations.Relu(h)
-			qAll := layers.Dense(ctx.In("output"), h, true, d.numPartitions)
+			qAll := d.qNetworkBatch(ctx, states)
 			oneHot := OneHot(ConvertDType(actionIdx, dtypes.Int32), d.numPartitions, qAll.DType())
 			return ReduceSum(Mul(qAll, oneHot), -1)
 		})
 
+	d.batchQExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
+		func(ctx *context.Context, states, actionIdx *Node) *Node {
+			qAll := d.qNetworkBatch(ctx, states)
+			oneHot := OneHot(ConvertDType(actionIdx, dtypes.Int32), d.numPartitions, qAll.DType())
+			return ReduceSum(Mul(qAll, oneHot), -1)
+		})
+
+	huber := losses.MakeHuberLoss(d.huberDelta)
 	d.trainExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
-		func(ctx *context.Context, states, targetQ, actionIdx *Node) *Node {
+		func(ctx *context.Context, states, targetQ, actionIdx, isWeights *Node) *Node {
 			g := states.Graph()
-			h := layers.Dense(ctx.In("hidden"), states, true, d.hiddenSize)
-			h = activations.Relu(h)
-			qAll := layers.Dense(ctx.In("output"), h, true, d.numPartitions)
+			qAll := d.qNetworkBatch(ctx, states)
 			oneHot := OneHot(ConvertDType(actionIdx, dtypes.Int32), d.numPartitions, qAll.DType())
 			qSelected := ReduceSum(Mul(qAll, oneHot), -1)
-			diff := Sub(qSelected, targetQ)
-			loss := ReduceAllMean(Mul(diff, diff))
+			loss := huber([]*Node{targetQ, isWeights}, []*Node{qSelected})
 			grads := ctx.BuildTrainableVariablesGradientsGraph(loss)
 			lr := Const(g, d.lr)
 			idx := 0
@@ -212,13 +225,29 @@ func (d *DQNBalancer) initGoMLX() {
 		})
 }
 
-func (d *DQNBalancer) qNetworkGraph(ctx *context.Context, state *Node) *Node {
-	x := InsertAxes(state, 0) // [1, stateSize]
-	h := layers.Dense(ctx.In("hidden"), x, true, d.hiddenSize)
+func (d *DQNBalancer) qNetworkBatch(ctx *context.Context, x *Node) *Node {
+	h := layers.Dense(ctx.In("feature1"), x, true, d.hiddenSize)
 	h = activations.Relu(h)
-	q := layers.Dense(ctx.In("output"), h, true, d.numPartitions)
-	q = Reshape(q, d.numPartitions) // flatten to [numPartitions]
-	return q
+	h = layers.Dense(ctx.In("feature2"), h, true, d.hiddenSize/2)
+	h = activations.Relu(h)
+
+	vStream := layers.Dense(ctx.In("value_hidden"), h, true, d.hiddenSize/4)
+	vStream = activations.Relu(vStream)
+	v := layers.Dense(ctx.In("value_out"), vStream, true, 1)
+
+	aStream := layers.Dense(ctx.In("adv_hidden"), h, true, d.hiddenSize/4)
+	aStream = activations.Relu(aStream)
+	a := layers.Dense(ctx.In("adv_out"), aStream, true, d.numPartitions)
+
+	aMean := ReduceMean(a, -1)
+	aMean = ExpandDims(aMean, -1)
+	return Add(v, Sub(a, aMean))
+}
+
+func (d *DQNBalancer) qNetworkGraph(ctx *context.Context, state *Node) *Node {
+	x := InsertAxes(state, 0)
+	q := d.qNetworkBatch(ctx, x)
+	return Reshape(q, d.numPartitions)
 }
 
 func (d *DQNBalancer) forward(state []float64) []float64 {
@@ -464,6 +493,9 @@ func (d *DQNBalancer) buildStateInto(dst []float64) {
 	if idx+1 < len(dst) {
 		dst[idx+1] = d.avgMsgSize / dqnMsgSizeScale
 	}
+
+	d.normalizer.Observe(dst)
+	d.normalizer.NormalizeInPlace(dst)
 }
 
 // computeReward produces a scalar signal for the DQN.
@@ -521,7 +553,8 @@ func (d *DQNBalancer) trainStep() {
 		return
 	}
 
-	batch, indices := d.replayBuffer.Sample(d.batchSize)
+	beta := d.betaSchedule.Next()
+	batch, indices, isWeights := d.replayBuffer.Sample(d.batchSize, beta)
 	bs := len(batch)
 	if bs < d.batchSize {
 		return
@@ -549,12 +582,13 @@ func (d *DQNBalancer) trainStep() {
 	nextStatesT := tensors.FromFlatDataAndDimensions(nextStatesBuf, bs, d.stateSize)
 
 	rt := d.weightsMu.RLock()
-	maxNextQT := d.nextQExec.MustExec1(nextStatesT)
+	bestActionsT := d.bestActionsExec.MustExec1(nextStatesT)
+	nextQT := d.targetQForActionsExec.MustExec1(nextStatesT, bestActionsT)
 	actionsT := tensors.FromFlatDataAndDimensions(actions, bs)
 	currentQT := d.batchQExec.MustExec1(statesT, actionsT)
 	d.weightsMu.RUnlock(rt)
 
-	maxNextQ := tensorToFloat64Slice(maxNextQT)
+	maxNextQ := tensorToFloat64Slice(nextQT)
 	currentQ := tensorToFloat64Slice(currentQT)
 	targets := make([]float64, bs)
 	for i := range batch {
@@ -570,7 +604,10 @@ func (d *DQNBalancer) trainStep() {
 	defer d.weightsMu.Unlock()
 
 	targetsT := tensors.FromFlatDataAndDimensions(targets, bs)
-	d.trainExec.MustExec(statesT, targetsT, actionsT)
+	isWeightsT := tensors.FromFlatDataAndDimensions(isWeights, bs)
+	d.trainExec.MustExec(statesT, targetsT, actionsT, isWeightsT)
+
+	d.targetNet.Step()
 }
 
 func padOrTrunc(s []float64, n int) []float64 {

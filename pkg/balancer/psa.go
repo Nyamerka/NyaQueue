@@ -4,6 +4,7 @@ import (
 	"hash/fnv"
 	"math"
 	"sync/atomic"
+	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/puzpuzpuz/xsync/v3"
@@ -13,11 +14,13 @@ import (
 
 const (
 	defaultPSAMaxBindings = 100_000
+	psaGracePeriod        = 500 * time.Millisecond
 )
 
 type psaShard struct {
-	mu   xsync.RBMutex
-	keys map[string]struct{}
+	mu           xsync.RBMutex
+	keys         map[string]struct{}
+	lastBindTime atomic.Int64
 }
 
 type PSA struct {
@@ -68,51 +71,58 @@ func (p *PSA) removeFromReverseIndex(key string, partID int) {
 func (p *PSA) SelectPartition(_ string, key []byte, numPartitions int) int {
 	keyStr := string(key)
 
-	if part, ok := p.bindings.Peek(keyStr); ok {
-		return part
-	}
-
-	// Double-check via Get (promotes in LRU).
 	if part, ok := p.bindings.Get(keyStr); ok {
 		return part
 	}
 
-	freeList := p.collectFree()
-	if len(freeList) > 0 {
-		part := p.leastLoadedFree(freeList)
+	if part, ok := p.claimFreePartition(); ok {
 		p.bind(keyStr, part)
-		p.free.Delete(part)
 		return part
 	}
 
 	h := hashKey(key)
-	return int(h % uint64(numPartitions))
+	part := int(h % uint64(numPartitions))
+	p.bind(keyStr, part)
+	return part
+}
+
+// claimFreePartition atomically claims the least-loaded free partition.
+// Uses LoadAndDelete for atomic ownership transfer — first goroutine to
+// successfully delete a partition from the free set owns it.
+func (p *PSA) claimFreePartition() (int, bool) {
+	loads := p.loads.Load()
+	bestPart := -1
+	bestLoad := math.MaxFloat64
+
+	p.free.Range(func(id int, _ struct{}) bool {
+		load := math.MaxFloat64
+		if loads != nil && id < len(*loads) {
+			load = (*loads)[id]
+		}
+		if load < bestLoad {
+			bestLoad = load
+			bestPart = id
+		}
+		return true
+	})
+
+	if bestPart < 0 {
+		return 0, false
+	}
+
+	if _, loaded := p.free.LoadAndDelete(bestPart); loaded {
+		return bestPart, true
+	}
+	return 0, false
 }
 
 func (p *PSA) bind(key string, part int) {
-	// Add first — may trigger eviction which locks a (potentially different) shard.
 	p.bindings.Add(key, part)
 	sh := &p.shards[part]
 	sh.mu.Lock()
 	sh.keys[key] = struct{}{}
 	sh.mu.Unlock()
-}
-
-func (p *PSA) leastLoadedFree(freeList []int) int {
-	loads := p.loads.Load()
-	if loads == nil || len(*loads) == 0 {
-		return freeList[0]
-	}
-	ld := *loads
-	best := freeList[0]
-	bestLoad := math.MaxFloat64
-	for _, id := range freeList {
-		if id < len(ld) && ld[id] < bestLoad {
-			bestLoad = ld[id]
-			best = id
-		}
-	}
-	return best
+	sh.lastBindTime.Store(time.Now().UnixNano())
 }
 
 func (p *PSA) OnMetrics(m broker.Metrics) {
@@ -141,6 +151,12 @@ func (p *PSA) releasePartition(id int) {
 		return
 	}
 	sh := &p.shards[id]
+
+	lastBind := sh.lastBindTime.Load()
+	if lastBind > 0 && time.Since(time.Unix(0, lastBind)) < psaGracePeriod {
+		return
+	}
+
 	sh.mu.Lock()
 	if len(sh.keys) == 0 {
 		sh.mu.Unlock()
@@ -155,8 +171,6 @@ func (p *PSA) releasePartition(id int) {
 	sh.mu.Unlock()
 
 	for _, k := range toRemove {
-		// Only remove from cache if it still points to this partition,
-		// to avoid invalidating a concurrent re-bind to a different partition.
 		if cur, ok := p.bindings.Peek(k); ok && cur == id {
 			p.bindings.Remove(k)
 		}
@@ -177,15 +191,6 @@ func avgLoad(loads []float64) float64 {
 		sum += v
 	}
 	return sum / float64(len(loads))
-}
-
-func (p *PSA) collectFree() []int {
-	var out []int
-	p.free.Range(func(id int, _ struct{}) bool {
-		out = append(out, id)
-		return true
-	})
-	return out
 }
 
 func hashKey(key []byte) uint64 {

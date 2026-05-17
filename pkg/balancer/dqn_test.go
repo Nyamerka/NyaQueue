@@ -325,16 +325,13 @@ func (s *DQNSuite) TestDQNBalancer_InflightInState() {
 		dqn.SelectPartition("t", nil, 4)
 	}
 
-	state := make([]float64, dqn.stateSize)
-	dqn.stateMu.Lock()
-	dqn.buildStateInto(state)
-	dqn.stateMu.Unlock()
+	ptr := dqn.inflight.Load()
+	require.NotNil(s.T(), ptr, "inflight slice should be initialized after SelectPartition")
 
-	inflightBase := dqn.numPartitions * 2
-	var totalInflight float64
-	for i := 0; i < dqn.numPartitions; i++ {
-		totalInflight += state[inflightBase+i]
+	var totalInflight int64
+	for i := 0; i < dqn.numPartitions && i < len(*ptr); i++ {
+		totalInflight += (*ptr)[i].Load()
 	}
-	require.Greater(s.T(), totalInflight, 0.0,
+	require.Greater(s.T(), totalInflight, int64(0),
 		"inflight should be reflected in state vector after SelectPartition calls")
 }
