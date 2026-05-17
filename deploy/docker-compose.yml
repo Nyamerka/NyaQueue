@@ -8,10 +8,14 @@ services:
     ports:
       - "9090:9090"
       - "8080:8080"
+    environment:
+      GOGC: "50"
+      GOMEMLIMIT: "7GiB"
+      GOMAXPROCS: "3"
     volumes:
       - nyaqueue-data:/data
-    cpus: "2.0"
-    mem_limit: "3g"
+    cpus: "3.0"
+    mem_limit: "8g"
     sysctls:
       net.ipv4.tcp_tw_reuse: 1
       net.ipv4.tcp_fin_timeout: 30
@@ -32,8 +36,8 @@ services:
       - "8083:8083"
     depends_on:
       - broker
-    cpus: "0.5"
-    mem_limit: "1g"
+    cpus: "0.1"
+    mem_limit: "256m"
 
   producer:
     build:
@@ -45,8 +49,8 @@ services:
       - "8081:8081"
     depends_on:
       - broker
-    cpus: "0.5"
-    mem_limit: "1g"
+    cpus: "0.2"
+    mem_limit: "512m"
 
   consumer:
     build:
@@ -59,8 +63,8 @@ services:
     depends_on:
       - broker
       - producer
-    cpus: "0.5"
-    mem_limit: "1g"
+    cpus: "0.3"
+    mem_limit: "512m"
 
   prometheus:
     image: prom/prometheus:v2.55.1
@@ -75,8 +79,8 @@ services:
       - "--storage.tsdb.retention.time=24h"
     depends_on:
       - broker-exporter
-    cpus: "0.5"
-    mem_limit: "1g"
+    cpus: "0.2"
+    mem_limit: "512m"
 
   grafana:
     image: grafana/grafana:11.3.0
@@ -93,8 +97,8 @@ services:
       - grafana-data:/var/lib/grafana
     depends_on:
       - prometheus
-    cpus: "0.5"
-    mem_limit: "1g"
+    cpus: "0.1"
+    mem_limit: "256m"
 
   kafka:
     profiles: ["kafka"]
@@ -115,7 +119,7 @@ services:
       KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
     volumes:
       - kafka-data:/bitnami/kafka
-    cpus: "1.5"
+    cpus: "0.8"
     mem_limit: "3g"
 
   experiment:
@@ -138,6 +142,8 @@ services:
       - kafka
     volumes:
       - ./results:/results
+    cpus: "2.0"
+    mem_limit: "2g"
     sysctls:
       net.ipv4.tcp_tw_reuse: 1
       net.ipv4.tcp_fin_timeout: 30

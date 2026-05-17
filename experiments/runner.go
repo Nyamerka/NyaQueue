@@ -249,17 +249,19 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		brk.SetScheduler(topic, alg.NewScheduler())
 	}
 
-	if strings.Contains(alg.Name, "DQN") && mode == ModeInProcess {
-		log.Printf("  [dqn-warmup] running %v warmup for %s/%s ...", dqnWarmupDuration, sc.Name, alg.Name)
-		_ = runScenario(ctx, h, sc, alg.Name, "nyaqueue", mode, topicCfg.NumPartitions, dqnWarmupDuration, topic)
+	if strings.Contains(alg.Name, "DQN") {
+		warmup := dqnWarmupDuration
+		if topicCfg.NumPartitions > 4 {
+			warmup = dqnWarmupDuration * time.Duration(topicCfg.NumPartitions/4)
+		}
+		log.Printf("  [dqn-warmup] running %v warmup for %s/%s (k=%d) ...", warmup, sc.Name, alg.Name, topicCfg.NumPartitions)
+		_ = runScenario(ctx, h, sc, alg.Name, "nyaqueue", ModeInProcess, topicCfg.NumPartitions, warmup, topic)
 	}
 
 	log.Printf("  running %s / %s / %s for %v (seed=%d) ...", sc.Name, alg.Name, mode, dur, sc.Seed)
 	result := runScenario(ctx, h, sc, alg.Name, "nyaqueue", mode, topicCfg.NumPartitions, dur, topic)
 
-	if mode != ModeInProcess {
-		time.Sleep(5 * time.Second)
-	}
+	drainQueues(ctx, h, 5*time.Second)
 	return result, nil
 }
 
@@ -310,6 +312,7 @@ func runScenario(
 		topic = topicOverride[0]
 	}
 	collector := NewMetricsCollector()
+	h.SetOnReconnect(collector.Reset)
 	collector.Start()
 
 	produceCtx, stopProducers := context.WithCancel(ctx)
@@ -679,4 +682,26 @@ func isRetryableError(err error) bool {
 		return true
 	}
 	return false
+}
+
+// drainQueues waits until all partition queues are empty or timeout expires.
+// This prevents leftover messages from one run polluting the next run's P99.
+func drainQueues(ctx context.Context, h *Harness, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		snap, err := h.GetMetricsSnapshot(ctx)
+		if err != nil || snap == nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		totalDepth := 0
+		for _, d := range snap.QueueDepth {
+			totalDepth += d
+		}
+		if totalDepth == 0 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	log.Printf("  [drain] timeout after %v, some queues may not be empty", timeout)
 }

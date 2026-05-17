@@ -222,10 +222,16 @@ func (c *MetricsCollector) RecordConsumeError() {
 	c.consumeErrors.Add(1)
 }
 
-// RecordLoadSample appends one stddev value computed across partitions at a
-// single point in time. Snapshot averages these to get the run-level imbalance.
+const loadStdDevGracePeriod = 5 * time.Second
+
 func (c *MetricsCollector) RecordLoadSample(loads []float64) {
 	if len(loads) < 2 {
+		return
+	}
+	rt := c.mu.RLock()
+	start := c.startTime
+	c.mu.RUnlock(rt)
+	if time.Since(start) < loadStdDevGracePeriod {
 		return
 	}
 	stddev := stat.StdDev(loads, nil)
@@ -234,8 +240,13 @@ func (c *MetricsCollector) RecordLoadSample(loads []float64) {
 	c.mu.Unlock()
 }
 
-// RecordLoadStdDev records a pre-computed load stddev from the broker.
 func (c *MetricsCollector) RecordLoadStdDev(sd float64) {
+	rt := c.mu.RLock()
+	start := c.startTime
+	c.mu.RUnlock(rt)
+	if time.Since(start) < loadStdDevGracePeriod {
+		return
+	}
 	c.mu.Lock()
 	c.loadStddevs = append(c.loadStddevs, sd)
 	c.mu.Unlock()

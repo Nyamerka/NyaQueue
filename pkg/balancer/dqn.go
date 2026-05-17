@@ -5,6 +5,7 @@ import (
 	"log"
 	"math"
 	"math/rand/v2"
+	"runtime"
 	"sync/atomic"
 	"time"
 
@@ -405,7 +406,11 @@ func (d *DQNBalancer) Stop() {
 }
 
 func (d *DQNBalancer) trainLoop(ctx stdctx.Context) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	steps := 0
+	var lastLoss float64
 
 	for {
 		select {
@@ -413,7 +418,13 @@ func (d *DQNBalancer) trainLoop(ctx stdctx.Context) {
 			d.replayBuffer.Push(t)
 			steps++
 			if steps%d.trainEvery == 0 {
-				d.trainStep()
+				lastLoss = d.trainStep()
+			}
+			if steps%100 == 0 {
+				eps := math.Float64frombits(d.adaptiveEpsilon.Load())
+				log.Printf("[dqn-bal] step=%d loss=%.4f ε=%.3f buf=%d/%d fallback=%v dropped=%d",
+					steps, lastLoss, eps, d.replayBuffer.Len(), d.replayBuffer.Cap(),
+					d.fallbackActive.Load(), d.droppedExperience.Load())
 			}
 		case <-ctx.Done():
 			for {
@@ -548,16 +559,16 @@ func computeReward(m broker.Metrics) float64 {
 	return reward
 }
 
-func (d *DQNBalancer) trainStep() {
+func (d *DQNBalancer) trainStep() float64 {
 	if d.replayBuffer.Len() < d.minReplay {
-		return
+		return 0
 	}
 
 	beta := d.betaSchedule.Next()
 	batch, indices, isWeights := d.replayBuffer.Sample(d.batchSize, beta)
 	bs := len(batch)
 	if bs < d.batchSize {
-		return
+		return 0
 	}
 
 	statesBuf := make([]float64, bs*d.stateSize)
@@ -605,9 +616,15 @@ func (d *DQNBalancer) trainStep() {
 
 	targetsT := tensors.FromFlatDataAndDimensions(targets, bs)
 	isWeightsT := tensors.FromFlatDataAndDimensions(isWeights, bs)
-	d.trainExec.MustExec(statesT, targetsT, actionsT, isWeightsT)
+	lossT := d.trainExec.MustExec1(statesT, targetsT, actionsT, isWeightsT)
 
 	d.targetNet.Step()
+
+	lossVals := tensorToFloat64Slice(lossT)
+	if len(lossVals) > 0 {
+		return lossVals[0]
+	}
+	return 0
 }
 
 func padOrTrunc(s []float64, n int) []float64 {

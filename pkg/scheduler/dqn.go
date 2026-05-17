@@ -5,6 +5,7 @@ import (
 	"log"
 	"math"
 	"math/rand/v2"
+	"runtime"
 	"sync/atomic"
 	"time"
 
@@ -457,7 +458,11 @@ func (d *DQNScheduler) policyLoop(ctx stdctx.Context) {
 }
 
 func (d *DQNScheduler) trainLoop(ctx stdctx.Context) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	steps := 0
+	var lastLoss float64
 
 	for {
 		select {
@@ -468,7 +473,15 @@ func (d *DQNScheduler) trainLoop(ctx stdctx.Context) {
 			}
 			steps++
 			if steps%d.trainEvery == 0 {
-				d.trainStep()
+				lastLoss = d.trainStep()
+			}
+			if steps%100 == 0 {
+				srt := d.stateMu.RLock()
+				eps := d.epsilon
+				d.stateMu.RUnlock(srt)
+				log.Printf("[dqn-sched] step=%d loss=%.4f ε=%.3f buf=%d/%d threshold=%d",
+					steps, lastLoss, eps, d.replayBuffer.Len(), d.replayBuffer.Cap(),
+					d.cachedThreshold.Load())
 			}
 		case <-ctx.Done():
 			for {
@@ -544,9 +557,9 @@ func (d *DQNScheduler) buildState(pi *broker.PriorityIndex) []float64 {
 	return state
 }
 
-func (d *DQNScheduler) trainStep() {
+func (d *DQNScheduler) trainStep() float64 {
 	if d.replayBuffer.Len() < d.minReplay {
-		return
+		return 0
 	}
 
 	mainSize := d.batchSize
@@ -559,7 +572,7 @@ func (d *DQNScheduler) trainStep() {
 	beta := d.betaSchedule.Next()
 	mainBatch, indices, isWeights := d.replayBuffer.Sample(mainSize, beta)
 	if len(mainBatch) < mainSize {
-		return
+		return 0
 	}
 
 	crisisBatch := d.crisisBuffer.Sample(crisisSize)
@@ -615,9 +628,15 @@ func (d *DQNScheduler) trainStep() {
 
 	targetsT := tensors.FromFlatDataAndDimensions(targets, bs)
 	isWeightsT := tensors.FromFlatDataAndDimensions(isWeights, bs)
-	d.trainExec.MustExec(statesT, targetsT, actionsT, isWeightsT)
+	lossT := d.trainExec.MustExec1(statesT, targetsT, actionsT, isWeightsT)
 
 	d.targetNet.Step()
+
+	lossVals := tensorToFloat64Sched(lossT)
+	if len(lossVals) > 0 {
+		return lossVals[0]
+	}
+	return 0
 }
 
 func padOrTruncSched(s []float64, n int) []float64 {

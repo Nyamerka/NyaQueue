@@ -214,6 +214,12 @@ func (b *PrioritizedReplayBuffer) UpdatePriority(idx int, tdError float64) {
 	}
 }
 
+func (b *PrioritizedReplayBuffer) Cap() int {
+	rt := b.mu.RLock()
+	defer b.mu.RUnlock(rt)
+	return b.capacity
+}
+
 func (b *PrioritizedReplayBuffer) Len() int {
 	rt := b.mu.RLock()
 	defer b.mu.RUnlock(rt)

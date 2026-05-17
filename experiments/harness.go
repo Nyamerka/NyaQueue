@@ -3,6 +3,7 @@ package experiments
 import (
 	"context"
 	"errors"
+	"log"
 	"math"
 	"time"
 
@@ -56,7 +57,19 @@ type Harness struct {
 	external     bool
 	managedTopic string
 
+	brokerAddr     string
+	httpBrokerAddr string
+
+	onReconnect func()
+
 	partitionCounts *xsync.MapOf[int, *xsync.Counter]
+}
+
+// SetOnReconnect registers a callback invoked after the harness
+// successfully reconnects to a broker (e.g. after OOM restart).
+// Typical usage: pass collector.Reset to discard stale latency samples.
+func (h *Harness) SetOnReconnect(fn func()) {
+	h.onReconnect = fn
 }
 
 // HarnessConfig describes how to create a harness.
@@ -75,6 +88,8 @@ type HarnessConfig struct {
 func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 	h := &Harness{
 		mode:            cfg.Mode,
+		brokerAddr:      cfg.BrokerAddr,
+		httpBrokerAddr:  cfg.HTTPBrokerAddr,
 		partitionCounts: xsync.NewMapOf[int, *xsync.Counter](),
 	}
 
@@ -450,6 +465,7 @@ func (h *Harness) ConsumeBatch(ctx context.Context, topic, group string, partiti
 // MetricsSnapshot holds partition loads and pre-computed load stddev from the broker.
 type MetricsSnapshot struct {
 	PartitionLoads []float64
+	QueueDepth     []int
 	LoadStdDev     float64
 	HasStdDev      bool
 }
@@ -462,6 +478,7 @@ func (h *Harness) GetMetricsSnapshot(ctx context.Context) (*MetricsSnapshot, err
 			m := brk.Metrics()
 			return &MetricsSnapshot{
 				PartitionLoads: m.PartitionLoads,
+				QueueDepth:     m.QueueDepth,
 				LoadStdDev:     m.LoadStdDev,
 				HasStdDev:      m.LoadStdDev > 0,
 			}, nil
@@ -474,6 +491,12 @@ func (h *Harness) GetMetricsSnapshot(ctx context.Context) (*MetricsSnapshot, err
 		}
 		snap := &MetricsSnapshot{
 			PartitionLoads: resp.PartitionLoads,
+		}
+		if len(resp.QueueDepth) > 0 {
+			snap.QueueDepth = make([]int, len(resp.QueueDepth))
+			for i, d := range resp.QueueDepth {
+				snap.QueueDepth[i] = int(d)
+			}
 		}
 		if sd, ok := h.publishStdDev(); ok {
 			snap.LoadStdDev = sd
@@ -582,6 +605,70 @@ func (h *Harness) publishStdDev() (float64, bool) {
 	}
 	variance /= float64(len(counts))
 	return math.Sqrt(variance) / mean, true
+}
+
+const reconnectMaxAttempts = 3
+
+func (h *Harness) reconnectGRPC(ctx context.Context) error {
+	if h.brokerAddr == "" {
+		return oops.New("no broker address for reconnect")
+	}
+	delay := 500 * time.Millisecond
+	for attempt := 1; attempt <= reconnectMaxAttempts; attempt++ {
+		log.Printf("[harness] gRPC reconnect attempt %d/%d to %s", attempt, reconnectMaxAttempts, h.brokerAddr)
+		if h.grpc != nil {
+			h.grpc.Close()
+		}
+		client, err := transport.NewClient(h.brokerAddr)
+		if err != nil {
+			time.Sleep(delay)
+			delay *= 2
+			continue
+		}
+		if err := waitForGRPCReady(ctx, client); err != nil {
+			client.Close()
+			time.Sleep(delay)
+			delay *= 2
+			continue
+		}
+		h.grpc = client
+		log.Printf("[harness] gRPC reconnected to %s", h.brokerAddr)
+		if h.onReconnect != nil {
+			h.onReconnect()
+		}
+		return nil
+	}
+	return oops.New("gRPC reconnect failed after max attempts")
+}
+
+func (h *Harness) reconnectHTTP(ctx context.Context) error {
+	addr := h.httpBrokerAddr
+	if addr == "" {
+		addr = h.brokerAddr
+	}
+	if addr == "" {
+		return oops.New("no broker address for reconnect")
+	}
+	delay := 500 * time.Millisecond
+	for attempt := 1; attempt <= reconnectMaxAttempts; attempt++ {
+		log.Printf("[harness] HTTP reconnect attempt %d/%d to %s", attempt, reconnectMaxAttempts, addr)
+		if h.httpClient != nil {
+			h.httpClient.Close()
+		}
+		h.httpClient = transport.NewHTTPClient(addr)
+		if err := waitForHTTPReady(ctx, h.httpClient); err != nil {
+			h.httpClient.Close()
+			time.Sleep(delay)
+			delay *= 2
+			continue
+		}
+		log.Printf("[harness] HTTP reconnected to %s", addr)
+		if h.onReconnect != nil {
+			h.onReconnect()
+		}
+		return nil
+	}
+	return oops.New("HTTP reconnect failed after max attempts")
 }
 
 func (h *Harness) Close() error {

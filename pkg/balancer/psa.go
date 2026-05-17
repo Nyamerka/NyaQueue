@@ -3,6 +3,7 @@ package balancer
 import (
 	"hash/fnv"
 	"math"
+	"math/rand/v2"
 	"sync/atomic"
 	"time"
 
@@ -13,8 +14,9 @@ import (
 )
 
 const (
-	defaultPSAMaxBindings = 100_000
-	psaGracePeriod        = 500 * time.Millisecond
+	defaultPSAMaxBindings   = 100_000
+	psaGracePeriod          = 500 * time.Millisecond
+	psaRebalanceStealFactor = 1.5
 )
 
 type psaShard struct {
@@ -89,12 +91,19 @@ func (p *PSA) SelectPartition(_ string, key []byte, numPartitions int) int {
 // claimFreePartition atomically claims the least-loaded free partition.
 // Uses LoadAndDelete for atomic ownership transfer — first goroutine to
 // successfully delete a partition from the free set owns it.
+// A random skip offset prevents hash-order bias that starves some partitions.
 func (p *PSA) claimFreePartition() (int, bool) {
 	loads := p.loads.Load()
+	skip := rand.IntN(p.numPartitions)
+	seen := 0
 	bestPart := -1
 	bestLoad := math.MaxFloat64
 
 	p.free.Range(func(id int, _ struct{}) bool {
+		if seen < skip {
+			seen++
+			return true
+		}
 		load := math.MaxFloat64
 		if loads != nil && id < len(*loads) {
 			load = (*loads)[id]
@@ -105,6 +114,20 @@ func (p *PSA) claimFreePartition() (int, bool) {
 		}
 		return true
 	})
+
+	if bestPart < 0 {
+		p.free.Range(func(id int, _ struct{}) bool {
+			load := math.MaxFloat64
+			if loads != nil && id < len(*loads) {
+				load = (*loads)[id]
+			}
+			if load < bestLoad {
+				bestLoad = load
+				bestPart = id
+			}
+			return true
+		})
+	}
 
 	if bestPart < 0 {
 		return 0, false
@@ -138,9 +161,30 @@ func (p *PSA) OnMetrics(m broker.Metrics) {
 
 	if len(m.PartitionLoads) > 1 {
 		avg := avgLoad(m.PartitionLoads)
+
 		for i, load := range m.PartitionLoads {
 			if avg > 0 && load > PSARebalanceLoadFactor*avg {
 				p.releasePartition(i)
+			}
+		}
+
+		// Periodic rebalance: steal bindings from overloaded partitions
+		// and migrate to idle ones (load == 0 with active neighbors > avg*1.5).
+		for i, load := range m.PartitionLoads {
+			if load > 0 {
+				continue
+			}
+			if i < len(m.QueueDepth) && m.QueueDepth[i] > 0 {
+				continue
+			}
+			for j, jLoad := range m.PartitionLoads {
+				if j == i || avg == 0 {
+					continue
+				}
+				if jLoad > psaRebalanceStealFactor*avg {
+					p.stealOneBinding(j, i)
+					break
+				}
 			}
 		}
 	}
@@ -176,6 +220,31 @@ func (p *PSA) releasePartition(id int) {
 		}
 	}
 	p.free.Store(id, struct{}{})
+}
+
+// stealOneBinding moves one key binding from overloaded src to idle dst.
+func (p *PSA) stealOneBinding(src, dst int) {
+	if src < 0 || src >= len(p.shards) || dst < 0 || dst >= len(p.shards) {
+		return
+	}
+	sh := &p.shards[src]
+	sh.mu.Lock()
+	var victim string
+	for k := range sh.keys {
+		victim = k
+		break
+	}
+	if victim == "" {
+		sh.mu.Unlock()
+		return
+	}
+	delete(sh.keys, victim)
+	sh.mu.Unlock()
+
+	if cur, ok := p.bindings.Peek(victim); ok && cur == src {
+		p.bindings.Remove(victim)
+	}
+	p.bind(victim, dst)
 }
 
 func (p *PSA) EvictionCount() int64 {
