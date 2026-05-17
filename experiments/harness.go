@@ -3,8 +3,10 @@ package experiments
 import (
 	"context"
 	"errors"
+	"math"
 	"time"
 
+	"github.com/puzpuzpuz/xsync/v3"
 	kafka "github.com/segmentio/kafka-go"
 
 	"github.com/Nyamerka/NyaQueue/internal/app"
@@ -46,12 +48,15 @@ func (m Mode) String() string {
 
 // Harness abstracts the target system (NyaQueue in-process, NyaQueue gRPC, NyaQueue HTTP, or Kafka).
 type Harness struct {
-	mode       Mode
-	app        *app.BrokerApp
-	grpc       *transport.Client
-	httpClient *transport.HTTPClient
-	kfk        *kafkadriver.KafkaHarness
-	external   bool
+	mode         Mode
+	app          *app.BrokerApp
+	grpc         *transport.Client
+	httpClient   *transport.HTTPClient
+	kfk          *kafkadriver.KafkaHarness
+	external     bool
+	managedTopic string
+
+	partitionCounts *xsync.MapOf[int, *xsync.Counter]
 }
 
 // HarnessConfig describes how to create a harness.
@@ -68,7 +73,10 @@ type HarnessConfig struct {
 
 // NewHarness creates and starts the target system.
 func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
-	h := &Harness{mode: cfg.Mode}
+	h := &Harness{
+		mode:            cfg.Mode,
+		partitionCounts: xsync.NewMapOf[int, *xsync.Counter](),
+	}
 
 	// Wrap the partition-aware factory into the func() signature expected by app.
 	k := cfg.NumPartitions
@@ -295,6 +303,7 @@ func (h *Harness) PublishBatch(ctx context.Context, topic string, items []BatchI
 		for _, r := range results {
 			if r.Err == nil {
 				ok++
+				h.recordPartition(r.Partition)
 			} else if firstErr == nil {
 				firstErr = r.Err
 			}
@@ -314,6 +323,9 @@ func (h *Harness) PublishBatch(ctx context.Context, topic string, items []BatchI
 		if err != nil {
 			return 0, oops.Wrapf(err, "produce batch gRPC topic=%q", topic)
 		}
+		for _, r := range results {
+			h.recordPartition(int(r.Partition))
+		}
 		return len(results), nil
 
 	case ModeHTTP:
@@ -328,6 +340,9 @@ func (h *Harness) PublishBatch(ctx context.Context, topic string, items []BatchI
 		results, err := h.httpClient.ProduceBatch(ctx, topic, records)
 		if err != nil {
 			return 0, oops.Wrapf(err, "produce batch HTTP topic=%q", topic)
+		}
+		for _, r := range results {
+			h.recordPartition(r.Partition)
 		}
 		return len(results), nil
 
@@ -457,21 +472,37 @@ func (h *Harness) GetMetricsSnapshot(ctx context.Context) (*MetricsSnapshot, err
 		if err != nil {
 			return nil, oops.Wrapf(err, "get metrics gRPC")
 		}
-		return &MetricsSnapshot{
+		snap := &MetricsSnapshot{
 			PartitionLoads: resp.PartitionLoads,
-			LoadStdDev:     resp.LoadStddev,
-			HasStdDev:      resp.LoadStddev > 0,
-		}, nil
+		}
+		if h.external {
+			if sd, ok := h.publishStdDev(); ok {
+				snap.LoadStdDev = sd
+				snap.HasStdDev = true
+			}
+		} else {
+			snap.LoadStdDev = resp.LoadStddev
+			snap.HasStdDev = resp.LoadStddev > 0
+		}
+		return snap, nil
 	case ModeHTTP:
 		resp, err := h.httpClient.GetMetrics(ctx)
 		if err != nil {
 			return nil, oops.Wrapf(err, "get metrics HTTP")
 		}
-		return &MetricsSnapshot{
+		snap := &MetricsSnapshot{
 			PartitionLoads: resp.PartitionLoads,
-			LoadStdDev:     resp.LoadStdDev,
-			HasStdDev:      resp.LoadStdDev > 0,
-		}, nil
+		}
+		if h.external {
+			if sd, ok := h.publishStdDev(); ok {
+				snap.LoadStdDev = sd
+				snap.HasStdDev = true
+			}
+		} else {
+			snap.LoadStdDev = resp.LoadStdDev
+			snap.HasStdDev = resp.LoadStdDev > 0
+		}
+		return snap, nil
 	case ModeKafka:
 		return &MetricsSnapshot{}, nil
 	}
@@ -525,8 +556,51 @@ func waitForGRPCReady(ctx context.Context, c *transport.Client) error {
 	}
 }
 
-// Close stops all resources.
+func (h *Harness) SetManagedTopic(topic string) {
+	h.managedTopic = topic
+}
+
+func (h *Harness) recordPartition(partition int) {
+	cnt, _ := h.partitionCounts.LoadOrCompute(partition, func() *xsync.Counter {
+		return xsync.NewCounter()
+	})
+	cnt.Add(1)
+}
+
+// publishStdDev computes stddev of the publish-side per-partition distribution.
+func (h *Harness) publishStdDev() (float64, bool) {
+	var counts []float64
+	h.partitionCounts.Range(func(_ int, cnt *xsync.Counter) bool {
+		counts = append(counts, float64(cnt.Value()))
+		return true
+	})
+	if len(counts) < 2 {
+		return 0, false
+	}
+	var sum float64
+	for _, c := range counts {
+		sum += c
+	}
+	mean := sum / float64(len(counts))
+	if mean == 0 {
+		return 0, false
+	}
+	var variance float64
+	for _, c := range counts {
+		d := c - mean
+		variance += d * d
+	}
+	variance /= float64(len(counts))
+	return math.Sqrt(variance) / mean, true
+}
+
 func (h *Harness) Close() error {
+	if h.managedTopic != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = h.DeleteTopic(ctx, h.managedTopic)
+		cancel()
+		h.managedTopic = ""
+	}
 	if h.grpc != nil {
 		h.grpc.Close()
 	}

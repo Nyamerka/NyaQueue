@@ -168,3 +168,79 @@ func (s *ReplayBufferSuite) TestConcurrentPushAndSample() {
 	wg.Wait()
 	require.Equal(s.T(), 1000, rb.Len())
 }
+
+type PrioritizedReplayBufferSuite struct {
+	suite.Suite
+}
+
+func TestPrioritizedReplayBufferSuite(t *testing.T) {
+	suite.Run(t, new(PrioritizedReplayBufferSuite))
+}
+
+func (s *PrioritizedReplayBufferSuite) TestPushAndLen() {
+	b := NewPrioritizedReplayBuffer(10, 0.6)
+	require.Equal(s.T(), 0, b.Len())
+
+	for i := 0; i < 5; i++ {
+		b.Push(Transition{State: []float64{float64(i)}, Action: []float64{0}, Reward: float64(i)})
+	}
+	require.Equal(s.T(), 5, b.Len())
+
+	for i := 5; i < 15; i++ {
+		b.Push(Transition{State: []float64{float64(i)}, Action: []float64{0}, Reward: float64(i)})
+	}
+	require.Equal(s.T(), 10, b.Len())
+}
+
+func (s *PrioritizedReplayBufferSuite) TestSampleSize() {
+	b := NewPrioritizedReplayBuffer(100, 0.6)
+	for i := 0; i < 50; i++ {
+		b.Push(Transition{State: []float64{float64(i)}, Action: []float64{0}, Reward: 1.0})
+	}
+
+	batch, indices := b.Sample(10)
+	require.Len(s.T(), batch, 10)
+	require.Len(s.T(), indices, 10)
+
+	batch, indices = b.Sample(100)
+	require.Len(s.T(), batch, 50)
+	require.Len(s.T(), indices, 50)
+}
+
+func (s *PrioritizedReplayBufferSuite) TestHighTDErrorSampledMore() {
+	b := NewPrioritizedReplayBuffer(100, 0.6)
+	for i := 0; i < 100; i++ {
+		b.Push(Transition{
+			State:  []float64{float64(i)},
+			Action: []float64{0},
+			Reward: float64(i),
+		})
+	}
+
+	b.UpdatePriority(0, 100.0)
+	for i := 1; i < 100; i++ {
+		b.UpdatePriority(i, 0.001)
+	}
+
+	counts := make([]int, 100)
+	const trials = 10_000
+	for trial := 0; trial < trials; trial++ {
+		batch, indices := b.Sample(1)
+		require.Len(s.T(), batch, 1)
+		counts[indices[0]]++
+	}
+
+	require.Greater(s.T(), counts[0], trials/10,
+		"index 0 with high TD error should be sampled much more frequently")
+}
+
+func (s *PrioritizedReplayBufferSuite) TestUpdatePriority() {
+	b := NewPrioritizedReplayBuffer(10, 0.6)
+	for i := 0; i < 5; i++ {
+		b.Push(Transition{State: []float64{float64(i)}, Action: []float64{0}, Reward: float64(i)})
+	}
+
+	b.UpdatePriority(2, 50.0)
+	b.UpdatePriority(-1, 1.0)
+	b.UpdatePriority(100, 1.0)
+}

@@ -2,6 +2,7 @@ package balancer
 
 import (
 	"math"
+	"sync"
 	"testing"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
@@ -67,7 +68,9 @@ func (s *P2CSuite) TestEWMASmoothing() {
 	const n = 10_000
 	counts := [2]int{}
 	for i := 0; i < n; i++ {
-		counts[p.SelectPartition("t", nil, 2)]++
+		idx := p.SelectPartition("t", nil, 2)
+		counts[idx]++
+		p.OnPublishComplete(idx)
 	}
 	require.Greater(s.T(), counts[1], counts[0],
 		"partition 1 (lower EWMA) should get more traffic after spike on 0")
@@ -85,7 +88,9 @@ func (s *P2CSuite) TestQueueDepthSignal() {
 	const n = 10_000
 	counts := [3]int{}
 	for i := 0; i < n; i++ {
-		counts[p.SelectPartition("t", nil, 3)]++
+		idx := p.SelectPartition("t", nil, 3)
+		counts[idx]++
+		p.OnPublishComplete(idx)
 	}
 	require.Greater(s.T(), counts[1], counts[0])
 	require.Greater(s.T(), counts[1], counts[2])
@@ -93,7 +98,9 @@ func (s *P2CSuite) TestQueueDepthSignal() {
 
 func (s *P2CSuite) TestSinglePartition() {
 	p := NewPowerOfTwoChoices()
-	require.Equal(s.T(), 0, p.SelectPartition("t", nil, 1))
+	idx := p.SelectPartition("t", nil, 1)
+	require.Equal(s.T(), 0, idx)
+	p.OnPublishComplete(idx)
 }
 
 func (s *P2CSuite) TestNoMetrics() {
@@ -101,4 +108,74 @@ func (s *P2CSuite) TestNoMetrics() {
 	idx := p.SelectPartition("t", nil, 4)
 	require.GreaterOrEqual(s.T(), idx, 0)
 	require.Less(s.T(), idx, 4)
+	p.OnPublishComplete(idx)
+}
+
+func (s *P2CSuite) TestInflightTracking() {
+	p := NewPowerOfTwoChoices(
+		WithP2CLoadWeight(0),
+		WithP2CDepthWeight(0),
+		WithP2CInflightWeight(1.0),
+	)
+
+	for i := 0; i < 100; i++ {
+		idx := p.SelectPartition("t", nil, 2)
+		if idx == 0 {
+			break
+		}
+		p.OnPublishComplete(idx)
+	}
+
+	inf := p.inflight.Load()
+	require.NotNil(s.T(), inf)
+	v0 := (*inf)[0].Load()
+	require.GreaterOrEqual(s.T(), v0, int64(1), "partition 0 should have inflight > 0")
+
+	p.OnPublishComplete(0)
+	v0after := (*inf)[0].Load()
+	require.Equal(s.T(), v0-1, v0after)
+}
+
+func (s *P2CSuite) TestInflightRaceInit() {
+	const goroutines = 16
+	const perGoroutine = 500
+
+	p := NewPowerOfTwoChoices(
+		WithP2CLoadWeight(0),
+		WithP2CDepthWeight(0),
+		WithP2CInflightWeight(1.0),
+	)
+
+	type result struct {
+		partition int
+	}
+	results := make([][]result, goroutines)
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			local := make([]result, perGoroutine)
+			for i := 0; i < perGoroutine; i++ {
+				idx := p.SelectPartition("t", nil, 4)
+				local[i] = result{partition: idx}
+			}
+			results[id] = local
+		}(g)
+	}
+	wg.Wait()
+
+	for _, local := range results {
+		for _, r := range local {
+			p.OnPublishComplete(r.partition)
+		}
+	}
+
+	inf := p.inflight.Load()
+	require.NotNil(s.T(), inf)
+	for i := 0; i < 4; i++ {
+		require.Equal(s.T(), int64(0), (*inf)[i].Load(),
+			"partition %d inflight should be 0 after all completions", i)
+	}
 }

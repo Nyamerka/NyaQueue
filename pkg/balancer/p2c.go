@@ -8,9 +8,10 @@ import (
 )
 
 const (
-	defaultP2CAlpha       = 0.3
-	defaultP2CLoadWeight  = 1.0
-	defaultP2CDepthWeight = 1.0
+	defaultP2CAlpha          = 0.3
+	defaultP2CLoadWeight     = 1.0
+	defaultP2CDepthWeight    = 1.0
+	defaultP2CInflightWeight = 2.0
 )
 
 type P2COption func(*PowerOfTwoChoices)
@@ -30,17 +31,24 @@ func WithP2CAlpha(a float64) P2COption {
 type PowerOfTwoChoices struct {
 	loadEWMA  atomic.Pointer[[]float64]
 	depthNorm atomic.Pointer[[]float64]
+	inflight  atomic.Pointer[[]atomic.Int64]
 
-	alpha       float64
-	loadWeight  float64
-	depthWeight float64
+	alpha          float64
+	loadWeight     float64
+	depthWeight    float64
+	inflightWeight float64
+}
+
+func WithP2CInflightWeight(w float64) P2COption {
+	return func(p *PowerOfTwoChoices) { p.inflightWeight = w }
 }
 
 func NewPowerOfTwoChoices(opts ...P2COption) *PowerOfTwoChoices {
 	p := &PowerOfTwoChoices{
-		alpha:       defaultP2CAlpha,
-		loadWeight:  defaultP2CLoadWeight,
-		depthWeight: defaultP2CDepthWeight,
+		alpha:          defaultP2CAlpha,
+		loadWeight:     defaultP2CLoadWeight,
+		depthWeight:    defaultP2CDepthWeight,
+		inflightWeight: defaultP2CInflightWeight,
 	}
 	for _, o := range opts {
 		o(p)
@@ -48,10 +56,27 @@ func NewPowerOfTwoChoices(opts ...P2COption) *PowerOfTwoChoices {
 	return p
 }
 
+func (p *PowerOfTwoChoices) ensureInflight(n int) *[]atomic.Int64 {
+	for {
+		ptr := p.inflight.Load()
+		if ptr != nil && len(*ptr) >= n {
+			return ptr
+		}
+		arr := make([]atomic.Int64, n)
+		if p.inflight.CompareAndSwap(ptr, &arr) {
+			return &arr
+		}
+	}
+}
+
 func (p *PowerOfTwoChoices) SelectPartition(_ string, _ []byte, numPartitions int) int {
 	if numPartitions <= 1 {
+		inf := p.ensureInflight(1)
+		(*inf)[0].Add(1)
 		return 0
 	}
+
+	inf := p.ensureInflight(numPartitions)
 
 	a := rand.IntN(numPartitions)
 	b := rand.IntN(numPartitions - 1)
@@ -59,22 +84,25 @@ func (p *PowerOfTwoChoices) SelectPartition(_ string, _ []byte, numPartitions in
 		b++
 	}
 
-	sa := p.score(a)
-	sb := p.score(b)
+	sa := p.score(a, inf)
+	sb := p.score(b, inf)
 
+	var chosen int
 	if sa < sb {
-		return a
+		chosen = a
+	} else if sb < sa {
+		chosen = b
+	} else if rand.IntN(2) == 0 {
+		chosen = a
+	} else {
+		chosen = b
 	}
-	if sb < sa {
-		return b
-	}
-	if rand.IntN(2) == 0 {
-		return a
-	}
-	return b
+
+	(*inf)[chosen].Add(1)
+	return chosen
 }
 
-func (p *PowerOfTwoChoices) score(idx int) float64 {
+func (p *PowerOfTwoChoices) score(idx int, inf *[]atomic.Int64) float64 {
 	var s float64
 	if lp := p.loadEWMA.Load(); lp != nil && idx < len(*lp) {
 		s += p.loadWeight * (*lp)[idx]
@@ -82,7 +110,16 @@ func (p *PowerOfTwoChoices) score(idx int) float64 {
 	if dp := p.depthNorm.Load(); dp != nil && idx < len(*dp) {
 		s += p.depthWeight * (*dp)[idx]
 	}
+	if inf != nil && idx < len(*inf) {
+		s += p.inflightWeight * float64((*inf)[idx].Load())
+	}
 	return s
+}
+
+func (p *PowerOfTwoChoices) OnPublishComplete(partition int) {
+	if ptr := p.inflight.Load(); ptr != nil && partition < len(*ptr) {
+		(*ptr)[partition].Add(-1)
+	}
 }
 
 func (p *PowerOfTwoChoices) OnMetrics(m broker.Metrics) {

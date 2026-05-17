@@ -120,6 +120,32 @@ func (s *PartitionSuite) TestAppendBatchPriorityIndex() {
 	require.Equal(s.T(), 3, p.PriorityIndex().Len())
 }
 
+func (s *PartitionSuite) TestProduceTimeRoundTrip() {
+	p, err := NewPartition(0, "test", s.T().TempDir(), ModeFIFO, SyncNone)
+	require.NoError(s.T(), err)
+	defer p.Close()
+
+	msgs := make([]*Message, 10)
+	for i := range msgs {
+		msgs[i] = NewMessage(uint8(i%10), []byte("k"), []byte("value"))
+		msgs[i].Header.ProduceTime = 1_000_000_000 + int64(i)*1000
+	}
+
+	offsets, err := p.AppendBatch(msgs)
+	require.NoError(s.T(), err)
+	require.Len(s.T(), offsets, len(msgs))
+
+	for i, off := range offsets {
+		got, err := p.Read(off)
+		require.NoError(s.T(), err)
+		require.Equal(s.T(), msgs[i].Header.ProduceTime, got.Header.ProduceTime,
+			"msg %d: ProduceTime must survive WAL round-trip", i)
+		require.NotZero(s.T(), got.Header.AppendTime,
+			"msg %d: AppendTime must be set by AppendBatch", i)
+		require.Equal(s.T(), msgs[i].Header.Priority, got.Header.Priority)
+	}
+}
+
 func (s *PartitionSuite) TestRebuild() {
 	dir := s.T().TempDir()
 

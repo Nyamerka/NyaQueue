@@ -8,28 +8,26 @@ import (
 	"github.com/samber/oops"
 )
 
-// Wire layout: [version:1][priority:1][timestamp:8][keyLen:4][key:keyLen][value:...]
+// Wire layout: [priority:1][timestamp:8][produceTime:8][appendTime:8][keyLen:4][key][value]
 const (
-	currentVersion     = 1
-	versionFieldSize   = 1
 	priorityFieldSize  = 1
 	timestampFieldSize = 8
 	keyLenFieldSize    = 4
 
-	priorityOffset = versionFieldSize                                                            // 1
-	timestampOff   = versionFieldSize + priorityFieldSize                                        // 2
-	keyLenOff      = versionFieldSize + priorityFieldSize + timestampFieldSize                   // 10
-	keyOff         = versionFieldSize + priorityFieldSize + timestampFieldSize + keyLenFieldSize // 14
+	priorityOffset = 0                                   // 0
+	timestampOff   = priorityFieldSize                   // 1
+	produceTimeOff = timestampOff + timestampFieldSize   // 9
+	appendTimeOff  = produceTimeOff + timestampFieldSize // 17
+	keyLenOff      = appendTimeOff + timestampFieldSize  // 25
+	keyOff         = keyLenOff + keyLenFieldSize         // 29
 
-	// HeaderSize is the fixed-width prefix before key/value data.
-	HeaderSize = keyLenOff
+	// HeaderSize is the fixed-width prefix before key length (priority + 3 timestamps).
+	HeaderSize = keyLenOff // 25
 
-	// MetadataSize includes version, priority, timestamp, and key length fields.
-	MetadataSize = keyOff
+	// MetadataSize includes all fixed fields including key length.
+	MetadataSize = keyOff // 29
 )
 
-// marshalPool holds reusable encode buffers as *[]byte to avoid the
-// per-Put allocation that sync.Pool causes for non-pointer values (SA6002).
 var marshalPool = sync.Pool{
 	New: func() any {
 		buf := make([]byte, 0, 1024)
@@ -48,7 +46,7 @@ type Message struct {
 	Header       MessageHeader
 	Key          []byte
 	Value        []byte
-	BatchDecoded bool `json:"-"` // true when Value was already decompressed by batch read
+	BatchDecoded bool `json:"-"`
 }
 
 func NewMessage(priority uint8, key, value []byte) *Message {
@@ -68,9 +66,6 @@ func (m *Message) Marshal() []byte {
 	return buf
 }
 
-// MarshalPooled returns an encoded buffer drawn from a sync.Pool. Callers MUST
-// pair every successful call with ReleaseMarshalBuf once they are done with
-// the bytes (typically after the WAL has copied them).
 func (m *Message) MarshalPooled() []byte {
 	needed := m.encodedSize()
 
@@ -99,13 +94,14 @@ func (m *Message) encodedSize() int {
 }
 
 func (m *Message) marshalInto(buf []byte) {
-	keyLen := len(m.Key)
-	buf[0] = currentVersion
+	kl := len(m.Key)
 	buf[priorityOffset] = m.Header.Priority
-	binary.BigEndian.PutUint64(buf[timestampOff:keyLenOff], uint64(m.Header.Timestamp))
-	binary.BigEndian.PutUint32(buf[keyLenOff:keyOff], uint32(keyLen))
-	copy(buf[keyOff:keyOff+keyLen], m.Key)
-	copy(buf[keyOff+keyLen:], m.Value)
+	binary.BigEndian.PutUint64(buf[timestampOff:], uint64(m.Header.Timestamp))
+	binary.BigEndian.PutUint64(buf[produceTimeOff:], uint64(m.Header.ProduceTime))
+	binary.BigEndian.PutUint64(buf[appendTimeOff:], uint64(m.Header.AppendTime))
+	binary.BigEndian.PutUint32(buf[keyLenOff:], uint32(kl))
+	copy(buf[keyOff:keyOff+kl], m.Key)
+	copy(buf[keyOff+kl:], m.Value)
 }
 
 func UnmarshalMessage(data []byte) (*Message, error) {
@@ -113,48 +109,38 @@ func UnmarshalMessage(data []byte) (*Message, error) {
 		return nil, oops.Errorf("message data too short: got %d bytes, need at least %d", len(data), MetadataSize)
 	}
 
-	version := data[0]
-	if version != currentVersion {
-		return nil, oops.Errorf("unsupported message version %d (expected %d)", version, currentVersion)
+	kl := int(binary.BigEndian.Uint32(data[keyLenOff:]))
+	if len(data) < MetadataSize+kl {
+		return nil, oops.Errorf("message truncated: got %d bytes, need %d (keyLen=%d)", len(data), MetadataSize+kl, kl)
 	}
 
-	priority := data[priorityOffset]
-	timestamp := int64(binary.BigEndian.Uint64(data[timestampOff:keyLenOff]))
-	keyLen := int(binary.BigEndian.Uint32(data[keyLenOff:keyOff]))
+	key := make([]byte, kl)
+	copy(key, data[keyOff:keyOff+kl])
 
-	if len(data) < MetadataSize+keyLen {
-		return nil, oops.Errorf("message truncated: got %d bytes, need %d (keyLen=%d)", len(data), MetadataSize+keyLen, keyLen)
-	}
-
-	key := make([]byte, keyLen)
-	copy(key, data[keyOff:keyOff+keyLen])
-
-	value := make([]byte, len(data)-(keyOff+keyLen))
-	copy(value, data[keyOff+keyLen:])
+	value := make([]byte, len(data)-(keyOff+kl))
+	copy(value, data[keyOff+kl:])
 
 	return &Message{
 		Header: MessageHeader{
-			Priority:  priority,
-			Timestamp: timestamp,
+			Priority:    data[priorityOffset],
+			Timestamp:   int64(binary.BigEndian.Uint64(data[timestampOff:])),
+			ProduceTime: int64(binary.BigEndian.Uint64(data[produceTimeOff:])),
+			AppendTime:  int64(binary.BigEndian.Uint64(data[appendTimeOff:])),
 		},
 		Key:   key,
 		Value: value,
 	}, nil
 }
 
-// UnmarshalHeader reads the fixed header for fast PriorityIndex rebuild.
 func UnmarshalHeader(data []byte) (MessageHeader, error) {
 	if len(data) < HeaderSize {
 		return MessageHeader{}, oops.Errorf("data too short for header: got %d bytes, need at least %d", len(data), HeaderSize)
 	}
 
-	version := data[0]
-	if version != currentVersion {
-		return MessageHeader{}, oops.Errorf("unsupported message version %d", version)
-	}
-
 	return MessageHeader{
-		Priority:  data[priorityOffset],
-		Timestamp: int64(binary.BigEndian.Uint64(data[timestampOff : timestampOff+timestampFieldSize])),
+		Priority:    data[priorityOffset],
+		Timestamp:   int64(binary.BigEndian.Uint64(data[timestampOff:])),
+		ProduceTime: int64(binary.BigEndian.Uint64(data[produceTimeOff:])),
+		AppendTime:  int64(binary.BigEndian.Uint64(data[appendTimeOff:])),
 	}, nil
 }

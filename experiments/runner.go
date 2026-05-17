@@ -159,6 +159,7 @@ func (r *Runner) runWarmup(ctx context.Context) {
 		}
 
 		_ = h.CreateTopic(ctx, "warmup-topic", topicCfg)
+		h.SetManagedTopic("warmup-topic")
 		if brk := h.Broker(); brk != nil {
 			brk.SetScheduler("warmup-topic", r.Algorithms[0].NewScheduler())
 		}
@@ -238,6 +239,7 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	if createErr != nil {
 		return ExperimentResult{}, oops.Wrapf(createErr, "create topic")
 	}
+	h.SetManagedTopic(topic)
 
 	if brk := h.Broker(); brk != nil {
 		brk.SetScheduler(topic, alg.NewScheduler())

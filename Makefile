@@ -57,4 +57,6 @@ compose-kafka:
 	docker compose -f deploy/docker-compose.yml --profile kafka up -d
 
 compose-experiment:
+	docker compose -f deploy/docker-compose.yml down -v --remove-orphans 2>/dev/null || true
+	docker volume rm deploy_nyaqueue-data 2>/dev/null || true
 	docker compose -f deploy/docker-compose.yml --profile experiment run --build --rm experiment

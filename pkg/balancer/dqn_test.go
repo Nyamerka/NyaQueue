@@ -1,6 +1,7 @@
 package balancer
 
 import (
+	"math"
 	"runtime"
 	"sync"
 	"testing"
@@ -288,9 +289,52 @@ func (s *DQNSuite) TestDQNBalancer_NoExploreInFallback() {
 	for i := 0; i < 1000; i++ {
 		p := dqn.SelectPartition("t", []byte("k"), 4)
 		counts[p]++
+		dqn.OnPublishComplete(p)
 	}
 	for _, c := range counts {
 		require.Greater(s.T(), c, 200,
 			"under fallback (RR) all partitions should get roughly equal share, not random")
 	}
+}
+
+func (s *DQNSuite) TestDQNBalancer_AdaptiveEpsilon() {
+	dqn := NewDQNBalancer(4, WithDQNEpsilon(0.05))
+	defer dqn.Stop()
+
+	initial := math.Float64frombits(dqn.adaptiveEpsilon.Load())
+	require.InDelta(s.T(), 0.05, initial, 0.001)
+
+	dqn.stateMu.Lock()
+	dqn.msgRate = 290_000
+	dqn.stateMu.Unlock()
+
+	time.Sleep(200 * time.Millisecond)
+
+	eps := math.Float64frombits(dqn.adaptiveEpsilon.Load())
+	expected := 0.05 * (dqnNormalRateThreshold / 290_000.0)
+	require.InDelta(s.T(), expected, eps, 0.001,
+		"at 290K msg/s epsilon should scale down to ~0.0017")
+	require.Less(s.T(), eps, 0.01)
+}
+
+func (s *DQNSuite) TestDQNBalancer_InflightInState() {
+	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
+
+	for i := 0; i < 100; i++ {
+		dqn.SelectPartition("t", nil, 4)
+	}
+
+	state := make([]float64, dqn.stateSize)
+	dqn.stateMu.Lock()
+	dqn.buildStateInto(state)
+	dqn.stateMu.Unlock()
+
+	inflightBase := dqn.numPartitions * 2
+	var totalInflight float64
+	for i := 0; i < dqn.numPartitions; i++ {
+		totalInflight += state[inflightBase+i]
+	}
+	require.Greater(s.T(), totalInflight, 0.0,
+		"inflight should be reflected in state vector after SelectPartition calls")
 }

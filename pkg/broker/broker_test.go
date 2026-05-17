@@ -433,3 +433,37 @@ func (s *BrokerSuite) TestSetSchedulerStopsOld() {
 	b.SetScheduler("t", newTrackingScheduler())
 	require.True(s.T(), old.isStopped(), "old scheduler must be stopped when replaced")
 }
+
+func (s *BrokerSuite) TestProduceTimePreserved() {
+	b, cleanup := s.newBroker()
+	defer cleanup()
+
+	cfg := DefaultTopicConfig()
+	cfg.NumPartitions = 1
+	require.NoError(s.T(), b.CreateTopic("t", cfg))
+	b.SetScheduler("t", fifoScheduler{})
+
+	ctx := context.Background()
+	msgs := make([]*Message, 10)
+	for i := range msgs {
+		msgs[i] = NewMessage(uint8(i%10), []byte("k"), []byte("val"))
+	}
+
+	results := b.PublishBatch(ctx, "t", msgs)
+	for _, r := range results {
+		require.NoError(s.T(), r.Err)
+	}
+
+	consumed, _, err := b.ConsumeBatch(ctx, "t", "g", 0, len(msgs))
+	require.NoError(s.T(), err)
+	require.Len(s.T(), consumed, len(msgs))
+
+	for i, msg := range consumed {
+		require.NotZero(s.T(), msg.Header.ProduceTime,
+			"msg %d: ProduceTime must be non-zero after PublishBatch → ConsumeBatch", i)
+		require.NotZero(s.T(), msg.Header.AppendTime,
+			"msg %d: AppendTime must be non-zero after PublishBatch → ConsumeBatch", i)
+		require.Greater(s.T(), msg.Header.AppendTime, msg.Header.ProduceTime-int64(1e9),
+			"msg %d: AppendTime should be close to ProduceTime (within 1s)", i)
+	}
+}

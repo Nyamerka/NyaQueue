@@ -1,7 +1,9 @@
 package nn
 
 import (
+	"math"
 	"math/rand/v2"
+	"sync"
 	"sync/atomic"
 )
 
@@ -84,4 +86,114 @@ func (rb *ReplayBuffer) Len() int {
 		return int(rb.capacity)
 	}
 	return int(w)
+}
+
+// PrioritizedReplayBuffer samples transitions proportional to priority^alpha.
+// Higher TD-error transitions are sampled more frequently.
+type PrioritizedReplayBuffer struct {
+	mu          sync.Mutex
+	transitions []Transition
+	priorities  []float64
+	capacity    int
+	size        int
+	writeIdx    int
+	alpha       float64
+	defaultPrio float64
+	maxPriority float64
+}
+
+func NewPrioritizedReplayBuffer(capacity int, alpha float64) *PrioritizedReplayBuffer {
+	return &PrioritizedReplayBuffer{
+		transitions: make([]Transition, capacity),
+		priorities:  make([]float64, capacity),
+		capacity:    capacity,
+		alpha:       alpha,
+		defaultPrio: 1.0,
+		maxPriority: 1.0,
+	}
+}
+
+func (b *PrioritizedReplayBuffer) Push(t Transition) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	cp := Transition{
+		State:     append([]float64(nil), t.State...),
+		Action:    append([]float64(nil), t.Action...),
+		Reward:    t.Reward,
+		NextState: append([]float64(nil), t.NextState...),
+		Done:      t.Done,
+	}
+
+	idx := b.writeIdx % b.capacity
+	b.transitions[idx] = cp
+	b.priorities[idx] = b.maxPriority
+	b.writeIdx++
+	if b.size < b.capacity {
+		b.size++
+	}
+}
+
+func (b *PrioritizedReplayBuffer) Sample(batchSize int) ([]Transition, []int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.size == 0 {
+		return nil, nil
+	}
+	if batchSize > b.size {
+		batchSize = b.size
+	}
+
+	probs := make([]float64, b.size)
+	var total float64
+	for i := 0; i < b.size; i++ {
+		p := math.Pow(b.priorities[i], b.alpha)
+		probs[i] = p
+		total += p
+	}
+
+	if total == 0 {
+		total = 1.0
+	}
+
+	batch := make([]Transition, batchSize)
+	indices := make([]int, batchSize)
+	for i := 0; i < batchSize; i++ {
+		r := rand.Float64() * total
+		var cum float64
+		idx := 0
+		for j := 0; j < b.size; j++ {
+			cum += probs[j]
+			if cum >= r {
+				idx = j
+				break
+			}
+			idx = j
+		}
+		batch[i] = b.transitions[idx]
+		indices[i] = idx
+	}
+
+	return batch, indices
+}
+
+func (b *PrioritizedReplayBuffer) UpdatePriority(idx int, tdError float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if idx < 0 || idx >= b.size {
+		return
+	}
+	p := math.Abs(tdError) + 1e-6
+	b.priorities[idx] = p
+	if p > b.maxPriority {
+		b.maxPriority = p
+	}
+}
+
+func (b *PrioritizedReplayBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.size
 }

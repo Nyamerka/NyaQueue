@@ -26,6 +26,12 @@ type Balancer interface {
 	OnMetrics(m Metrics)
 }
 
+// InflightTracker is optionally implemented by balancers that track
+// in-flight publishes per partition (e.g. P2C, DQN).
+type InflightTracker interface {
+	OnPublishComplete(partition int)
+}
+
 // BaseThroughputSetter is optionally implemented by balancers that support
 // reactive watchdog fallback based on throughput degradation.
 type BaseThroughputSetter interface {
@@ -298,6 +304,11 @@ func (b *Broker) Publish(ctx context.Context, topicName string, msg *Message) (p
 
 	msg.Header.ProduceTime = time.Now().UnixNano()
 	offset, err = p.Append(msg)
+
+	if tracker, ok := rt.balancer.(InflightTracker); ok {
+		tracker.OnPublishComplete(partIdx)
+	}
+
 	if err != nil {
 		return 0, 0, oops.Wrapf(err, "append to partition %d", partIdx)
 	}
@@ -354,6 +365,9 @@ func (b *Broker) PublishBatch(ctx context.Context, topicName string, msgs []*Mes
 		results[i].Partition = partIdx
 
 		if bp != nil && bp.Check(partIdx) == BPClosed {
+			if tracker, ok := bal.(InflightTracker); ok {
+				tracker.OnPublishComplete(partIdx)
+			}
 			results[i].Err = ErrThrottled
 			continue
 		}
@@ -401,6 +415,11 @@ func (b *Broker) PublishBatch(ctx context.Context, topicName string, msgs []*Mes
 				results[item.idx].Err = err
 			} else {
 				results[item.idx].Offset = offsets[j]
+			}
+		}
+		for range batch {
+			if tracker, ok := bal.(InflightTracker); ok {
+				tracker.OnPublishComplete(partIdx)
 			}
 		}
 		b.metrics.RecordProduceBatch(topicName, partIdx, len(batch))

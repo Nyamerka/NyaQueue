@@ -36,7 +36,7 @@ func (s *MessageSuite) TestMarshalUnmarshal() {
 			require.NotZero(s.T(), msg.Header.Timestamp)
 
 			data := msg.Marshal()
-			require.True(s.T(), len(data) >= HeaderSize+4)
+			require.True(s.T(), len(data) >= MetadataSize)
 
 			restored, err := UnmarshalMessage(data)
 			require.NoError(s.T(), err)
@@ -52,6 +52,32 @@ func (s *MessageSuite) TestMarshalUnmarshal() {
 			}
 		})
 	}
+}
+
+func (s *MessageSuite) TestMarshalRoundTrip_Timestamps() {
+	msg := &Message{
+		Header: MessageHeader{
+			Priority:    3,
+			Timestamp:   time.Now().UnixNano(),
+			ProduceTime: time.Now().Add(-time.Millisecond).UnixNano(),
+			AppendTime:  time.Now().Add(-500 * time.Microsecond).UnixNano(),
+		},
+		Key:   []byte("ts-key"),
+		Value: []byte("ts-val"),
+	}
+
+	data := msg.Marshal()
+	restored, err := UnmarshalMessage(data)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), msg.Header.ProduceTime, restored.Header.ProduceTime)
+	require.Equal(s.T(), msg.Header.AppendTime, restored.Header.AppendTime)
+	require.Equal(s.T(), msg.Header.Timestamp, restored.Header.Timestamp)
+	require.Equal(s.T(), msg.Header.Priority, restored.Header.Priority)
+
+	hdr, err := UnmarshalHeader(data)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), msg.Header.ProduceTime, hdr.ProduceTime)
+	require.Equal(s.T(), msg.Header.AppendTime, hdr.AppendTime)
 }
 
 func (s *MessageSuite) TestUnmarshalHeaderOnly() {

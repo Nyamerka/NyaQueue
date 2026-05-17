@@ -44,14 +44,15 @@ type DQNBalancer struct {
 	minReplay     int
 	trainEvery    int
 
-	backend   backends.Backend
-	ctx       *context.Context
-	fwdExec   *context.Exec
-	nextQExec *context.Exec
-	trainExec *context.Exec
-	stateSize int
+	backend    backends.Backend
+	ctx        *context.Context
+	fwdExec    *context.Exec
+	nextQExec  *context.Exec
+	batchQExec *context.Exec
+	trainExec  *context.Exec
+	stateSize  int
 
-	replayBuffer *nn.ReplayBuffer
+	replayBuffer *nn.PrioritizedReplayBuffer
 
 	expCh  chan nn.Transition
 	eg     *errgroup.Group
@@ -63,6 +64,7 @@ type DQNBalancer struct {
 	baseThroughput    atomic.Int64
 	fallbackActive    atomic.Bool
 	epsilonSuppressed atomic.Bool
+	adaptiveEpsilon   atomic.Uint64
 
 	stateMu        *xsync.RBMutex
 	loads          []float64
@@ -71,6 +73,7 @@ type DQNBalancer struct {
 	avgMsgSize     float64
 
 	droppedExperience atomic.Int64
+	inflight          atomic.Pointer[[]atomic.Int64]
 
 	cachedQValues atomic.Pointer[[]float64]
 
@@ -94,7 +97,7 @@ func WithDQNGamma(g float64) DQNOption         { return func(d *DQNBalancer) { d
 func WithDQNLearningRate(lr float64) DQNOption { return func(d *DQNBalancer) { d.lr = lr } }
 func WithDQNHiddenSize(n int) DQNOption        { return func(d *DQNBalancer) { d.hiddenSize = n } }
 func WithDQNReplayBufSize(n int) DQNOption {
-	return func(d *DQNBalancer) { d.replayBuffer = nn.NewReplayBuffer(n) }
+	return func(d *DQNBalancer) { d.replayBuffer = nn.NewPrioritizedReplayBuffer(n, 0.6) }
 }
 func WithDQNBatchSize(n int) DQNOption         { return func(d *DQNBalancer) { d.batchSize = n } }
 func WithDQNMinReplay(n int) DQNOption         { return func(d *DQNBalancer) { d.minReplay = n } }
@@ -114,7 +117,7 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 		batchSize:     DefaultDQNBatchSize,
 		minReplay:     DefaultDQNMinReplay,
 		trainEvery:    DefaultDQNTrainEvery,
-		replayBuffer:  nn.NewReplayBuffer(DefaultDQNReplayBufSize),
+		replayBuffer:  nn.NewPrioritizedReplayBuffer(DefaultDQNReplayBufSize, 0.6),
 		fallbackRR:    NewRoundRobin(),
 		fallbackRatio: DefaultDQNFallbackRatio,
 		loadThreshold: DefaultDQNLoadThreshold,
@@ -128,8 +131,9 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 		opt(d)
 	}
 
-	d.stateSize = numPartitions*2 + 2
+	d.stateSize = numPartitions*3 + 2
 	d.policyStateBuf = make([]float64, d.stateSize)
+	d.adaptiveEpsilon.Store(math.Float64bits(d.epsilon))
 	d.initGoMLX()
 
 	ctx, cancel := stdctx.WithCancel(stdctx.Background())
@@ -175,6 +179,15 @@ func (d *DQNBalancer) initGoMLX() {
 			return ReduceMax(q, -1)
 		})
 
+	d.batchQExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
+		func(ctx *context.Context, states, actionIdx *Node) *Node {
+			h := layers.Dense(ctx.In("hidden"), states, true, d.hiddenSize)
+			h = activations.Relu(h)
+			qAll := layers.Dense(ctx.In("output"), h, true, d.numPartitions)
+			oneHot := OneHot(ConvertDType(actionIdx, dtypes.Int32), d.numPartitions, qAll.DType())
+			return ReduceSum(Mul(qAll, oneHot), -1)
+		})
+
 	d.trainExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
 		func(ctx *context.Context, states, targetQ, actionIdx *Node) *Node {
 			g := states.Graph()
@@ -213,20 +226,44 @@ func (d *DQNBalancer) forward(state []float64) []float64 {
 	return tensorToFloat64Slice(result)
 }
 
+func (d *DQNBalancer) ensureInflight(n int) *[]atomic.Int64 {
+	for {
+		ptr := d.inflight.Load()
+		if ptr != nil && len(*ptr) >= n {
+			return ptr
+		}
+		arr := make([]atomic.Int64, n)
+		if d.inflight.CompareAndSwap(ptr, &arr) {
+			return &arr
+		}
+	}
+}
+
 func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions int) int {
+	inf := d.ensureInflight(numPartitions)
+
 	if d.fallbackActive.Load() {
-		return d.fallbackRR.SelectPartition(topic, key, numPartitions)
+		idx := d.fallbackRR.SelectPartition(topic, key, numPartitions)
+		(*inf)[idx].Add(1)
+		return idx
 	}
 
-	if !d.epsilonSuppressed.Load() && rand.Float64() < d.epsilon {
-		return rand.IntN(numPartitions)
+	eps := d.adaptiveEpsilon.Load()
+	if !d.epsilonSuppressed.Load() && rand.Float64() < math.Float64frombits(eps) {
+		idx := rand.IntN(numPartitions)
+		(*inf)[idx].Add(1)
+		return idx
 	}
 
 	if cached := d.cachedQValues.Load(); cached != nil && len(*cached) >= numPartitions {
-		return argmax((*cached)[:numPartitions])
+		idx := argmax((*cached)[:numPartitions])
+		(*inf)[idx].Add(1)
+		return idx
 	}
 
-	return d.fallbackRR.SelectPartition(topic, key, numPartitions)
+	idx := d.fallbackRR.SelectPartition(topic, key, numPartitions)
+	(*inf)[idx].Add(1)
+	return idx
 }
 
 func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
@@ -327,6 +364,12 @@ func (d *DQNBalancer) DroppedExperience() int64 {
 	return d.droppedExperience.Load()
 }
 
+func (d *DQNBalancer) OnPublishComplete(partition int) {
+	if ptr := d.inflight.Load(); ptr != nil && partition < len(*ptr) {
+		(*ptr)[partition].Add(-1)
+	}
+}
+
 func (d *DQNBalancer) Stop() {
 	d.cancel()
 	_ = d.eg.Wait()
@@ -365,7 +408,14 @@ func (d *DQNBalancer) policyLoop(ctx stdctx.Context) {
 		case <-ticker.C:
 			srt := d.stateMu.RLock()
 			d.buildStateInto(d.policyStateBuf)
+			rate := d.msgRate
 			d.stateMu.RUnlock(srt)
+
+			eps := d.epsilon
+			if rate > dqnNormalRateThreshold {
+				eps = d.epsilon * (dqnNormalRateThreshold / rate)
+			}
+			d.adaptiveEpsilon.Store(math.Float64bits(eps))
 
 			rt := d.weightsMu.RLock()
 			qValues := d.forward(d.policyStateBuf)
@@ -399,7 +449,15 @@ func (d *DQNBalancer) buildStateInto(dst []float64) {
 		n = d.numPartitions
 	}
 	copy(dst[d.numPartitions:], d.predictedLoads)
-	idx := d.numPartitions * 2
+
+	inflightBase := d.numPartitions * 2
+	if ptr := d.inflight.Load(); ptr != nil {
+		for i := 0; i < d.numPartitions && i < len(*ptr); i++ {
+			dst[inflightBase+i] = float64((*ptr)[i].Load()) / dqnInflightScale
+		}
+	}
+
+	idx := d.numPartitions * 3
 	if idx < len(dst) {
 		dst[idx] = d.msgRate / dqnMsgRateScale
 	}
@@ -463,7 +521,7 @@ func (d *DQNBalancer) trainStep() {
 		return
 	}
 
-	batch := d.replayBuffer.Sample(d.batchSize)
+	batch, indices := d.replayBuffer.Sample(d.batchSize)
 	bs := len(batch)
 	if bs < d.batchSize {
 		return
@@ -492,18 +550,25 @@ func (d *DQNBalancer) trainStep() {
 
 	rt := d.weightsMu.RLock()
 	maxNextQT := d.nextQExec.MustExec1(nextStatesT)
+	actionsT := tensors.FromFlatDataAndDimensions(actions, bs)
+	currentQT := d.batchQExec.MustExec1(statesT, actionsT)
 	d.weightsMu.RUnlock(rt)
 
 	maxNextQ := tensorToFloat64Slice(maxNextQT)
+	currentQ := tensorToFloat64Slice(currentQT)
 	targets := make([]float64, bs)
 	for i := range batch {
 		targets[i] = rewards[i] + d.gamma*maxNextQ[i]*(1-dones[i])
 	}
 
+	for i, idx := range indices {
+		tdError := targets[i] - currentQ[i]
+		d.replayBuffer.UpdatePriority(idx, tdError)
+	}
+
 	d.weightsMu.Lock()
 	defer d.weightsMu.Unlock()
 
-	actionsT := tensors.FromFlatDataAndDimensions(actions, bs)
 	targetsT := tensors.FromFlatDataAndDimensions(targets, bs)
 	d.trainExec.MustExec(statesT, targetsT, actionsT)
 }

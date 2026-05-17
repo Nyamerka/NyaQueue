@@ -3,6 +3,7 @@ package scheduler
 import (
 	stdctx "context"
 	"log"
+	"math"
 	"math/rand/v2"
 	"sync/atomic"
 	"time"
@@ -43,13 +44,15 @@ type DQNScheduler struct {
 	minReplay  int
 	trainEvery int
 
-	backend   backends.Backend
-	ctx       *context.Context
-	fwdExec   *context.Exec
-	nextQExec *context.Exec
-	trainExec *context.Exec
+	backend    backends.Backend
+	ctx        *context.Context
+	fwdExec    *context.Exec
+	nextQExec  *context.Exec
+	batchQExec *context.Exec
+	trainExec  *context.Exec
 
-	replayBuffer *nn.ReplayBuffer
+	replayBuffer *nn.PrioritizedReplayBuffer
+	crisisBuffer *nn.ReplayBuffer
 
 	expCh  chan nn.Transition
 	eg     *errgroup.Group
@@ -60,13 +63,6 @@ type DQNScheduler struct {
 	lastPI    atomic.Pointer[broker.PriorityIndex]
 	threshold int
 
-	fallbackFIFO bool
-
-	depthFallbackThreshold int
-	recoveryTicks          int
-	recoveryCount          int
-	autoFallbackLogged     bool
-
 	cachedThreshold atomic.Int32
 
 	prevSnap atomic.Pointer[schedPolicySnap]
@@ -74,6 +70,13 @@ type DQNScheduler struct {
 
 	latencySums   [broker.MaxPriority]atomic.Uint64
 	latencyCounts [broker.MaxPriority]atomic.Uint64
+
+	prevTotalDepth  atomic.Int64
+	prevRewardDepth atomic.Int64
+	produceRate     float64
+	consumeRate     float64
+
+	lastPolicyDepth int // protected by stateMu
 }
 
 const (
@@ -88,34 +91,27 @@ func WithDQNSchedGamma(g float64) DQNSchedOption         { return func(d *DQNSch
 func WithDQNSchedLearningRate(lr float64) DQNSchedOption { return func(d *DQNScheduler) { d.lr = lr } }
 func WithDQNSchedHiddenSize(n int) DQNSchedOption        { return func(d *DQNScheduler) { d.hiddenSize = n } }
 func WithDQNSchedReplayBufSize(n int) DQNSchedOption {
-	return func(d *DQNScheduler) { d.replayBuffer = nn.NewReplayBuffer(n) }
+	return func(d *DQNScheduler) { d.replayBuffer = nn.NewPrioritizedReplayBuffer(n, 0.6) }
 }
 func WithDQNSchedBatchSize(n int) DQNSchedOption { return func(d *DQNScheduler) { d.batchSize = n } }
-func WithDQNSchedDepthFallback(n int) DQNSchedOption {
-	return func(d *DQNScheduler) { d.depthFallbackThreshold = n }
-}
-func WithDQNSchedRecoveryTicks(n int) DQNSchedOption {
-	return func(d *DQNScheduler) { d.recoveryTicks = n }
-}
 
 func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 	d := &DQNScheduler{
-		weightsMu:              xsync.NewRBMutex(),
-		stateMu:                xsync.NewRBMutex(),
-		hiddenSize:             DefaultDQNSchedHiddenSize,
-		stateSize:              DefaultDQNSchedStateSize,
-		numActions:             DefaultDQNSchedActions,
-		epsilon:                DefaultDQNSchedEpsilon,
-		gamma:                  DefaultDQNSchedGamma,
-		lr:                     DefaultDQNSchedLearningRate,
-		batchSize:              DefaultDQNSchedBatchSize,
-		minReplay:              DefaultDQNSchedMinReplay,
-		trainEvery:             DefaultDQNSchedTrainEvery,
-		replayBuffer:           nn.NewReplayBuffer(DefaultDQNSchedReplayBufSize),
-		threshold:              DefaultDQNSchedThreshold,
-		depthFallbackThreshold: DefaultDQNSchedDepthFallback,
-		recoveryTicks:          DefaultDQNSchedRecoveryTicks,
-		expCh:                  make(chan nn.Transition, DefaultDQNSchedExpChSize),
+		weightsMu:    xsync.NewRBMutex(),
+		stateMu:      xsync.NewRBMutex(),
+		hiddenSize:   DefaultDQNSchedHiddenSize,
+		stateSize:    DefaultDQNSchedStateSize,
+		numActions:   DefaultDQNSchedActions,
+		epsilon:      DefaultDQNSchedEpsilon,
+		gamma:        DefaultDQNSchedGamma,
+		lr:           DefaultDQNSchedLearningRate,
+		batchSize:    DefaultDQNSchedBatchSize,
+		minReplay:    DefaultDQNSchedMinReplay,
+		trainEvery:   DefaultDQNSchedTrainEvery,
+		replayBuffer: nn.NewPrioritizedReplayBuffer(DefaultDQNSchedReplayBufSize, 0.6),
+		crisisBuffer: nn.NewReplayBuffer(dqnSchedCrisisBufSize),
+		threshold:    DefaultDQNSchedThreshold,
+		expCh:        make(chan nn.Transition, DefaultDQNSchedExpChSize),
 	}
 
 	for _, opt := range opts {
@@ -147,7 +143,35 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 		return nil
 	})
 
+	d.seedExpertTransitions()
+
 	return d
+}
+
+func (d *DQNScheduler) seedExpertTransitions() {
+	depthIdx := broker.MaxPriority * 2
+	for i := 0; i < dqnSchedExpertSeeds; i++ {
+		state := make([]float64, d.stateSize)
+		state[depthIdx] = 0.8 + rand.Float64()*0.2
+		if depthIdx+1 < d.stateSize {
+			state[depthIdx+1] = 0.5 + rand.Float64()*0.5
+		}
+		if depthIdx+2 < d.stateSize {
+			state[depthIdx+2] = 3.0 + rand.Float64()*2.0
+		}
+
+		next := make([]float64, d.stateSize)
+		copy(next, state)
+		next[depthIdx] *= 0.6
+
+		d.replayBuffer.Push(nn.Transition{
+			State:     state,
+			Action:    []float64{0},
+			Reward:    2.0,
+			NextState: next,
+			Done:      false,
+		})
+	}
 }
 
 func (d *DQNScheduler) initGoMLX() {
@@ -166,6 +190,15 @@ func (d *DQNScheduler) initGoMLX() {
 			h = activations.Relu(h)
 			q := layers.Dense(ctx.In("output"), h, true, d.numActions)
 			return ReduceMax(q, -1)
+		})
+
+	d.batchQExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
+		func(ctx *context.Context, states, actionIdx *Node) *Node {
+			h := layers.Dense(ctx.In("hidden"), states, true, d.hiddenSize)
+			h = activations.Relu(h)
+			qAll := layers.Dense(ctx.In("output"), h, true, d.numActions)
+			oneHot := OneHot(ConvertDType(actionIdx, dtypes.Int32), d.numActions, qAll.DType())
+			return ReduceSum(Mul(qAll, oneHot), -1)
 		})
 
 	d.trainExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
@@ -215,18 +248,10 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 	d.lastPI.Store(pi)
 
 	srt := d.stateMu.RLock()
-	fallback := d.fallbackFIFO
+	eps := d.epsilon
 	d.stateMu.RUnlock(srt)
 
-	if fallback {
-		return d.fifoFallback(partition, consumerOffset)
-	}
-
-	if d.depthFallbackThreshold > 0 && pi.Len() > d.depthFallbackThreshold {
-		return d.fifoFallback(partition, consumerOffset)
-	}
-
-	explore := rand.Float64() < d.epsilon
+	explore := rand.Float64() < eps
 
 	var threshold int
 	if explore {
@@ -259,6 +284,11 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 func (d *DQNScheduler) Enqueue(_ *broker.Message, _ int64) {}
 
 func (d *DQNScheduler) OnMetrics(m broker.Metrics) {
+	d.stateMu.Lock()
+	d.produceRate = m.MsgRate
+	d.consumeRate = m.ConsumeRate
+	d.stateMu.Unlock()
+
 	prev := d.prevSnap.Load()
 	curr := d.currSnap.Load()
 	if prev == nil || curr == nil {
@@ -291,25 +321,51 @@ func (d *DQNScheduler) computePerPriorityReward() float64 {
 
 	var reward float64
 	var totalWeight float64
+	avgLatencies := make([]float64, broker.MaxPriority)
 	for level := 0; level < broker.MaxPriority; level++ {
 		if counts[level] == 0 {
 			continue
 		}
 		meanLatencySec := float64(sums[level]) / float64(counts[level]) / 1e9
-		weight := float64(level + 1)
+		avgLatencies[level] = meanLatencySec
+		weight := float64(broker.MaxPriority - level) // P0 → weight=10, P9 → weight=1
 		reward -= meanLatencySec * weight
 		totalWeight += weight
 	}
 	if totalWeight > 0 {
 		reward /= totalWeight
 	}
-	return reward
-}
 
-func (d *DQNScheduler) SetFallbackFIFO(on bool) {
-	d.stateMu.Lock()
-	d.fallbackFIFO = on
-	d.stateMu.Unlock()
+	if pi := d.lastPI.Load(); pi != nil {
+		currentDepth := int64(pi.Len())
+		prevDepth := d.prevRewardDepth.Swap(currentDepth)
+		growth := float64(currentDepth - prevDepth)
+		if growth > 0 {
+			reward -= dqnSchedGrowthPenaltyW * math.Log1p(growth)
+		}
+	}
+
+	var highPrioActive, lowPrioActive bool
+	var highPrioLatency, lowPrioLatency float64
+	for level := 0; level < broker.MaxPriority; level++ {
+		if counts[level] > 0 && !highPrioActive {
+			highPrioLatency = avgLatencies[level]
+			highPrioActive = true
+			break
+		}
+	}
+	for level := broker.MaxPriority - 1; level >= 0; level-- {
+		if counts[level] > 0 && !lowPrioActive {
+			lowPrioLatency = avgLatencies[level]
+			lowPrioActive = true
+			break
+		}
+	}
+	if highPrioActive && lowPrioActive && highPrioLatency < lowPrioLatency {
+		reward += dqnSchedPriorityOrderBonus
+	}
+
+	return reward
 }
 
 func (d *DQNScheduler) Stop() {
@@ -353,27 +409,14 @@ func (d *DQNScheduler) policyLoop(ctx stdctx.Context) {
 			d.threshold = threshold
 
 			depth := pi.Len()
-			if d.depthFallbackThreshold > 0 && depth > d.depthFallbackThreshold {
-				if !d.fallbackFIFO {
-					d.fallbackFIFO = true
-					if !d.autoFallbackLogged {
-						d.autoFallbackLogged = true
-						log.Printf("[dqn-scheduler] auto-fallback FIFO: depth %d > threshold %d", depth, d.depthFallbackThreshold)
-					}
-				}
-				d.recoveryCount = 0
-			} else if d.fallbackFIFO && d.depthFallbackThreshold > 0 && depth < d.depthFallbackThreshold/2 {
-				d.recoveryCount++
-				if d.recoveryCount >= d.recoveryTicks {
-					d.fallbackFIFO = false
-					d.recoveryCount = 0
-					d.autoFallbackLogged = false
-					log.Printf("[dqn-scheduler] recovered from auto-fallback: depth %d", depth)
-				}
-			} else if d.fallbackFIFO {
-				d.recoveryCount = 0
-			}
+			velocity := depth - d.lastPolicyDepth
+			d.lastPolicyDepth = depth
 
+			if depth > dqnSchedOverloadDepth && velocity > 0 {
+				d.epsilon = 0
+			} else {
+				d.epsilon = DefaultDQNSchedEpsilon
+			}
 			d.stateMu.Unlock()
 
 		case <-ctx.Done():
@@ -389,6 +432,9 @@ func (d *DQNScheduler) trainLoop(ctx stdctx.Context) {
 		select {
 		case t := <-d.expCh:
 			d.replayBuffer.Push(t)
+			if d.isOverloadTransition(t) {
+				d.crisisBuffer.Push(t)
+			}
 			steps++
 			if steps%d.trainEvery == 0 {
 				d.trainStep()
@@ -406,16 +452,18 @@ func (d *DQNScheduler) trainLoop(ctx stdctx.Context) {
 	}
 }
 
-func (d *DQNScheduler) fifoFallback(partition *broker.Partition, consumerOffset uint64) (*broker.Message, uint64, error) {
-	hwm := partition.HighWaterMark()
-	if consumerOffset > hwm {
-		return nil, consumerOffset, broker.ErrNoMessages
+func (d *DQNScheduler) isOverloadTransition(t nn.Transition) bool {
+	depthIdx := broker.MaxPriority * 2
+	velocityIdx := depthIdx + 1
+	if depthIdx >= len(t.State) {
+		return false
 	}
-	msg, err := partition.Read(consumerOffset)
-	if err != nil {
-		return nil, consumerOffset, err
+	depth := t.State[depthIdx]
+	var velocity float64
+	if velocityIdx < len(t.State) {
+		velocity = t.State[velocityIdx]
 	}
-	return msg, consumerOffset + 1, nil
+	return depth > float64(dqnSchedOverloadDepth) && velocity > 0
 }
 
 func (d *DQNScheduler) buildState(pi *broker.PriorityIndex) []float64 {
@@ -439,8 +487,25 @@ func (d *DQNScheduler) buildState(pi *broker.PriorityIndex) []float64 {
 		}
 	}
 
-	if depthIdx := levels * 2; depthIdx < d.stateSize {
+	depthIdx := levels * 2
+	if depthIdx < d.stateSize {
 		state[depthIdx] = float64(totalDepth)
+	}
+
+	velocityIdx := depthIdx + 1
+	if velocityIdx < d.stateSize {
+		prevDepth := d.prevTotalDepth.Swap(int64(totalDepth))
+		velocity := float64(int64(totalDepth) - prevDepth)
+		state[velocityIdx] = velocity / dqnSchedVelocityScale
+	}
+
+	ratioIdx := velocityIdx + 1
+	if ratioIdx < d.stateSize {
+		d.stateMu.Lock()
+		if d.consumeRate > 0 {
+			state[ratioIdx] = d.produceRate / d.consumeRate
+		}
+		d.stateMu.Unlock()
 	}
 
 	return state
@@ -451,11 +516,21 @@ func (d *DQNScheduler) trainStep() {
 		return
 	}
 
-	batch := d.replayBuffer.Sample(d.batchSize)
-	bs := len(batch)
-	if bs < d.batchSize {
+	mainSize := d.batchSize
+	crisisSize := 0
+	if d.crisisBuffer.Len() > 0 {
+		crisisSize = int(float64(d.batchSize) * dqnSchedCrisisRatio)
+		mainSize = d.batchSize - crisisSize
+	}
+
+	mainBatch, indices := d.replayBuffer.Sample(mainSize)
+	if len(mainBatch) < mainSize {
 		return
 	}
+
+	crisisBatch := d.crisisBuffer.Sample(crisisSize)
+	batch := append(mainBatch, crisisBatch...)
+	bs := len(batch)
 
 	statesBuf := make([]float64, bs*d.stateSize)
 	nextStatesBuf := make([]float64, bs*d.stateSize)
@@ -480,18 +555,25 @@ func (d *DQNScheduler) trainStep() {
 
 	rt := d.weightsMu.RLock()
 	maxNextQT := d.nextQExec.MustExec1(nextStatesT)
+	actionsT := tensors.FromFlatDataAndDimensions(actions, bs)
+	currentQT := d.batchQExec.MustExec1(statesT, actionsT)
 	d.weightsMu.RUnlock(rt)
 
 	maxNextQ := tensorToFloat64Sched(maxNextQT)
+	currentQ := tensorToFloat64Sched(currentQT)
 	targets := make([]float64, bs)
 	for i := range batch {
 		targets[i] = rewards[i] + d.gamma*maxNextQ[i]*(1-dones[i])
 	}
 
+	for i, idx := range indices {
+		tdError := targets[i] - currentQ[i]
+		d.replayBuffer.UpdatePriority(idx, tdError)
+	}
+
 	d.weightsMu.Lock()
 	defer d.weightsMu.Unlock()
 
-	actionsT := tensors.FromFlatDataAndDimensions(actions, bs)
 	targetsT := tensors.FromFlatDataAndDimensions(targets, bs)
 	d.trainExec.MustExec(statesT, targetsT, actionsT)
 }

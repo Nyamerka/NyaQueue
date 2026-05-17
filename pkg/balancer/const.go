@@ -43,8 +43,12 @@ var dqnThroughputLogNorm = math.Log1p(dqnMaxThroughput / dqnThroughputScale)
 const (
 	dqnMsgRateScale       = 100_000.0
 	dqnMsgSizeScale       = 1024.0 // normalize to KB
+	dqnInflightScale      = 10_000.0
 	dqnPolicyTickInterval = 100 * time.Millisecond
 )
+
+// Adaptive epsilon: below this msg rate, epsilon stays at base value.
+const dqnNormalRateThreshold = 10_000.0
 
 // DQN queue-depth penalty in reward.
 const (
