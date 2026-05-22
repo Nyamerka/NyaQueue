@@ -190,7 +190,7 @@ func (s *DQNSuite) TestAllOptions() {
 	require.Equal(s.T(), 0.1, dqn.epsilon)
 	require.Equal(s.T(), 0.9, dqn.gamma)
 	require.Equal(s.T(), 0.01, dqn.lr)
-	require.Equal(s.T(), 32, dqn.hiddenSize)
+	require.Equal(s.T(), 128, dqn.hiddenSize)
 	require.Equal(s.T(), 16, dqn.batchSize)
 	require.Equal(s.T(), 32, dqn.minReplay)
 	require.Equal(s.T(), 0.5, dqn.fallbackRatio)
