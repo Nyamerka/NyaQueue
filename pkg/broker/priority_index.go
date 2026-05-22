@@ -125,10 +125,7 @@ func NewPriorityIndex(opts ...PriorityIndexOption) *PriorityIndex {
 	}
 	if pi.maxPerLevel > 0 {
 		for i := range pi.levels {
-			pi.levels[i].ring = entryRing{
-				buf: make([]PendingEntry, pi.maxPerLevel),
-				cap: pi.maxPerLevel,
-			}
+			pi.levels[i].ring = entryRing{cap: pi.maxPerLevel}
 		}
 	}
 	return pi

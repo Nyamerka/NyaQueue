@@ -31,7 +31,7 @@ func (s *PartitionSuite) TestAppendAndRead() {
 
 	for _, tc := range tests {
 		s.Run(tc.name, func() {
-			p, err := NewPartition(0, "test", s.T().TempDir(), tc.mode, SyncNone)
+			p, err := NewPartition(0, "test", s.T().TempDir(), tc.mode, SyncNone, 1)
 			require.NoError(s.T(), err)
 			defer p.Close()
 
@@ -52,7 +52,7 @@ func (s *PartitionSuite) TestAppendAndRead() {
 }
 
 func (s *PartitionSuite) TestPriorityIndexPopulated() {
-	p, err := NewPartition(0, "test", s.T().TempDir(), ModeStrictPriority, SyncNone)
+	p, err := NewPartition(0, "test", s.T().TempDir(), ModeStrictPriority, SyncNone, 1)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -65,7 +65,7 @@ func (s *PartitionSuite) TestPriorityIndexPopulated() {
 }
 
 func (s *PartitionSuite) TestFIFONoPriorityIndex() {
-	p, err := NewPartition(0, "test", s.T().TempDir(), ModeFIFO, SyncNone)
+	p, err := NewPartition(0, "test", s.T().TempDir(), ModeFIFO, SyncNone, 1)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -73,7 +73,7 @@ func (s *PartitionSuite) TestFIFONoPriorityIndex() {
 }
 
 func (s *PartitionSuite) TestAppendBatch() {
-	p, err := NewPartition(0, "test", s.T().TempDir(), ModeFIFO, SyncNone)
+	p, err := NewPartition(0, "test", s.T().TempDir(), ModeFIFO, SyncNone, 1)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -96,7 +96,7 @@ func (s *PartitionSuite) TestAppendBatch() {
 }
 
 func (s *PartitionSuite) TestAppendBatchEmpty() {
-	p, err := NewPartition(0, "test", s.T().TempDir(), ModeFIFO, SyncNone)
+	p, err := NewPartition(0, "test", s.T().TempDir(), ModeFIFO, SyncNone, 1)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -106,7 +106,7 @@ func (s *PartitionSuite) TestAppendBatchEmpty() {
 }
 
 func (s *PartitionSuite) TestAppendBatchPriorityIndex() {
-	p, err := NewPartition(0, "test", s.T().TempDir(), ModeStrictPriority, SyncNone)
+	p, err := NewPartition(0, "test", s.T().TempDir(), ModeStrictPriority, SyncNone, 1)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -121,7 +121,7 @@ func (s *PartitionSuite) TestAppendBatchPriorityIndex() {
 }
 
 func (s *PartitionSuite) TestProduceTimeRoundTrip() {
-	p, err := NewPartition(0, "test", s.T().TempDir(), ModeFIFO, SyncNone)
+	p, err := NewPartition(0, "test", s.T().TempDir(), ModeFIFO, SyncNone, 1)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -149,7 +149,7 @@ func (s *PartitionSuite) TestProduceTimeRoundTrip() {
 func (s *PartitionSuite) TestRebuild() {
 	dir := s.T().TempDir()
 
-	p, err := NewPartition(0, "test", dir, ModeStrictPriority, SyncNone)
+	p, err := NewPartition(0, "test", dir, ModeStrictPriority, SyncNone, 1)
 	require.NoError(s.T(), err)
 
 	for i := 0; i < 10; i++ {

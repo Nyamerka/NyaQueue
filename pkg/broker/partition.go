@@ -42,7 +42,7 @@ func (p *Partition) SetBatchCodec(c Codec) {
 	p.batchCodec = c
 }
 
-func NewPartition(id int, topicName, dataDir string, mode ScheduleMode, syncPolicy SyncPolicy) (*Partition, error) {
+func NewPartition(id int, topicName, dataDir string, mode ScheduleMode, syncPolicy SyncPolicy, numPartitions int) (*Partition, error) {
 	dir := filepath.Join(dataDir, topicName, fmt.Sprintf("partition-%d", id))
 	log, err := wal.Open(dir, walOptions(syncPolicy))
 	if err != nil {
@@ -64,7 +64,11 @@ func NewPartition(id int, topicName, dataDir string, mode ScheduleMode, syncPoli
 	}
 
 	if mode != ModeFIFO {
-		p.priorityIndex = NewPriorityIndex(WithMaxPerLevel(50_000))
+		maxPL := 500_000 / max(numPartitions, 1) / MaxPriority
+		if maxPL < 1000 {
+			maxPL = 1000
+		}
+		p.priorityIndex = NewPriorityIndex(WithMaxPerLevel(maxPL))
 	}
 
 	return p, nil

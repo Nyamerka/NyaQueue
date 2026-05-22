@@ -75,6 +75,11 @@ func main() {
 		HTTPBrokerAddr: httpBrokerAddr,
 		Duration:       duration,
 	}
+	runner.OnScenarioComplete = func(results []experiments.ExperimentResult) {
+		_ = experiments.ExportCSV(results, outputDir)
+		_ = experiments.ExportJSON(results, outputDir)
+		log.Printf("[incremental] saved %d results to %s", len(results), outputDir)
+	}
 
 	nyaModes := 0
 	hasKafka := false

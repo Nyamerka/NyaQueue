@@ -10,12 +10,12 @@ services:
       - "8080:8080"
     environment:
       GOGC: "50"
-      GOMEMLIMIT: "7GiB"
+      GOMEMLIMIT: "3500MiB"
       GOMAXPROCS: "3"
     volumes:
       - nyaqueue-data:/data
     cpus: "3.0"
-    mem_limit: "8g"
+    mem_limit: "4g"
     sysctls:
       net.ipv4.tcp_tw_reuse: 1
       net.ipv4.tcp_fin_timeout: 30
@@ -37,7 +37,7 @@ services:
     depends_on:
       - broker
     cpus: "0.1"
-    mem_limit: "256m"
+    mem_limit: "128m"
 
   producer:
     build:
@@ -50,7 +50,7 @@ services:
     depends_on:
       - broker
     cpus: "0.2"
-    mem_limit: "512m"
+    mem_limit: "256m"
 
   consumer:
     build:
@@ -64,7 +64,7 @@ services:
       - broker
       - producer
     cpus: "0.3"
-    mem_limit: "512m"
+    mem_limit: "256m"
 
   prometheus:
     image: prom/prometheus:v2.55.1
@@ -80,7 +80,7 @@ services:
     depends_on:
       - broker-exporter
     cpus: "0.2"
-    mem_limit: "512m"
+    mem_limit: "256m"
 
   grafana:
     image: grafana/grafana:11.3.0
@@ -98,7 +98,7 @@ services:
     depends_on:
       - prometheus
     cpus: "0.1"
-    mem_limit: "256m"
+    mem_limit: "128m"
 
   kafka:
     profiles: ["kafka"]
@@ -120,7 +120,7 @@ services:
     volumes:
       - kafka-data:/bitnami/kafka
     cpus: "0.8"
-    mem_limit: "3g"
+    mem_limit: "2g"
 
   experiment:
     profiles: ["experiment"]
@@ -128,6 +128,9 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       target: experiment
+    environment:
+      GOGC: "50"
+      GOMEMLIMIT: "1800MiB"
     command:
       - "--experiment.mode=inprocess,grpc,http,kafka"
       - "--experiment.scenarios=all"

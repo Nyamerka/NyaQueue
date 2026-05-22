@@ -19,7 +19,7 @@ func TestDQNSchedSuite(t *testing.T) { suite.Run(t, new(DQNSchedSuite)) }
 
 func (s *DQNSchedSuite) TestSelectsFromPriorityIndex() {
 	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone)
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone, 1)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -61,7 +61,7 @@ func (s *DQNSchedSuite) TestOnMetrics() {
 	dqn := NewDQNScheduler()
 
 	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone)
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone, 1)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -107,7 +107,7 @@ func (s *DQNSchedSuite) TestReplayBufSizeOption() {
 
 func (s *DQNSchedSuite) TestNoPriorityIndex() {
 	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeFIFO, broker.SyncNone)
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeFIFO, broker.SyncNone, 1)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -119,7 +119,7 @@ func (s *DQNSchedSuite) TestNoPriorityIndex() {
 
 func (s *DQNSchedSuite) TestAsyncTrainingDoesNotBlockInference() {
 	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone)
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone, 1)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -151,7 +151,7 @@ func (s *DQNSchedSuite) TestBellmanUsesCorrectNextState() {
 	dqn := NewDQNScheduler()
 
 	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone)
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone, 1)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -174,7 +174,7 @@ func (s *DQNSchedSuite) TestBellmanUsesCorrectNextState() {
 
 func (s *DQNSchedSuite) TestConcurrentNextAndOnMetrics() {
 	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone)
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone, 1)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -266,7 +266,7 @@ func (s *DQNSchedSuite) TestEpsilonSuppressionUnderOverload() {
 	dqn := NewDQNScheduler()
 
 	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone)
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone, 1)
 	require.NoError(s.T(), err)
 	defer p.Close()
 
@@ -324,7 +324,7 @@ func (s *DQNSchedSuite) TestCrisisBufferCollectsOverload() {
 
 func (s *DQNSchedSuite) TestNoFallbackAlwaysDQN() {
 	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone)
+	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone, 1)
 	require.NoError(s.T(), err)
 	defer p.Close()
 

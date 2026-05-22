@@ -19,6 +19,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/layers"
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
 	"github.com/gomlx/gomlx/pkg/ml/train/losses"
+	"github.com/gomlx/gomlx/pkg/ml/train/optimizers"
 	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/samber/oops"
 	"golang.org/x/sync/errgroup"
@@ -129,6 +130,7 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 		opt(d)
 	}
 
+	d.hiddenSize = max(DefaultDQNSchedHiddenSize, d.stateSize*3)
 	d.cachedThreshold.Store(int32(d.threshold))
 	d.betaSchedule = nn.NewBetaSchedule(0.4, 1.0, DefaultDQNSchedReplayBufSize/d.batchSize)
 	d.normalizer = nn.NewRunningNormalizer(d.stateSize)
@@ -190,6 +192,11 @@ func (d *DQNScheduler) seedExpertTransitions() {
 func (d *DQNScheduler) initGoMLX() {
 	d.backend = backends.MustNew()
 	d.ctx = context.New()
+	d.ctx.SetParams(map[string]any{
+		optimizers.ParamOptimizer:    "adam",
+		optimizers.ParamLearningRate: d.lr,
+		optimizers.ParamAdamEpsilon:  1e-7,
+	})
 
 	d.fwdExec = context.MustNewExec(d.backend, d.ctx, func(ctx *context.Context, state *Node) *Node {
 		return d.qNetworkGraph(ctx, state)
@@ -227,16 +234,8 @@ func (d *DQNScheduler) initGoMLX() {
 			oneHot := OneHot(ConvertDType(actionIdx, dtypes.Int32), d.numActions, qAll.DType())
 			qSelected := ReduceSum(Mul(qAll, oneHot), -1)
 			loss := huber([]*Node{targetQ, isWeights}, []*Node{qSelected})
-			grads := ctx.BuildTrainableVariablesGradientsGraph(loss)
-			lr := Const(g, d.lr)
-			idx := 0
-			ctx.EnumerateVariables(func(v *context.Variable) {
-				if v.Trainable && v.InUseByGraph(g) {
-					w := v.ValueGraph(g)
-					v.SetValueGraph(Sub(w, Mul(lr, grads[idx])))
-					idx++
-				}
-			})
+			opt := optimizers.FromContext(ctx)
+			opt.UpdateGraph(ctx, g, loss)
 			return loss
 		})
 }

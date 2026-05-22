@@ -19,6 +19,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/layers"
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
 	"github.com/gomlx/gomlx/pkg/ml/train/losses"
+	"github.com/gomlx/gomlx/pkg/ml/train/optimizers"
 	"github.com/puzpuzpuz/xsync/v3"
 	"golang.org/x/sync/errgroup"
 	"gonum.org/v1/gonum/stat"
@@ -141,6 +142,7 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 	}
 
 	d.stateSize = numPartitions*3 + 2
+	d.hiddenSize = max(DefaultDQNHiddenSize, d.stateSize*3)
 	d.policyStateBuf = make([]float64, d.stateSize)
 	d.adaptiveEpsilon.Store(math.Float64bits(d.epsilon))
 	d.betaSchedule = nn.NewBetaSchedule(0.4, 1.0, DefaultDQNReplayBufSize/d.batchSize)
@@ -175,6 +177,11 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 func (d *DQNBalancer) initGoMLX() {
 	d.backend = backends.MustNew()
 	d.ctx = context.New()
+	d.ctx.SetParams(map[string]any{
+		optimizers.ParamOptimizer:    "adam",
+		optimizers.ParamLearningRate: d.lr,
+		optimizers.ParamAdamEpsilon:  1e-7,
+	})
 
 	d.fwdExec = context.MustNewExec(d.backend, d.ctx, func(ctx *context.Context, state *Node) *Node {
 		return d.qNetworkGraph(ctx, state)
@@ -212,16 +219,8 @@ func (d *DQNBalancer) initGoMLX() {
 			oneHot := OneHot(ConvertDType(actionIdx, dtypes.Int32), d.numPartitions, qAll.DType())
 			qSelected := ReduceSum(Mul(qAll, oneHot), -1)
 			loss := huber([]*Node{targetQ, isWeights}, []*Node{qSelected})
-			grads := ctx.BuildTrainableVariablesGradientsGraph(loss)
-			lr := Const(g, d.lr)
-			idx := 0
-			ctx.EnumerateVariables(func(v *context.Variable) {
-				if v.Trainable && v.InUseByGraph(g) {
-					w := v.ValueGraph(g)
-					v.SetValueGraph(Sub(w, Mul(lr, grads[idx])))
-					idx++
-				}
-			})
+			opt := optimizers.FromContext(ctx)
+			opt.UpdateGraph(ctx, g, loss)
 			return loss
 		})
 }

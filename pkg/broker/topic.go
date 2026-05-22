@@ -25,7 +25,7 @@ func NewTopic(name, dataDir string, cfg TopicConfig, syncPolicy SyncPolicy) (*To
 	}
 
 	for i := 0; i < cfg.NumPartitions; i++ {
-		p, err := NewPartition(i, name, dataDir, cfg.ScheduleMode, syncPolicy)
+		p, err := NewPartition(i, name, dataDir, cfg.ScheduleMode, syncPolicy, cfg.NumPartitions)
 		if err != nil {
 			t.Close()
 			return nil, oops.Wrapf(err, "create partition %d for topic %q", i, name)
