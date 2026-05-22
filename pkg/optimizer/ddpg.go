@@ -11,6 +11,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/ml/layers"
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
+	"github.com/gomlx/gomlx/pkg/ml/train/optimizers"
 
 	_ "github.com/gomlx/gomlx/backends/simplego"
 	"github.com/puzpuzpuz/xsync/v3"
@@ -21,7 +22,7 @@ const (
 	ddpgTau              = 0.005
 	ddpgDefaultGamma     = 0.99
 	ddpgDefaultBatchSize = 32
-	ddpgReplayBufSize    = 1_000_000
+	ddpgReplayBufSize    = 50_000
 	ddpgOUTheta          = 0.15
 	ddpgOUSigma          = 0.2
 )
@@ -33,6 +34,7 @@ type DDPG struct {
 
 	stateSize  int
 	actionSize int
+	hiddenSize int
 	lr         float64
 	gamma      float64
 	batchSize  int
@@ -64,9 +66,11 @@ func NewDDPG(stateSize, actionSize int, lr float64, batchSize int) *DDPG {
 	if batchSize <= 0 {
 		batchSize = ddpgDefaultBatchSize
 	}
+	hiddenSize := max(ddpgHiddenSize, (stateSize+actionSize)*3)
 	d := &DDPG{
 		stateSize:    stateSize,
 		actionSize:   actionSize,
+		hiddenSize:   hiddenSize,
 		lr:           lr,
 		gamma:        ddpgDefaultGamma,
 		batchSize:    batchSize,
@@ -83,6 +87,11 @@ func NewDDPG(stateSize, actionSize int, lr float64, batchSize int) *DDPG {
 
 	d.backend = backends.MustNew()
 	d.mainCtx = context.New()
+	d.mainCtx.SetParams(map[string]any{
+		optimizers.ParamOptimizer:    "adam",
+		optimizers.ParamLearningRate: d.lr,
+		optimizers.ParamAdamEpsilon:  1e-7,
+	})
 
 	d.initNetworks()
 
@@ -110,16 +119,8 @@ func (d *DDPG) initNetworks() {
 			loss := ReduceAllMean(Mul(diff, diff))
 
 			criticCtx := ctx.In("critic")
-			grads := criticCtx.BuildTrainableVariablesGradientsGraph(loss)
-			lr := Const(g, d.lr)
-			idx := 0
-			criticCtx.EnumerateVariables(func(v *context.Variable) {
-				if v.Trainable && v.InUseByGraph(g) {
-					w := v.ValueGraph(g)
-					v.SetValueGraph(Sub(w, Mul(lr, grads[idx])))
-					idx++
-				}
-			})
+			opt := optimizers.FromContext(criticCtx)
+			opt.UpdateGraph(criticCtx, g, loss)
 			return loss
 		})
 	dummyBatchStates := make([]float64, d.stateSize)
@@ -139,16 +140,8 @@ func (d *DDPG) initNetworks() {
 			loss := Neg(ReduceAllMean(q))
 
 			actorCtx := ctx.In("actor")
-			grads := actorCtx.BuildTrainableVariablesGradientsGraph(loss)
-			lr := Const(g, d.lr)
-			idx := 0
-			actorCtx.EnumerateVariables(func(v *context.Variable) {
-				if v.Trainable && v.InUseByGraph(g) {
-					w := v.ValueGraph(g)
-					v.SetValueGraph(Sub(w, Mul(lr, grads[idx])))
-					idx++
-				}
-			})
+			opt := optimizers.FromContext(actorCtx)
+			opt.UpdateGraph(actorCtx, g, loss)
 			return loss
 		})
 }
@@ -257,9 +250,11 @@ func (d *DDPG) softUpdate() {
 
 func (d *DDPG) actorGraphBatched(ctx *context.Context, states *Node) *Node {
 	actorCtx := ctx.In("actor")
-	h := layers.Dense(actorCtx.In("l1"), states, true, ddpgHiddenSize)
+	h := layers.Dense(actorCtx.In("l1"), states, true, d.hiddenSize)
+	h = layers.LayerNormalization(actorCtx.In("ln1"), h, -1).Done()
 	h = activations.Relu(h)
-	h = layers.Dense(actorCtx.In("l2"), h, true, ddpgHiddenSize)
+	h = layers.Dense(actorCtx.In("l2"), h, true, d.hiddenSize)
+	h = layers.LayerNormalization(actorCtx.In("ln2"), h, -1).Done()
 	h = activations.Relu(h)
 	out := layers.Dense(actorCtx.In("l3"), h, true, d.actionSize)
 	return Tanh(out)
@@ -268,9 +263,11 @@ func (d *DDPG) actorGraphBatched(ctx *context.Context, states *Node) *Node {
 func (d *DDPG) criticGraphBatched(ctx *context.Context, states, actions *Node) *Node {
 	criticCtx := ctx.In("critic")
 	input := Concatenate([]*Node{states, actions}, -1)
-	h := layers.Dense(criticCtx.In("l1"), input, true, ddpgHiddenSize)
+	h := layers.Dense(criticCtx.In("l1"), input, true, d.hiddenSize)
+	h = layers.LayerNormalization(criticCtx.In("ln1"), h, -1).Done()
 	h = activations.Relu(h)
-	h = layers.Dense(criticCtx.In("l2"), h, true, ddpgHiddenSize)
+	h = layers.Dense(criticCtx.In("l2"), h, true, d.hiddenSize)
+	h = layers.LayerNormalization(criticCtx.In("ln2"), h, -1).Done()
 	h = activations.Relu(h)
 	q := layers.Dense(criticCtx.In("l3"), h, true, 1)
 	return Squeeze(q, -1)

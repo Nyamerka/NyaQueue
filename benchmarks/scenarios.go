@@ -118,22 +118,20 @@ func Overload() Scenario {
 	}
 }
 
-// SkewedK16 is Skewed with 16 partitions and proportionally higher load so
-// per-partition utilisation stays above 0.5 — the regime where DQN load
-// balancing is theoretically non-trivial (K ≥ 16, ρ > 0.5).
-func SkewedK16() Scenario {
+// OverloadK32 sends at maximum throughput across 32 partitions with a skewed
+// priority distribution. Tests DQN scalability advantage at higher k — with 32
+// partitions DQN can exploit differential partition loads for significant gains.
+func OverloadK32() Scenario {
 	return Scenario{
-		Name:          "skewed_k16",
+		Name:          "overload_k32",
 		Duration:      30 * time.Second,
-		NumPartitions: 16,
-		Producers:     16,
-		Consumers:     16,
+		NumPartitions: 32,
+		Producers:     32,
+		Consumers:     32,
 		MsgSize:       256,
-		RatePerSec:    4800,
-		SkewRatio:     0.8,
-		Priorities:    uniformPriorities(),
+		RatePerSec:    0,
+		Priorities:    [10]float64{0.30, 0.25, 0.15, 0.10, 0.08, 0.05, 0.03, 0.02, 0.01, 0.01},
 		Seed:          42,
-		LingerMs:      1,
 	}
 }
 
@@ -165,7 +163,7 @@ func AllScenarios() Scenarios {
 		GrowingLoad(),
 		MixedPriority(),
 		Overload(),
-		SkewedK16(),
+		OverloadK32(),
 		OverloadK16(),
 	}
 }

@@ -242,15 +242,19 @@ func (d *DQNScheduler) initGoMLX() {
 
 func (d *DQNScheduler) qNetworkBatch(ctx *context.Context, x *Node) *Node {
 	h := layers.Dense(ctx.In("feature1"), x, true, d.hiddenSize)
+	h = layers.LayerNormalization(ctx.In("ln1"), h, -1).Done()
 	h = activations.Relu(h)
 	h = layers.Dense(ctx.In("feature2"), h, true, d.hiddenSize/2)
+	h = layers.LayerNormalization(ctx.In("ln2"), h, -1).Done()
 	h = activations.Relu(h)
 
 	vStream := layers.Dense(ctx.In("value_hidden"), h, true, d.hiddenSize/4)
+	vStream = layers.LayerNormalization(ctx.In("ln_vh"), vStream, -1).Done()
 	vStream = activations.Relu(vStream)
 	v := layers.Dense(ctx.In("value_out"), vStream, true, 1)
 
 	aStream := layers.Dense(ctx.In("adv_hidden"), h, true, d.hiddenSize/4)
+	aStream = layers.LayerNormalization(ctx.In("ln_ah"), aStream, -1).Done()
 	aStream = activations.Relu(aStream)
 	a := layers.Dense(ctx.In("adv_out"), aStream, true, d.numActions)
 
