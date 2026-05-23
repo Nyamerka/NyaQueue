@@ -8,21 +8,19 @@ import (
 // DQN hyperparameters (user-facing defaults).
 const (
 	DefaultDQNHiddenSize     = 128
-	DefaultDQNEpsilon        = 0.05
 	DefaultDQNGamma          = 0.9
 	DefaultDQNLearningRate   = 0.001
 	DefaultDQNReplayBufSize  = 50_000
 	DefaultDQNBatchSize      = 32
 	DefaultDQNMinReplay      = 64
 	DefaultDQNTrainEvery     = 4
-	DefaultDQNFallbackRatio  = 0.8
-	DefaultDQNLoadThreshold  = 0.75
 	DefaultDQNExpChannelSize = 4096
+	DefaultDQNWeightDecay    = 1e-4
 )
 
 // DQN reward shaping constants.
 //
-// The reward combines two signals via smooth pressure-based interpolation:
+// Two orthogonal signals via smooth pressure-based interpolation:
 //
 //	balance  = -CV(loads), where CV = stddev/mean (coefficient of variation)
 //	utility  = log1p(throughput/scale) / log1p(maxThroughput/scale)  ∈ [0,1]
@@ -33,22 +31,18 @@ const (
 	dqnThroughputScale   = 10_000.0
 	dqnMaxThroughput     = 300_000.0
 	dqnOverloadThreshold = 0.7
-	dqnBaseBalanceWeight = 0.5
-	dqnMaxBalanceWeight  = 0.95
+	dqnBaseBalanceWeight = 0.4
+	dqnMaxBalanceWeight  = 0.7
 )
 
 var dqnThroughputLogNorm = math.Log1p(dqnMaxThroughput / dqnThroughputScale)
 
 // DQN state normalization scales.
 const (
-	dqnMsgRateScale       = 100_000.0
-	dqnMsgSizeScale       = 1024.0 // normalize to KB
-	dqnInflightScale      = 10_000.0
-	dqnPolicyTickInterval = 100 * time.Millisecond
+	dqnMsgRateScale  = 100_000.0
+	dqnMsgSizeScale  = 1024.0
+	dqnInflightScale = 10_000.0
 )
-
-// Adaptive epsilon: below this msg rate, epsilon stays at base value.
-const dqnNormalRateThreshold = 10_000.0
 
 // DQN queue-depth penalty in reward.
 const (
@@ -56,11 +50,30 @@ const (
 	dqnDepthWeight  = 0.3
 )
 
-// DQN fallback hysteresis: consecutive ticks required to enter/exit RR fallback.
+// Softmax (Boltzmann) exploration temperature schedule.
+// At τ=1.0 routing is ~uniform (safe as RR); as training converges τ→0.1 (greedy).
 const (
-	fallbackEnterTicks = 3
-	fallbackExitTicks  = 10
+	dqnInitialTemperature = 1.0
+	dqnFinalTemperature   = 0.1
+	dqnMinStepsForGreedy  = 50
+	dqnTempDecaySteps     = 500
 )
+
+// Credit-assignment gating: only record transitions when τ < this threshold.
+const dqnExperienceRecordThreshold = 0.5
+
+// Differential reward EWMA smoothing factor.
+const dqnRewardEWMAAlpha = 0.1
+
+// Policy tick interval and adaptive slow-tick for low-rate scenarios.
+const (
+	dqnPolicyTickInterval     = 100 * time.Millisecond
+	dqnSlowPolicyTickInterval = 500 * time.Millisecond
+	dqnLowRateThreshold       = 5_000.0
+)
+
+// GB-DQN drift detection: booster created when ewmaReward < peakReward * threshold.
+const dqnDriftThreshold = 0.7
 
 // PSA constants.
 const (

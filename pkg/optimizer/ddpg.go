@@ -88,9 +88,10 @@ func NewDDPG(stateSize, actionSize int, lr float64, batchSize int) *DDPG {
 	d.backend = backends.MustNew()
 	d.mainCtx = context.New()
 	d.mainCtx.SetParams(map[string]any{
-		optimizers.ParamOptimizer:    "adam",
-		optimizers.ParamLearningRate: d.lr,
-		optimizers.ParamAdamEpsilon:  1e-7,
+		optimizers.ParamOptimizer:       "adam",
+		optimizers.ParamLearningRate:    d.lr,
+		optimizers.ParamAdamEpsilon:     1e-7,
+		optimizers.ParamAdamWeightDecay: 1e-4,
 	})
 
 	d.initNetworks()

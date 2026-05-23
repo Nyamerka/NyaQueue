@@ -193,9 +193,10 @@ func (d *DQNScheduler) initGoMLX() {
 	d.backend = backends.MustNew()
 	d.ctx = context.New()
 	d.ctx.SetParams(map[string]any{
-		optimizers.ParamOptimizer:    "adam",
-		optimizers.ParamLearningRate: d.lr,
-		optimizers.ParamAdamEpsilon:  1e-7,
+		optimizers.ParamOptimizer:       "adam",
+		optimizers.ParamLearningRate:    d.lr,
+		optimizers.ParamAdamEpsilon:     1e-7,
+		optimizers.ParamAdamWeightDecay: 1e-4,
 	})
 
 	d.fwdExec = context.MustNewExec(d.backend, d.ctx, func(ctx *context.Context, state *Node) *Node {

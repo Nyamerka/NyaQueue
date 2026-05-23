@@ -163,8 +163,8 @@ func AllScenarios() Scenarios {
 		GrowingLoad(),
 		MixedPriority(),
 		Overload(),
-		OverloadK32(),
 		OverloadK16(),
+		OverloadK32(),
 	}
 }
 

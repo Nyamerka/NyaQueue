@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"runtime"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -27,8 +28,8 @@ import (
 	_ "github.com/gomlx/gomlx/backends/simplego"
 )
 
-// DQNBalancer selects partitions via a DQN.
-// State: [partition_loads, predicted_loads, msg_rate, avg_msg_size]; Action: partition index.
+// DQNBalancer selects partitions via a DQN with softmax (Boltzmann) routing.
+// State: [partition_loads, predicted_loads, inflight, msg_rate, avg_msg_size]; Action: partition index.
 type policySnap struct {
 	state  []float64
 	action int
@@ -40,7 +41,6 @@ type DQNBalancer struct {
 
 	numPartitions int
 	hiddenSize    int
-	epsilon       float64
 	gamma         float64
 	lr            float64
 	huberDelta    float64
@@ -66,13 +66,7 @@ type DQNBalancer struct {
 	eg     *errgroup.Group
 	cancel stdctx.CancelFunc
 
-	fallbackRR        *RoundRobin
-	fallbackRatio     float64
-	loadThreshold     float64
-	baseThroughput    atomic.Int64
-	fallbackActive    atomic.Bool
-	epsilonSuppressed atomic.Bool
-	adaptiveEpsilon   atomic.Uint64
+	fallbackP2C *PowerOfTwoChoices
 
 	stateMu        *xsync.RBMutex
 	loads          []float64
@@ -91,8 +85,12 @@ type DQNBalancer struct {
 
 	lastProcessedGen atomic.Int64
 
-	consecutiveFallbackTicks int
-	consecutiveRecoveryTicks int
+	trainingSteps atomic.Int64
+	ewmaReward    atomic.Uint64 // float64 bits — differential reward baseline
+	peakReward    atomic.Uint64 // float64 bits — best EWMA seen (drift detection)
+
+	boosterMu *xsync.RBMutex
+	booster   atomic.Pointer[dqnBooster]
 
 	policyStateBuf []float64
 }
@@ -100,7 +98,6 @@ type DQNBalancer struct {
 // DQNOption configures a DQNBalancer.
 type DQNOption func(*DQNBalancer)
 
-func WithDQNEpsilon(e float64) DQNOption        { return func(d *DQNBalancer) { d.epsilon = e } }
 func WithDQNGamma(g float64) DQNOption          { return func(d *DQNBalancer) { d.gamma = g } }
 func WithDQNLearningRate(lr float64) DQNOption  { return func(d *DQNBalancer) { d.lr = lr } }
 func WithDQNHiddenSize(n int) DQNOption         { return func(d *DQNBalancer) { d.hiddenSize = n } }
@@ -108,19 +105,19 @@ func WithDQNHuberDelta(delta float64) DQNOption { return func(d *DQNBalancer) { 
 func WithDQNReplayBufSize(n int) DQNOption {
 	return func(d *DQNBalancer) { d.replayBuffer = nn.NewPrioritizedReplayBuffer(n, 0.6) }
 }
-func WithDQNBatchSize(n int) DQNOption         { return func(d *DQNBalancer) { d.batchSize = n } }
-func WithDQNMinReplay(n int) DQNOption         { return func(d *DQNBalancer) { d.minReplay = n } }
-func WithDQNFallbackRatio(r float64) DQNOption { return func(d *DQNBalancer) { d.fallbackRatio = r } }
-func WithDQNLoadThreshold(t float64) DQNOption { return func(d *DQNBalancer) { d.loadThreshold = t } }
-func WithDQNTrainEvery(n int) DQNOption        { return func(d *DQNBalancer) { d.trainEvery = n } }
+func WithDQNBatchSize(n int) DQNOption { return func(d *DQNBalancer) { d.batchSize = n } }
+func WithDQNMinReplay(n int) DQNOption { return func(d *DQNBalancer) { d.minReplay = n } }
+func WithDQNTrainEvery(n int) DQNOption {
+	return func(d *DQNBalancer) { d.trainEvery = n }
+}
 
 func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 	d := &DQNBalancer{
 		weightsMu:     xsync.NewRBMutex(),
 		stateMu:       xsync.NewRBMutex(),
+		boosterMu:     xsync.NewRBMutex(),
 		numPartitions: numPartitions,
 		hiddenSize:    DefaultDQNHiddenSize,
-		epsilon:       DefaultDQNEpsilon,
 		gamma:         DefaultDQNGamma,
 		lr:            DefaultDQNLearningRate,
 		huberDelta:    1.0,
@@ -128,9 +125,7 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 		minReplay:     DefaultDQNMinReplay,
 		trainEvery:    DefaultDQNTrainEvery,
 		replayBuffer:  nn.NewPrioritizedReplayBuffer(DefaultDQNReplayBufSize, 0.6),
-		fallbackRR:    NewRoundRobin(),
-		fallbackRatio: DefaultDQNFallbackRatio,
-		loadThreshold: DefaultDQNLoadThreshold,
+		fallbackP2C:   NewPowerOfTwoChoices(),
 		expCh:         make(chan nn.Transition, DefaultDQNExpChannelSize),
 
 		loads:          make([]float64, numPartitions),
@@ -144,7 +139,6 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 	d.stateSize = numPartitions*3 + 2
 	d.hiddenSize = max(DefaultDQNHiddenSize, d.stateSize*3)
 	d.policyStateBuf = make([]float64, d.stateSize)
-	d.adaptiveEpsilon.Store(math.Float64bits(d.epsilon))
 	d.betaSchedule = nn.NewBetaSchedule(0.4, 1.0, DefaultDQNReplayBufSize/d.batchSize)
 	d.normalizer = nn.NewRunningNormalizer(d.stateSize)
 	d.initGoMLX()
@@ -178,9 +172,10 @@ func (d *DQNBalancer) initGoMLX() {
 	d.backend = backends.MustNew()
 	d.ctx = context.New()
 	d.ctx.SetParams(map[string]any{
-		optimizers.ParamOptimizer:    "adam",
-		optimizers.ParamLearningRate: d.lr,
-		optimizers.ParamAdamEpsilon:  1e-7,
+		optimizers.ParamOptimizer:       "adam",
+		optimizers.ParamLearningRate:    d.lr,
+		optimizers.ParamAdamEpsilon:     1e-7,
+		optimizers.ParamAdamWeightDecay: DefaultDQNWeightDecay,
 	})
 
 	d.fwdExec = context.MustNewExec(d.backend, d.ctx, func(ctx *context.Context, state *Node) *Node {
@@ -259,6 +254,48 @@ func (d *DQNBalancer) forward(state []float64) []float64 {
 	return tensorToFloat64Slice(result)
 }
 
+// temperature returns the current Boltzmann temperature based on training progress.
+func (d *DQNBalancer) temperature() float64 {
+	steps := d.trainingSteps.Load()
+	if steps < dqnMinStepsForGreedy {
+		return dqnInitialTemperature
+	}
+	progress := float64(steps-dqnMinStepsForGreedy) / float64(dqnTempDecaySteps)
+	progress = math.Min(progress, 1.0)
+	return dqnInitialTemperature * math.Pow(dqnFinalTemperature/dqnInitialTemperature, progress)
+}
+
+// softmaxSelect samples a partition from Q-values using Boltzmann exploration.
+// At high τ the distribution is ~uniform; as τ→0 it converges to argmax.
+func (d *DQNBalancer) softmaxSelect(qValues []float64) int {
+	tau := d.temperature()
+	maxQ := slices.Max(qValues)
+
+	probs := make([]float64, len(qValues))
+	sum := 0.0
+	for i, q := range qValues {
+		probs[i] = math.Exp((q - maxQ) / tau)
+		sum += probs[i]
+	}
+	for i := range probs {
+		probs[i] /= sum
+	}
+
+	r := rand.Float64()
+	cumulative := 0.0
+	for i, p := range probs {
+		cumulative += p
+		if r <= cumulative {
+			return i
+		}
+	}
+	return len(qValues) - 1
+}
+
+func (d *DQNBalancer) shouldRecordExperience() bool {
+	return d.temperature() < dqnExperienceRecordThreshold
+}
+
 func (d *DQNBalancer) ensureInflight(n int) *[]atomic.Int64 {
 	for {
 		ptr := d.inflight.Load()
@@ -275,35 +312,27 @@ func (d *DQNBalancer) ensureInflight(n int) *[]atomic.Int64 {
 func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions int) int {
 	inf := d.ensureInflight(numPartitions)
 
-	if d.fallbackActive.Load() {
-		idx := d.fallbackRR.SelectPartition(topic, key, numPartitions)
-		(*inf)[idx].Add(1)
-		return idx
-	}
-
-	eps := d.adaptiveEpsilon.Load()
-	if !d.epsilonSuppressed.Load() && rand.Float64() < math.Float64frombits(eps) {
-		idx := rand.IntN(numPartitions)
-		(*inf)[idx].Add(1)
-		return idx
-	}
-
 	if cached := d.cachedQValues.Load(); cached != nil && len(*cached) >= numPartitions {
-		idx := argmax((*cached)[:numPartitions])
+		qv := (*cached)[:numPartitions]
+		if b := d.booster.Load(); b != nil {
+			qv = b.addResidual(qv)
+		}
+		idx := d.softmaxSelect(qv)
 		(*inf)[idx].Add(1)
 		return idx
 	}
 
-	idx := d.fallbackRR.SelectPartition(topic, key, numPartitions)
+	idx := d.fallbackP2C.SelectPartition(topic, key, numPartitions)
 	(*inf)[idx].Add(1)
 	return idx
 }
 
 func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
-	reward := computeReward(m)
+	reward := d.computeReward(m)
+
+	d.fallbackP2C.OnMetrics(m)
 
 	d.stateMu.Lock()
-
 	if len(m.PartitionLoads) > 0 {
 		if cap(d.loads) < len(m.PartitionLoads) {
 			d.loads = make([]float64, len(m.PartitionLoads))
@@ -320,65 +349,11 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 	}
 	d.msgRate = m.MsgRate
 	d.avgMsgSize = m.AvgMsgSize
-
-	shouldFallback := false
-
-	baseTP := float64(d.baseThroughput.Load())
-	if baseTP > 0 && m.Throughput < d.fallbackRatio*baseTP {
-		shouldFallback = true
-	}
-
-	if d.loadThreshold > 0 && len(m.PartitionLoads) > 0 {
-		meanLoad := 0.0
-		for _, l := range m.PartitionLoads {
-			meanLoad += l
-		}
-		meanLoad /= float64(len(m.PartitionLoads))
-		if meanLoad > d.loadThreshold {
-			shouldFallback = true
-		}
-	}
-
-	if len(m.PartitionLoads) > 1 {
-		meanLoad := 0.0
-		for _, l := range m.PartitionLoads {
-			meanLoad += l
-		}
-		meanLoad /= float64(len(m.PartitionLoads))
-		if meanLoad > 0 {
-			variance := 0.0
-			for _, l := range m.PartitionLoads {
-				diff := l - meanLoad
-				variance += diff * diff
-			}
-			cv := math.Sqrt(variance/float64(len(m.PartitionLoads))) / meanLoad
-			if cv > 0.15 {
-				shouldFallback = true
-			}
-		}
-	}
-
-	enterTicks := fallbackEnterTicks
-	if d.msgRate > dqnNormalRateThreshold*10 {
-		enterTicks = 1
-	}
-
-	if shouldFallback {
-		d.consecutiveRecoveryTicks = 0
-		d.consecutiveFallbackTicks++
-		d.epsilonSuppressed.Store(true)
-		if d.consecutiveFallbackTicks >= enterTicks {
-			d.fallbackActive.Store(true)
-		}
-	} else {
-		d.consecutiveFallbackTicks = 0
-		d.consecutiveRecoveryTicks++
-		if d.consecutiveRecoveryTicks >= fallbackExitTicks {
-			d.fallbackActive.Store(false)
-			d.epsilonSuppressed.Store(false)
-		}
-	}
 	d.stateMu.Unlock()
+
+	if !d.shouldRecordExperience() {
+		return
+	}
 
 	prev := d.prevSnap.Load()
 	curr := d.currSnap.Load()
@@ -399,10 +374,6 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 	}
 }
 
-func (d *DQNBalancer) SetBaseThroughput(t float64) {
-	d.baseThroughput.Store(int64(t))
-}
-
 func (d *DQNBalancer) SetPredictedLoads(predicted []float64) {
 	d.stateMu.Lock()
 	if cap(d.predictedLoads) < len(predicted) {
@@ -413,12 +384,16 @@ func (d *DQNBalancer) SetPredictedLoads(predicted []float64) {
 	d.stateMu.Unlock()
 }
 
-func (d *DQNBalancer) IsFallbackActive() bool {
-	return d.fallbackActive.Load()
-}
-
 func (d *DQNBalancer) DroppedExperience() int64 {
 	return d.droppedExperience.Load()
+}
+
+func (d *DQNBalancer) Temperature() float64 {
+	return d.temperature()
+}
+
+func (d *DQNBalancer) TrainingSteps() int64 {
+	return d.trainingSteps.Load()
 }
 
 func (d *DQNBalancer) OnPublishComplete(partition int) {
@@ -446,12 +421,12 @@ func (d *DQNBalancer) trainLoop(ctx stdctx.Context) {
 			steps++
 			if steps%d.trainEvery == 0 {
 				lastLoss = d.trainStep()
+				d.trainingSteps.Add(1)
 			}
 			if steps%100 == 0 {
-				eps := math.Float64frombits(d.adaptiveEpsilon.Load())
-				log.Printf("[dqn-bal] step=%d loss=%.4f ε=%.3f buf=%d/%d fallback=%v dropped=%d",
-					steps, lastLoss, eps, d.replayBuffer.Len(), d.replayBuffer.Cap(),
-					d.fallbackActive.Load(), d.droppedExperience.Load())
+				log.Printf("[dqn-bal] step=%d loss=%.4f τ=%.3f buf=%d/%d dropped=%d",
+					steps, lastLoss, d.temperature(), d.replayBuffer.Len(), d.replayBuffer.Cap(),
+					d.droppedExperience.Load())
 			}
 		case <-ctx.Done():
 			for {
@@ -466,23 +441,29 @@ func (d *DQNBalancer) trainLoop(ctx stdctx.Context) {
 	}
 }
 
+func (d *DQNBalancer) policyInterval() time.Duration {
+	srt := d.stateMu.RLock()
+	rate := d.msgRate
+	d.stateMu.RUnlock(srt)
+
+	if rate > 0 && rate < dqnLowRateThreshold {
+		return dqnSlowPolicyTickInterval
+	}
+	return dqnPolicyTickInterval
+}
+
 func (d *DQNBalancer) policyLoop(ctx stdctx.Context) {
-	ticker := newPolicyTicker()
+	ticker := time.NewTicker(dqnPolicyTickInterval)
 	defer ticker.Stop()
+
+	lastInterval := dqnPolicyTickInterval
 
 	for {
 		select {
 		case <-ticker.C:
 			srt := d.stateMu.RLock()
 			d.buildStateInto(d.policyStateBuf)
-			rate := d.msgRate
 			d.stateMu.RUnlock(srt)
-
-			eps := d.epsilon
-			if rate > dqnNormalRateThreshold {
-				eps = d.epsilon * (dqnNormalRateThreshold / rate)
-			}
-			d.adaptiveEpsilon.Store(math.Float64bits(eps))
 
 			rt := d.weightsMu.RLock()
 			qValues := d.forward(d.policyStateBuf)
@@ -501,6 +482,11 @@ func (d *DQNBalancer) policyLoop(ctx stdctx.Context) {
 
 			d.prevSnap.Store(d.currSnap.Load())
 			d.currSnap.Store(snap)
+
+			if newInterval := d.policyInterval(); newInterval != lastInterval {
+				ticker.Reset(newInterval)
+				lastInterval = newInterval
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -536,21 +522,15 @@ func (d *DQNBalancer) buildStateInto(dst []float64) {
 	d.normalizer.NormalizeInPlace(dst)
 }
 
-// computeReward produces a scalar signal for the DQN.
+// computeReward produces a differential reward signal for the DQN.
 //
-// Two orthogonal signals:
+// Base reward combines two orthogonal signals:
 //
-//	balance  = -CV(loads) ∈ [-1, 0], where CV = σ/μ (coefficient of variation).
-//	           CV is scale-invariant: a 10% spread at mean 0.2 is penalised the
-//	           same as a 10% spread at mean 0.8, which raw StdDev does not give.
-//	utility  = log1p(throughput/scale) / log1p(max/scale) ∈ [0, 1].
+//	balance  = -CV(loads) ∈ [-1, 0]
+//	utility  = log1p(throughput/scale) / log1p(max/scale) ∈ [0, 1]
 //
-// Adaptive weighting via load pressure (smooth, no discontinuity):
-//
-//	pressure = clamp(meanLoad / overloadThreshold, 0, 1)
-//	w_bal    = 0.5 + 0.45·pressure   (at zero load: 50/50; at overload: 95/5)
-//	reward   = w_bal·balance + (1 − w_bal)·utility
-func computeReward(m broker.Metrics) float64 {
+// Differential: reward = raw - ewma(raw). Positive = improving, negative = degrading.
+func (d *DQNBalancer) computeReward(m broker.Metrics) float64 {
 	if len(m.PartitionLoads) == 0 {
 		return 0
 	}
@@ -571,19 +551,31 @@ func computeReward(m broker.Metrics) float64 {
 	pressure := math.Min(meanLoad/dqnOverloadThreshold, 1.0)
 	balanceW := dqnBaseBalanceWeight + (dqnMaxBalanceWeight-dqnBaseBalanceWeight)*pressure
 
-	reward := balanceW*balancePenalty + (1-balanceW)*utilityReward
+	rawReward := balanceW*balancePenalty + (1-balanceW)*utilityReward
 
 	var totalDepth int
-	for _, d := range m.QueueDepth {
-		totalDepth += d
+	for _, dep := range m.QueueDepth {
+		totalDepth += dep
 	}
 	if totalDepth > 0 {
 		normalized := float64(totalDepth) / dqnDepthSoftCap
 		depthPenalty := -math.Min(normalized*normalized, 1.0)
-		reward += dqnDepthWeight * depthPenalty
+		rawReward += dqnDepthWeight * depthPenalty
 	}
 
-	return reward
+	prevEWMA := math.Float64frombits(d.ewmaReward.Load())
+	diff := rawReward - prevEWMA
+	newEWMA := prevEWMA + dqnRewardEWMAAlpha*(rawReward-prevEWMA)
+	d.ewmaReward.Store(math.Float64bits(newEWMA))
+
+	peak := math.Float64frombits(d.peakReward.Load())
+	if newEWMA > peak {
+		d.peakReward.Store(math.Float64bits(newEWMA))
+	} else if peak > 0 && newEWMA < peak*dqnDriftThreshold {
+		d.handleDrift()
+	}
+
+	return diff
 }
 
 func (d *DQNBalancer) trainStep() float64 {
@@ -674,10 +666,6 @@ func argmax(s []float64) int {
 		}
 	}
 	return best
-}
-
-func newPolicyTicker() *time.Ticker {
-	return time.NewTicker(dqnPolicyTickInterval)
 }
 
 func tensorToFloat64Slice(t *tensors.Tensor) []float64 {

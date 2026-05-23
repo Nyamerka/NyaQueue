@@ -269,12 +269,9 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		}
 
 		warmupSc := sc
+		warmupSc.Duration = warmup
 		if warmupSc.RatePerSec == 0 {
-			warmupSc.RatePerSec = 5000 * warmupSc.Producers
-		}
-		if warmupSc.Producers > 4 {
-			warmupSc.Producers = 4
-			warmupSc.RatePerSec = min(warmupSc.RatePerSec, 20000)
+			warmupSc.RatePerSec = 5000 * min(warmupSc.Producers, topicCfg.NumPartitions)
 		}
 
 		log.Printf("  [dqn-warmup] running %v warmup for %s/%s (k=%d, rate=%d, producers=%d) ...",
