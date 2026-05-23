@@ -135,28 +135,49 @@ func (h *KafkaHarness) writerFor(topic string) *kafka.Writer {
 func (h *KafkaHarness) Consume(ctx context.Context, topic, group string, partition int, maxBytes int) ([]Message, error) {
 	r := h.readerFor(topic, group, partition, maxBytes)
 
-	msg, err := r.ReadMessage(ctx)
-	if err != nil {
-		return nil, oops.Wrapf(err, "kafka read topic=%q part=%d", topic, partition)
+	msgs := make([]Message, 0, 16)
+	for i := 0; i < 16; i++ {
+		msg, err := r.FetchMessage(ctx)
+		if err != nil {
+			if len(msgs) > 0 {
+				break
+			}
+			return nil, oops.Wrapf(err, "kafka fetch topic=%q part=%d", topic, partition)
+		}
+		msgs = append(msgs, Message{
+			Key:    msg.Key,
+			Value:  msg.Value,
+			Offset: msg.Offset,
+		})
 	}
-	return []Message{{
-		Key:    msg.Key,
-		Value:  msg.Value,
-		Offset: msg.Offset,
-	}}, nil
+	if len(msgs) > 0 {
+		last := msgs[len(msgs)-1]
+		_ = r.CommitMessages(ctx, kafka.Message{
+			Topic:     topic,
+			Partition: partition,
+			Offset:    last.Offset,
+		})
+	}
+	return msgs, nil
 }
 
 func (h *KafkaHarness) readerFor(topic, group string, partition, maxBytes int) *kafka.Reader {
 	rk := readerKey{topic: topic, group: group, partition: partition}
 	r, _ := h.readers.LoadOrCompute(rk, func() *kafka.Reader {
-		return kafka.NewReader(kafka.ReaderConfig{
-			Brokers:     h.brokers,
-			Topic:       topic,
-			Partition:   partition,
-			MaxBytes:    maxBytes,
-			MaxWait:     10 * time.Millisecond,
-			StartOffset: kafka.FirstOffset,
-		})
+		cfg := kafka.ReaderConfig{
+			Brokers:        h.brokers,
+			Topic:          topic,
+			MaxBytes:       maxBytes,
+			MaxWait:        10 * time.Millisecond,
+			CommitInterval: 0,
+		}
+		if group != "" {
+			cfg.GroupID = group
+		} else {
+			cfg.Partition = partition
+			cfg.StartOffset = kafka.FirstOffset
+		}
+		return kafka.NewReader(cfg)
 	})
 	return r
 }

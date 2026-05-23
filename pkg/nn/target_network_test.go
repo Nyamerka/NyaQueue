@@ -33,31 +33,12 @@ func buildTestNetwork(ctx *context.Context, state *Node) *Node {
 	return Reshape(q, 4)
 }
 
-func (s *TargetNetworkSuite) TestSoftUpdateInterpolates() {
+func (s *TargetNetworkSuite) TestHardSyncCopiesWeights() {
 	mainCtx := context.New()
 	fwd := context.MustNewExec(s.backend, mainCtx, buildTestNetwork)
 	fwd.MustExec(make([]float64, 8))
 
-	tn := NewTargetNetwork(mainCtx, WithTau(0.5), WithSyncEvery(1))
-
-	var initialTargetWeights []float64
-	tn.targetCtx.EnumerateVariables(func(v *context.Variable) {
-		if v.Trainable {
-			val := v.MustValue()
-			val.MustConstFlatData(func(flat any) {
-				switch f := flat.(type) {
-				case []float32:
-					for _, x := range f {
-						initialTargetWeights = append(initialTargetWeights, float64(x))
-					}
-				case []float64:
-					cp := make([]float64, len(f))
-					copy(cp, f)
-					initialTargetWeights = append(initialTargetWeights, cp...)
-				}
-			})
-		}
-	})
+	tn := NewTargetNetwork(mainCtx, WithSyncEvery(1))
 
 	mainCtx.EnumerateVariables(func(v *context.Variable) {
 		if v.Trainable {
@@ -77,9 +58,8 @@ func (s *TargetNetworkSuite) TestSoftUpdateInterpolates() {
 		}
 	})
 
-	tn.SoftUpdate()
+	tn.HardSync()
 
-	idx := 0
 	tn.targetCtx.EnumerateVariables(func(v *context.Variable) {
 		if !v.Trainable {
 			return
@@ -89,22 +69,17 @@ func (s *TargetNetworkSuite) TestSoftUpdateInterpolates() {
 			switch f := flat.(type) {
 			case []float32:
 				for _, w := range f {
-					expected := 0.5*100.0 + 0.5*initialTargetWeights[idx]
-					require.InDelta(s.T(), expected, float64(w), 0.01,
-						"after soft update with τ=0.5, weight should be interpolated")
-					idx++
+					require.InDelta(s.T(), 100.0, float64(w), 0.01,
+						"after hard sync, target weight should equal main weight")
 				}
 			case []float64:
 				for _, w := range f {
-					expected := 0.5*100.0 + 0.5*initialTargetWeights[idx]
-					require.InDelta(s.T(), expected, w, 0.01,
-						"after soft update with τ=0.5, weight should be interpolated")
-					idx++
+					require.InDelta(s.T(), 100.0, w, 0.01,
+						"after hard sync, target weight should equal main weight")
 				}
 			}
 		})
 	})
-	require.Greater(s.T(), idx, 0, "should have checked at least some weights")
 }
 
 func (s *TargetNetworkSuite) TestTargetCtxIndependentFromMain() {

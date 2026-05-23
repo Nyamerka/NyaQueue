@@ -4,9 +4,7 @@ import (
 	stdctx "context"
 	"log"
 	"math"
-	"math/rand/v2"
 	"runtime"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,19 +38,61 @@ type policySnap struct {
 	gen    int64
 }
 
+type nStepBuffer struct {
+	queue []nn.Transition
+	n     int
+	gamma float64
+}
+
+func newNStepBuffer(n int, gamma float64) *nStepBuffer {
+	return &nStepBuffer{
+		queue: make([]nn.Transition, 0, n),
+		n:     n,
+		gamma: gamma,
+	}
+}
+
+func (b *nStepBuffer) Push(t nn.Transition) (nn.Transition, bool) {
+	b.queue = append(b.queue, t)
+	if len(b.queue) < b.n {
+		return nn.Transition{}, false
+	}
+	first := b.queue[0]
+	gPow := 1.0
+	var R float64
+	for _, tr := range b.queue {
+		R += gPow * tr.Reward
+		gPow *= b.gamma
+	}
+	out := nn.Transition{
+		State:     first.State,
+		Action:    first.Action,
+		Reward:    R,
+		NextState: b.queue[b.n-1].NextState,
+		Done:      b.queue[b.n-1].Done,
+	}
+	b.queue = b.queue[1:]
+	return out, true
+}
+
+func (b *nStepBuffer) Reset() {
+	b.queue = b.queue[:0]
+}
+
 // DQNBalancer selects partitions via a DQN with softmax (Boltzmann) routing.
 // State: [partition_loads, predicted_loads, inflight, msg_rate, avg_msg_size]; Action: partition index.
 type DQNBalancer struct {
 	weightsMu *xsync.RBMutex
 
-	numPartitions int
-	hiddenSize    int
-	gamma         float64
-	lr            float64
-	huberDelta    float64
-	batchSize     int
-	minReplay     int
-	trainEvery    int
+	numPartitions  int
+	hiddenSize     int
+	gamma          float64
+	lr             float64
+	huberDelta     float64
+	batchSize      int
+	minReplay      int
+	trainEvery     int
+	updatesPerStep int
 
 	backend               backends.Backend
 	ctx                   *context.Context
@@ -77,8 +117,10 @@ type DQNBalancer struct {
 	stateMu        *xsync.RBMutex
 	loads          []float64
 	predictedLoads []float64
+	queueDepth     []int
 	msgRate        float64
 	avgMsgSize     float64
+	consumeRate    float64
 
 	droppedExperience atomic.Int64
 	inflight          atomic.Pointer[[]atomic.Int64]
@@ -92,9 +134,24 @@ type DQNBalancer struct {
 	lastProcessedGen atomic.Int64
 
 	trainingSteps atomic.Int64
-	ewmaReward    atomic.Uint64 // float64 bits — differential reward baseline
 
-	rewardNorm rewardNormalizer
+	nStep *nStepBuffer
+
+	popArt struct {
+		mu    sync.Mutex
+		mean  float64
+		m2    float64
+		count int64
+	}
+
+	trainBuf struct {
+		states     []float64
+		nextStates []float64
+		actions    []float64
+		rewards    []float64
+		dones      []float64
+		targets    []float64
+	}
 
 	policyStateBuf []float64
 }
@@ -117,19 +174,20 @@ func WithDQNTrainEvery(n int) DQNOption {
 
 func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 	d := &DQNBalancer{
-		weightsMu:     xsync.NewRBMutex(),
-		stateMu:       xsync.NewRBMutex(),
-		numPartitions: numPartitions,
-		hiddenSize:    DefaultDQNHiddenSize,
-		gamma:         DefaultDQNGamma,
-		lr:            DefaultDQNLearningRate,
-		huberDelta:    1.0,
-		batchSize:     DefaultDQNBatchSize,
-		minReplay:     DefaultDQNMinReplay,
-		trainEvery:    DefaultDQNTrainEvery,
-		replayBuffer:  nn.NewPrioritizedReplayBuffer(DefaultDQNReplayBufSize, 0.6),
-		fallbackP2C:   NewPowerOfTwoChoices(),
-		expCh:         make(chan nn.Transition, DefaultDQNExpChannelSize),
+		weightsMu:      xsync.NewRBMutex(),
+		stateMu:        xsync.NewRBMutex(),
+		numPartitions:  numPartitions,
+		hiddenSize:     DefaultDQNHiddenSize,
+		gamma:          DefaultDQNGamma,
+		lr:             DefaultDQNLearningRate,
+		huberDelta:     1.0,
+		batchSize:      DefaultDQNBatchSize,
+		minReplay:      DefaultDQNMinReplay,
+		trainEvery:     DefaultDQNTrainEvery,
+		updatesPerStep: DefaultDQNUpdatesPerStep,
+		replayBuffer:   nn.NewPrioritizedReplayBuffer(DefaultDQNReplayBufSize, 0.6),
+		fallbackP2C:    NewPowerOfTwoChoices(),
+		expCh:          make(chan nn.Transition, DefaultDQNExpChannelSize),
 
 		loads:          make([]float64, numPartitions),
 		predictedLoads: make([]float64, numPartitions),
@@ -139,11 +197,12 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 		opt(d)
 	}
 
-	d.stateSize = numPartitions*3 + 2
-	d.hiddenSize = max(DefaultDQNHiddenSize, d.stateSize*3)
+	d.stateSize = numPartitions*4 + 4
+	d.hiddenSize = max(DefaultDQNHiddenSize, d.stateSize*2)
 	d.policyStateBuf = make([]float64, d.stateSize)
 	d.betaSchedule = nn.NewBetaSchedule(0.4, 1.0, DefaultDQNReplayBufSize/d.batchSize)
 	d.normalizer = nn.NewRunningNormalizer(d.stateSize)
+	d.nStep = newNStepBuffer(3, d.gamma)
 	d.initGoMLX()
 
 	ctx, cancel := stdctx.WithCancel(stdctx.Background())
@@ -253,101 +312,13 @@ func (d *DQNBalancer) qNetworkGraph(ctx *context.Context, state *Node) *Node {
 }
 
 func (d *DQNBalancer) forward(state []float64) []float64 {
-	result := d.fwdExec.MustExec1(state)
+	buf := float64BufPool.Get().(*[]float64)
+	norm := (*buf)[:len(state)]
+	copy(norm, state)
+	d.normalizer.NormalizeInPlace(norm)
+	result := d.fwdExec.MustExec1(norm)
+	float64BufPool.Put(buf)
 	return tensorToFloat64Slice(result)
-}
-
-// temperature returns the current Boltzmann temperature based on training progress,
-// with a rate-adaptive floor that prevents hotspotting at high throughput.
-func (d *DQNBalancer) temperature() float64 {
-	steps := d.trainingSteps.Load()
-	if steps < dqnMinStepsForGreedy {
-		return dqnInitialTemperature
-	}
-	progress := float64(steps-dqnMinStepsForGreedy) / float64(dqnTempDecaySteps)
-	progress = math.Min(progress, 1.0)
-	base := dqnInitialTemperature * math.Pow(dqnFinalTemperature/dqnInitialTemperature, progress)
-
-	srt := d.stateMu.RLock()
-	rate := d.msgRate
-	d.stateMu.RUnlock(srt)
-
-	if rate > 0 {
-		msgsPerTick := rate * dqnPolicyTickInterval.Seconds()
-		if msgsPerTick > 100 {
-			floor := 0.05 * math.Log10(msgsPerTick/100) / math.Log2(float64(d.numPartitions))
-			if base < floor {
-				base = floor
-			}
-		}
-	}
-	return base
-}
-
-// softmaxSelect samples a partition from Q-values using Boltzmann exploration.
-// At high τ the distribution is ~uniform; as τ→0 it converges to argmax.
-func (d *DQNBalancer) softmaxSelect(qValues []float64) int {
-	bp := float64BufPool.Get().(*[]float64)
-	probs := (*bp)[:len(qValues)]
-	idx := d.softmaxSelectWith(qValues, probs)
-	float64BufPool.Put(bp)
-	return idx
-}
-
-// softmaxSelectWith samples using a caller-provided probs buffer (zero-alloc).
-func (d *DQNBalancer) softmaxSelectWith(qValues, probs []float64) int {
-	tau := d.temperature()
-	maxQ := slices.Max(qValues)
-	probs = probs[:len(qValues)]
-
-	sum := 0.0
-	for i, q := range qValues {
-		probs[i] = math.Exp((q - maxQ) / tau)
-		sum += probs[i]
-	}
-	for i := range probs {
-		probs[i] /= sum
-	}
-
-	r := rand.Float64()
-	cumulative := 0.0
-	for i, p := range probs {
-		cumulative += p
-		if r <= cumulative {
-			return i
-		}
-	}
-	return len(qValues) - 1
-}
-
-// inflightAdjustInto writes inflight-penalized Q-values into dst.
-// Uses logarithmic penalty with a 2× mean activation threshold:
-// - Only penalizes partitions with significantly more than fair share (ratio > 2.0)
-// - log(ratio) provides soft dampening instead of aggressive elimination
-// - Scaled by τ: at lower τ (more greedy) stronger correction, preventing stale routing
-func (d *DQNBalancer) inflightAdjustInto(dst, qv []float64, inf *[]atomic.Int64, n int) {
-	var totalInflight int64
-	for i := 0; i < n; i++ {
-		totalInflight += (*inf)[i].Load()
-	}
-	if totalInflight == 0 {
-		copy(dst[:n], qv[:n])
-		return
-	}
-
-	meanInflight := float64(totalInflight) / float64(n)
-	tau := d.temperature()
-
-	for i := 0; i < n; i++ {
-		infl := float64((*inf)[i].Load())
-		ratio := infl / max(meanInflight, 1.0)
-
-		if ratio > 2.0 {
-			dst[i] = qv[i] - tau*math.Log(ratio)
-		} else {
-			dst[i] = qv[i]
-		}
-	}
 }
 
 func (d *DQNBalancer) shouldRecordExperience() bool {
@@ -371,25 +342,7 @@ func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions in
 	inf := d.ensureInflight(numPartitions)
 
 	if cached := d.cachedQValues.Load(); cached != nil && len(*cached) >= numPartitions {
-		qv := (*cached)[:numPartitions]
-
-		bp := float64BufPool.Get().(*[]float64)
-		buf := *bp
-		probs := buf[numPartitions : numPartitions*2]
-
-		tau := d.temperature()
-		var selected []float64
-		if tau < dqnInflightPenaltyThreshold {
-			adjusted := buf[:numPartitions]
-			d.inflightAdjustInto(adjusted, qv, inf, numPartitions)
-			selected = adjusted
-		} else {
-			selected = qv
-		}
-
-		idx := d.softmaxSelectWith(selected, probs)
-
-		float64BufPool.Put(bp)
+		idx := argmax((*cached)[:numPartitions])
 		(*inf)[idx].Add(1)
 		return idx
 	}
@@ -419,8 +372,16 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 		d.predictedLoads = d.predictedLoads[:len(m.PredictedLoads)]
 		copy(d.predictedLoads, m.PredictedLoads)
 	}
+	if len(m.QueueDepth) > 0 {
+		if cap(d.queueDepth) < len(m.QueueDepth) {
+			d.queueDepth = make([]int, len(m.QueueDepth))
+		}
+		d.queueDepth = d.queueDepth[:len(m.QueueDepth)]
+		copy(d.queueDepth, m.QueueDepth)
+	}
 	d.msgRate = m.MsgRate
 	d.avgMsgSize = m.AvgMsgSize
+	d.consumeRate = m.ConsumeRate
 	d.stateMu.Unlock()
 
 	if !d.shouldRecordExperience() {
@@ -431,17 +392,19 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 	curr := d.currSnap.Load()
 	if prev != nil && curr != nil && curr.gen > d.lastProcessedGen.Load() {
 		d.lastProcessedGen.Store(curr.gen)
-		t := nn.Transition{
+		raw := nn.Transition{
 			State:     append([]float64(nil), prev.state...),
 			Action:    []float64{float64(prev.action)},
 			Reward:    reward,
 			NextState: append([]float64(nil), curr.state...),
 			Done:      false,
 		}
-		select {
-		case d.expCh <- t:
-		default:
-			d.droppedExperience.Add(1)
+		if multi, ok := d.nStep.Push(raw); ok {
+			select {
+			case d.expCh <- multi:
+			default:
+				d.droppedExperience.Add(1)
+			}
 		}
 	}
 }
@@ -461,7 +424,7 @@ func (d *DQNBalancer) DroppedExperience() int64 {
 }
 
 func (d *DQNBalancer) Temperature() float64 {
-	return d.temperature()
+	return 0
 }
 
 func (d *DQNBalancer) TrainingSteps() int64 {
@@ -492,12 +455,14 @@ func (d *DQNBalancer) trainLoop(ctx stdctx.Context) {
 			d.replayBuffer.Push(t)
 			steps++
 			if steps%d.trainEvery == 0 {
-				lastLoss = d.trainStep()
-				d.trainingSteps.Add(1)
+				for u := 0; u < d.updatesPerStep; u++ {
+					lastLoss = d.trainStep()
+					d.trainingSteps.Add(1)
+				}
 			}
 			if steps%100 == 0 {
-				log.Printf("[dqn-bal] step=%d loss=%.4f τ=%.3f buf=%d/%d dropped=%d",
-					steps, lastLoss, d.temperature(), d.replayBuffer.Len(), d.replayBuffer.Cap(),
+				log.Printf("[dqn-bal] step=%d loss=%.4f buf=%d/%d dropped=%d",
+					steps, lastLoss, d.replayBuffer.Len(), d.replayBuffer.Cap(),
 					d.droppedExperience.Load())
 			}
 		case <-ctx.Done():
@@ -582,26 +547,38 @@ func (d *DQNBalancer) buildStateInto(dst []float64) {
 		}
 	}
 
-	idx := d.numPartitions * 3
+	depthBase := d.numPartitions * 3
+	for i := 0; i < d.numPartitions && i < len(d.queueDepth); i++ {
+		if depthBase+i < len(dst) {
+			dst[depthBase+i] = float64(d.queueDepth[i]) / dqnDepthFeatureScale
+		}
+	}
+
+	idx := d.numPartitions * 4
 	if idx < len(dst) {
 		dst[idx] = d.msgRate / dqnMsgRateScale
 	}
 	if idx+1 < len(dst) {
 		dst[idx+1] = d.avgMsgSize / dqnMsgSizeScale
 	}
+	if idx+2 < len(dst) {
+		dst[idx+2] = d.consumeRate / dqnMsgRateScale
+	}
+	if idx+3 < len(dst) && d.consumeRate > 0 {
+		dst[idx+3] = d.msgRate / d.consumeRate
+	}
 
 	d.normalizer.Observe(dst)
-	d.normalizer.NormalizeInPlace(dst)
 }
 
-// computeReward produces a differential reward signal for the DQN.
+// computeReward produces a direct shaped reward signal for the DQN.
 //
 // Base reward combines two orthogonal signals:
 //
 //	balance  = -CV(loads) ∈ [-1, 0]
 //	utility  = log1p(throughput/scale) / log1p(max/scale) ∈ [0, 1]
 //
-// Differential: reward = raw - ewma(raw). Positive = improving, negative = degrading.
+// No EWMA-diff: raw ∈ [-1.3, 1.0] — already scaled for learning.
 func (d *DQNBalancer) computeReward(m broker.Metrics) float64 {
 	if len(m.PartitionLoads) == 0 {
 		return 0
@@ -623,7 +600,7 @@ func (d *DQNBalancer) computeReward(m broker.Metrics) float64 {
 	pressure := math.Min(meanLoad/dqnOverloadThreshold, 1.0)
 	balanceW := dqnBaseBalanceWeight + (dqnMaxBalanceWeight-dqnBaseBalanceWeight)*pressure
 
-	rawReward := balanceW*balancePenalty + (1-balanceW)*utilityReward
+	raw := balanceW*balancePenalty + (1-balanceW)*utilityReward
 
 	var totalDepth int
 	for _, dep := range m.QueueDepth {
@@ -631,54 +608,22 @@ func (d *DQNBalancer) computeReward(m broker.Metrics) float64 {
 	}
 	if totalDepth > 0 {
 		normalized := float64(totalDepth) / dqnDepthSoftCap
-		depthPenalty := -math.Min(normalized*normalized, 1.0)
-		rawReward += dqnDepthWeight * depthPenalty
+		raw -= dqnDepthWeight * math.Min(normalized*normalized, 1.0)
 	}
 
-	prevEWMA := math.Float64frombits(d.ewmaReward.Load())
-	diff := rawReward - prevEWMA
-	newEWMA := prevEWMA + dqnRewardEWMAAlpha*(rawReward-prevEWMA)
-	d.ewmaReward.Store(math.Float64bits(newEWMA))
-
-	return d.rewardNorm.normalize(diff)
+	return raw
 }
 
-// rewardNormalizer applies Z-score normalization using Welford's online algorithm.
-// Ensures gradient signal remains strong even when raw reward is near zero.
-type rewardNormalizer struct {
-	count int64
-	mean  float64
-	m2    float64
-}
-
-func (rn *rewardNormalizer) normalize(raw float64) float64 {
-	rn.count++
-	delta := raw - rn.mean
-	rn.mean += delta / float64(rn.count)
-	delta2 := raw - rn.mean
-	rn.m2 += delta * delta2
-
-	if rn.count < 10 {
-		return raw
-	}
-	std := math.Sqrt(rn.m2 / float64(rn.count-1))
-	if std < 1e-8 {
-		return 0
-	}
-	return (raw - rn.mean) / std
-}
-
-func (rn *rewardNormalizer) Reset() {
-	rn.count = 0
-	rn.mean = 0
-	rn.m2 = 0
-}
-
-// ResetForNewScenario resets accumulated reward statistics for a clean training signal.
+// ResetForNewScenario resets accumulated statistics for a clean training signal.
 // Should be called before each new scenario warmup to prevent cross-scenario pollution.
 func (d *DQNBalancer) ResetForNewScenario() {
-	d.rewardNorm.Reset()
-	d.ewmaReward.Store(math.Float64bits(0))
+	d.normalizer.Reset()
+	d.nStep.Reset()
+	d.popArt.mu.Lock()
+	d.popArt.mean = 0
+	d.popArt.m2 = 0
+	d.popArt.count = 0
+	d.popArt.mu.Unlock()
 }
 
 func (d *DQNBalancer) trainStep() float64 {
@@ -693,23 +638,41 @@ func (d *DQNBalancer) trainStep() float64 {
 		return 0
 	}
 
-	statesBuf := make([]float64, bs*d.stateSize)
-	nextStatesBuf := make([]float64, bs*d.stateSize)
-	actions := make([]float64, bs)
-	rewards := make([]float64, bs)
-	dones := make([]float64, bs)
+	n := bs * d.stateSize
+	if cap(d.trainBuf.states) < n {
+		d.trainBuf.states = make([]float64, n)
+		d.trainBuf.nextStates = make([]float64, n)
+	}
+	if cap(d.trainBuf.actions) < bs {
+		d.trainBuf.actions = make([]float64, bs)
+		d.trainBuf.rewards = make([]float64, bs)
+		d.trainBuf.dones = make([]float64, bs)
+		d.trainBuf.targets = make([]float64, bs)
+	}
+	statesBuf := d.trainBuf.states[:n]
+	nextStatesBuf := d.trainBuf.nextStates[:n]
+	actions := d.trainBuf.actions[:bs]
+	rewards := d.trainBuf.rewards[:bs]
+	dones := d.trainBuf.dones[:bs]
 
 	for i, t := range batch {
 		copy(statesBuf[i*d.stateSize:], padOrTrunc(t.State, d.stateSize))
 		copy(nextStatesBuf[i*d.stateSize:], padOrTrunc(t.NextState, d.stateSize))
 		if len(t.Action) > 0 {
 			actions[i] = t.Action[0]
+		} else {
+			actions[i] = 0
 		}
 		rewards[i] = t.Reward
 		if t.Done {
 			dones[i] = 1.0
+		} else {
+			dones[i] = 0
 		}
 	}
+
+	d.normalizer.NormalizeBatch(statesBuf, bs)
+	d.normalizer.NormalizeBatch(nextStatesBuf, bs)
 
 	statesT := tensors.FromFlatDataAndDimensions(statesBuf, bs, d.stateSize)
 	nextStatesT := tensors.FromFlatDataAndDimensions(nextStatesBuf, bs, d.stateSize)
@@ -723,9 +686,31 @@ func (d *DQNBalancer) trainStep() float64 {
 
 	maxNextQ := tensorToFloat64Slice(nextQT)
 	currentQ := tensorToFloat64Slice(currentQT)
-	targets := make([]float64, bs)
+	gammaPow := math.Pow(d.gamma, float64(d.nStep.n))
+	targets := d.trainBuf.targets[:bs]
 	for i := range batch {
-		targets[i] = rewards[i] + d.gamma*maxNextQ[i]*(1-dones[i])
+		targets[i] = rewards[i] + gammaPow*maxNextQ[i]*(1-dones[i])
+	}
+
+	// PopArt-lite: normalize targets for stable gradient signal.
+	d.popArt.mu.Lock()
+	for _, t := range targets {
+		d.popArt.count++
+		delta := t - d.popArt.mean
+		d.popArt.mean += delta / float64(d.popArt.count)
+		d.popArt.m2 += delta * (t - d.popArt.mean)
+	}
+	paMean := d.popArt.mean
+	var paSigma float64
+	if d.popArt.count > 1 {
+		paSigma = math.Sqrt(d.popArt.m2/float64(d.popArt.count-1)) + 1e-8
+	} else {
+		paSigma = 1.0
+	}
+	d.popArt.mu.Unlock()
+
+	for i := range targets {
+		targets[i] = (targets[i] - paMean) / paSigma
 	}
 
 	for i, idx := range indices {

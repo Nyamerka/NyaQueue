@@ -78,8 +78,14 @@ func main() {
 		Duration:       duration,
 	}
 	runner.OnScenarioComplete = func(results []experiments.ExperimentResult) {
-		_ = experiments.ExportCSV(results, outputDir)
-		_ = experiments.ExportJSON(results, outputDir)
+		if err := experiments.ExportCSV(results, outputDir); err != nil {
+			log.Printf("[incremental] CSV export FAILED: %v", err)
+			return
+		}
+		if err := experiments.ExportJSON(results, outputDir); err != nil {
+			log.Printf("[incremental] JSON export FAILED: %v", err)
+			return
+		}
 		log.Printf("[incremental] saved %d results to %s", len(results), outputDir)
 	}
 

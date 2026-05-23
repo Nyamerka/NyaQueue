@@ -50,6 +50,5 @@ FROM base AS experiment
 COPY --from=builder /bin/broker /usr/local/bin/broker
 COPY --from=builder /bin/experiment /usr/local/bin/experiment
 COPY deploy/configs/broker.yaml /etc/nyaqueue/config.yaml
-RUN mkdir -p /results && chown -R nyaqueue:nyaqueue /results
-USER nyaqueue
+RUN mkdir -p /results
 ENTRYPOINT ["experiment"]

@@ -258,6 +258,8 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	}
 	h.SetManagedTopic(topic)
 
+	// Apply the balancer and scheduler for this algorithm.
+	h.SwitchBalancer(alg, topicCfg.NumPartitions)
 	if brk := h.Broker(); brk != nil {
 		brk.SetScheduler(topic, alg.NewScheduler())
 	}

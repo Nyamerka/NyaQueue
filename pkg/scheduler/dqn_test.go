@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
-	"github.com/Nyamerka/NyaQueue/pkg/nn"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
@@ -28,7 +27,7 @@ func (s *DQNSchedSuite) TestSelectsFromPriorityIndex() {
 		require.NoError(s.T(), err)
 	}
 
-	dqn := NewDQNScheduler(WithDQNSchedEpsilon(0.0))
+	dqn := NewDQNScheduler()
 	defer dqn.Stop()
 	msg, _, err := dqn.Next(p, 0)
 	require.NoError(s.T(), err)
@@ -41,7 +40,6 @@ func (s *DQNSchedSuite) TestFunctionalOptions() {
 		opts []DQNSchedOption
 	}{
 		{"default", nil},
-		{"custom_epsilon", []DQNSchedOption{WithDQNSchedEpsilon(0.1)}},
 		{"custom_gamma", []DQNSchedOption{WithDQNSchedGamma(0.95)}},
 		{"custom_hidden", []DQNSchedOption{WithDQNSchedHiddenSize(32)}},
 		{"custom_lr", []DQNSchedOption{WithDQNSchedLearningRate(0.01)}},
@@ -69,10 +67,8 @@ func (s *DQNSchedSuite) TestOnMetrics() {
 		_, _ = p.Append(broker.NewMessage(5, []byte("k"), []byte("v")))
 	}
 
-	// Call Next to let policyLoop discover the PriorityIndex.
 	_, _, _ = dqn.Next(p, 0)
 
-	// Wait for policyLoop to produce snapshots from the cached PI.
 	require.Eventually(s.T(), func() bool {
 		return dqn.prevSnap.Load() != nil && dqn.currSnap.Load() != nil
 	}, 2*time.Second, 10*time.Millisecond)
@@ -128,10 +124,9 @@ func (s *DQNSchedSuite) TestAsyncTrainingDoesNotBlockInference() {
 		require.NoError(s.T(), err)
 	}
 
-	dqn := NewDQNScheduler(WithDQNSchedEpsilon(0.5))
+	dqn := NewDQNScheduler()
 	defer dqn.Stop()
 
-	// Call Next to feed PI to policyLoop.
 	_, _, _ = dqn.Next(p, 0)
 	require.Eventually(s.T(), func() bool {
 		return dqn.prevSnap.Load() != nil
@@ -159,7 +154,6 @@ func (s *DQNSchedSuite) TestBellmanUsesCorrectNextState() {
 		_, _ = p.Append(broker.NewMessage(uint8(i%10), []byte("k"), []byte("v")))
 	}
 
-	// Call Next to let policyLoop discover PI.
 	_, _, _ = dqn.Next(p, 0)
 
 	require.Eventually(s.T(), func() bool {
@@ -183,7 +177,7 @@ func (s *DQNSchedSuite) TestConcurrentNextAndOnMetrics() {
 		require.NoError(s.T(), err)
 	}
 
-	dqn := NewDQNScheduler(WithDQNSchedEpsilon(0.5))
+	dqn := NewDQNScheduler()
 	defer dqn.Stop()
 
 	var wg sync.WaitGroup
@@ -208,7 +202,6 @@ func (s *DQNSchedSuite) TestRewardHighPriorityWeightedMore() {
 	dqn := NewDQNScheduler()
 	defer dqn.Stop()
 
-	// Scenario A: P0 (highest) slow 1s, P9 (lowest) fast 0.01s.
 	dqn.latencySums[0].Store(uint64(1 * 1e9))
 	dqn.latencyCounts[0].Store(1)
 	dqn.latencySums[9].Store(uint64(0.01 * 1e9))
@@ -221,7 +214,6 @@ func (s *DQNSchedSuite) TestRewardHighPriorityWeightedMore() {
 		dqn.latencyCounts[i].Store(0)
 	}
 
-	// Scenario B: P0 (highest) fast 0.01s, P9 (lowest) slow 1s.
 	dqn.latencySums[0].Store(uint64(0.01 * 1e9))
 	dqn.latencyCounts[0].Store(1)
 	dqn.latencySums[9].Store(uint64(1 * 1e9))
@@ -237,7 +229,6 @@ func (s *DQNSchedSuite) TestRewardPriorityOrderBonus() {
 	dqn := NewDQNScheduler()
 	defer dqn.Stop()
 
-	// High-prio (P0) served faster (0.1s) than low-prio (P9) (1.0s) — should get bonus.
 	dqn.latencySums[0].Store(uint64(0.1 * 1e9))
 	dqn.latencyCounts[0].Store(1)
 	dqn.latencySums[9].Store(uint64(1.0 * 1e9))
@@ -250,7 +241,6 @@ func (s *DQNSchedSuite) TestRewardPriorityOrderBonus() {
 		dqn.latencyCounts[i].Store(0)
 	}
 
-	// Inverted: high-prio (P0) slow (1.0s), low-prio (P9) fast (0.1s) — no bonus.
 	dqn.latencySums[0].Store(uint64(1.0 * 1e9))
 	dqn.latencyCounts[0].Store(1)
 	dqn.latencySums[9].Store(uint64(0.1 * 1e9))
@@ -262,67 +252,7 @@ func (s *DQNSchedSuite) TestRewardPriorityOrderBonus() {
 		"serving high-prio faster should yield bonus")
 }
 
-func (s *DQNSchedSuite) TestEpsilonSuppressionUnderOverload() {
-	dqn := NewDQNScheduler()
-
-	dir := s.T().TempDir()
-	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone, 1)
-	require.NoError(s.T(), err)
-	defer p.Close()
-
-	for i := 0; i < 2000; i++ {
-		_, _ = p.Append(broker.NewMessage(uint8(i%10), []byte("k"), []byte("v")))
-	}
-
-	_, _, _ = dqn.Next(p, 0)
-
-	require.Eventually(s.T(), func() bool {
-		dqn.stateMu.Lock()
-		eps := dqn.epsilon
-		dqn.stateMu.Unlock()
-		return eps == 0
-	}, 3*time.Second, 50*time.Millisecond,
-		"epsilon should be suppressed to 0 when queue depth > 1000")
-
-	dqn.Stop()
-}
-
-func (s *DQNSchedSuite) TestExpertSeedTransitions() {
-	dqn := NewDQNScheduler()
-	defer dqn.Stop()
-
-	require.GreaterOrEqual(s.T(), dqn.replayBuffer.Len(), 200,
-		"expert transitions should be seeded on construction")
-}
-
-func (s *DQNSchedSuite) TestCrisisBufferCollectsOverload() {
-	dqn := NewDQNScheduler()
-	defer dqn.Stop()
-
-	depthIdx := broker.MaxPriority * 2
-	state := make([]float64, dqn.stateSize)
-	state[depthIdx] = float64(dqnSchedOverloadDepth + 100)
-	if depthIdx+1 < dqn.stateSize {
-		state[depthIdx+1] = 10.0
-	}
-
-	for i := 0; i < 10; i++ {
-		t := nn.Transition{
-			State:     state,
-			Action:    []float64{0},
-			Reward:    1.0,
-			NextState: state,
-		}
-		dqn.expCh <- t
-	}
-
-	require.Eventually(s.T(), func() bool {
-		return dqn.crisisBuffer.Len() > 0
-	}, 2*time.Second, 10*time.Millisecond,
-		"overload transitions should be stored in crisis buffer")
-}
-
-func (s *DQNSchedSuite) TestNoFallbackAlwaysDQN() {
+func (s *DQNSchedSuite) TestDQNSchedulerNoEpsilon() {
 	dir := s.T().TempDir()
 	p, err := broker.NewPartition(0, "test", dir, broker.ModeStrictPriority, broker.SyncNone, 1)
 	require.NoError(s.T(), err)
@@ -332,7 +262,7 @@ func (s *DQNSchedSuite) TestNoFallbackAlwaysDQN() {
 		_, _ = p.Append(broker.NewMessage(uint8(i%10), []byte("k"), []byte("v")))
 	}
 
-	dqn := NewDQNScheduler(WithDQNSchedEpsilon(0.0))
+	dqn := NewDQNScheduler()
 	defer dqn.Stop()
 
 	for i := 0; i < 50; i++ {
@@ -340,6 +270,14 @@ func (s *DQNSchedSuite) TestNoFallbackAlwaysDQN() {
 		if err != nil {
 			continue
 		}
-		require.NotNil(s.T(), msg, "DQN should always serve messages without fallback")
+		require.NotNil(s.T(), msg, "DQN scheduler should always use cached threshold (argmax)")
 	}
+}
+
+func (s *DQNSchedSuite) TestNoExpertSeeds() {
+	dqn := NewDQNScheduler()
+	defer dqn.Stop()
+
+	require.Equal(s.T(), 0, dqn.replayBuffer.Len(),
+		"replay buffer should start empty (no expert seeding)")
 }

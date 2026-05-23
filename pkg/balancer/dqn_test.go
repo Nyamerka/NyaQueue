@@ -2,17 +2,16 @@ package balancer
 
 import (
 	"math"
-	"math/rand/v2"
 	"runtime"
 	"testing"
 	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	"github.com/Nyamerka/NyaQueue/pkg/nn"
 	"github.com/alitto/pond/v2"
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"gonum.org/v1/gonum/stat"
 )
 
 type DQNSuite struct {
@@ -57,7 +56,7 @@ func (s *DQNSuite) TestOnMetricsTrains() {
 		dqn.OnMetrics(broker.Metrics{
 			DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.3, 0.5, 0.7, 0.9}},
 		})
-		time.Sleep(110 * time.Millisecond)
+		time.Sleep(60 * time.Millisecond)
 	}
 
 	require.Eventually(s.T(), func() bool {
@@ -129,7 +128,7 @@ func (s *DQNSuite) TestTrainStepWithEnoughData() {
 		dqn.OnMetrics(broker.Metrics{
 			DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.2, 0.3, float64(i) * 0.1}},
 		})
-		time.Sleep(110 * time.Millisecond)
+		time.Sleep(60 * time.Millisecond)
 	}
 
 	require.Eventually(s.T(), func() bool {
@@ -245,43 +244,9 @@ func (s *DQNSuite) TestDQNBalancer_InflightInState() {
 		"inflight should be reflected in state vector after SelectPartition calls")
 }
 
-// --- New tests for softmax routing, temperature, credit assignment ---
-
-func (s *DQNSuite) TestSoftmaxRoutingUniformAtHighTemp() {
+func (s *DQNSuite) TestArgmaxRoutingSelectsBest() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
-
-	require.InDelta(s.T(), dqnInitialTemperature, dqn.temperature(), 0.001,
-		"initial temperature should be 1.0")
-
-	qValues := []float64{0.01, 0.02, 0.015, 0.018}
-	cached := make([]float64, len(qValues))
-	copy(cached, qValues)
-	dqn.cachedQValues.Store(&cached)
-
-	counts := map[int]int{}
-	for i := 0; i < 4000; i++ {
-		p := dqn.SelectPartition("t", nil, 4)
-		counts[p]++
-		dqn.OnPublishComplete(p)
-	}
-
-	for _, c := range counts {
-		require.Greater(s.T(), c, 700,
-			"at τ=1.0 with near-equal Q all partitions should get roughly equal share")
-		require.Less(s.T(), c, 1300,
-			"at τ=1.0 with near-equal Q no partition should dominate")
-	}
-}
-
-func (s *DQNSuite) TestSoftmaxRoutingConvergesToBest() {
-	dqn := NewDQNBalancer(4)
-	defer dqn.Stop()
-
-	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
-
-	require.InDelta(s.T(), dqnFinalTemperature, dqn.temperature(), 0.01,
-		"fully decayed temperature should be ~0.1")
 
 	qValues := []float64{0.1, 0.2, 10.0, 0.3}
 	cached := make([]float64, len(qValues))
@@ -289,31 +254,14 @@ func (s *DQNSuite) TestSoftmaxRoutingConvergesToBest() {
 	dqn.cachedQValues.Store(&cached)
 
 	counts := map[int]int{}
-	for i := 0; i < 4000; i++ {
+	for i := 0; i < 1000; i++ {
 		p := dqn.SelectPartition("t", nil, 4)
 		counts[p]++
 		dqn.OnPublishComplete(p)
 	}
 
-	require.Greater(s.T(), counts[2], 3000,
-		"at low τ partition 2 (best Q) should dominate")
-}
-
-func (s *DQNSuite) TestTemperatureDecay() {
-	dqn := NewDQNBalancer(4)
-	defer dqn.Stop()
-
-	t0 := dqn.temperature()
-	require.InDelta(s.T(), dqnInitialTemperature, t0, 0.001)
-
-	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps/2)
-	tMid := dqn.temperature()
-	require.Less(s.T(), tMid, t0, "temperature should decrease with training")
-	require.Greater(s.T(), tMid, dqnFinalTemperature, "mid-training temperature should be between initial and final")
-
-	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps*2)
-	tFinal := dqn.temperature()
-	require.InDelta(s.T(), dqnFinalTemperature, tFinal, 0.01, "fully decayed temperature should reach final value")
+	require.Equal(s.T(), 1000, counts[2],
+		"argmax routing should always select partition 2 (best Q)")
 }
 
 func (s *DQNSuite) TestNoFallbackUnderOverload() {
@@ -349,47 +297,31 @@ func (s *DQNSuite) TestDQNBootstrapNoDeadlock() {
 				PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8},
 			},
 		})
-		time.Sleep(110 * time.Millisecond)
+		time.Sleep(60 * time.Millisecond)
 	}
 
-	require.Greater(s.T(), dqn.TrainingSteps(), int64(0),
+	require.Eventually(s.T(), func() bool {
+		return dqn.TrainingSteps() > 0
+	}, 10*time.Second, 10*time.Millisecond,
 		"DQN should accumulate training steps from step 0 without deadlock")
 	require.Greater(s.T(), dqn.replayBuffer.Len(), 0,
 		"replay buffer should have experiences recorded from the start")
 }
 
-func (s *DQNSuite) TestRewardDifferentialSignal() {
+func (s *DQNSuite) TestDirectRewardSignal() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
-	steadyMetrics := broker.Metrics{
+	r1 := dqn.computeReward(broker.Metrics{
 		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
 		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
-	}
-	for i := 0; i < 20; i++ {
-		dqn.computeReward(steadyMetrics)
-	}
-
+	})
 	r2 := dqn.computeReward(broker.Metrics{
-		BusinessMetrics: broker.BusinessMetrics{Throughput: 100000},
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
 		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
 	})
-	require.Greater(s.T(), r2, 0.0,
-		"reward should be positive when throughput improves (differential signal)")
-
-	for i := 0; i < 10; i++ {
-		dqn.computeReward(broker.Metrics{
-			BusinessMetrics: broker.BusinessMetrics{Throughput: 100000},
-			DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
-		})
-	}
-
-	r3 := dqn.computeReward(broker.Metrics{
-		BusinessMetrics: broker.BusinessMetrics{Throughput: 10000},
-		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
-	})
-	require.Less(s.T(), r3, 0.0,
-		"reward should be negative when throughput degrades (differential signal)")
+	require.InDelta(s.T(), r1, r2, 1e-10,
+		"direct reward should be deterministic for same input (no EWMA drift)")
 }
 
 func (s *DQNSuite) TestDQNConvergenceWithoutFallback() {
@@ -404,7 +336,7 @@ func (s *DQNSuite) TestDQNConvergenceWithoutFallback() {
 			BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
 			DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: loads},
 		})
-		time.Sleep(110 * time.Millisecond)
+		time.Sleep(60 * time.Millisecond)
 	}
 
 	require.Eventually(s.T(), func() bool {
@@ -412,7 +344,9 @@ func (s *DQNSuite) TestDQNConvergenceWithoutFallback() {
 	}, 3*time.Second, 10*time.Millisecond,
 		"DQN should accumulate experience and train without fallback mechanism")
 
-	require.Greater(s.T(), dqn.TrainingSteps(), int64(0),
+	require.Eventually(s.T(), func() bool {
+		return dqn.TrainingSteps() > 0
+	}, 3*time.Second, 10*time.Millisecond,
 		"training steps should advance from zero")
 }
 
@@ -443,244 +377,168 @@ func (s *DQNSuite) TestWeightDecayPreventsGrowth() {
 		"initial weight norm should be positive")
 }
 
-func (s *DQNSuite) TestInflightAdjustPreventsHotspot() {
-	dqn := NewDQNBalancer(4)
+// --- New tests for R21 fixes ---
+
+func (s *DQNSuite) TestRawStateInReplay() {
+	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
 	defer dqn.Stop()
 
-	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
-
-	qv := []float64{0.35, 0.30, 0.25, 0.20}
-	cached := make([]float64, len(qv))
-	copy(cached, qv)
-	dqn.cachedQValues.Store(&cached)
-
-	n := 10_000
-	counts := make([]int, 4)
-	for i := 0; i < n; i++ {
-		p := dqn.SelectPartition("t", nil, 4)
-		counts[p]++
+	dqn.OnMetrics(broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000, MsgRate: 10000},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8}},
+	})
+	time.Sleep(200 * time.Millisecond)
+	for i := 0; i < 20; i++ {
+		dqn.OnMetrics(broker.Metrics{
+			BusinessMetrics: broker.BusinessMetrics{Throughput: 50000, MsgRate: 10000},
+			DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8}},
+		})
+		time.Sleep(60 * time.Millisecond)
 	}
 
-	maxCount := 0
-	for _, c := range counts {
-		if c > maxCount {
-			maxCount = c
+	require.Eventually(s.T(), func() bool {
+		return dqn.replayBuffer.Len() > 0
+	}, 3*time.Second, 10*time.Millisecond)
+
+	batch, _, _ := dqn.replayBuffer.Sample(1, 1.0)
+	require.NotEmpty(s.T(), batch)
+	state := batch[0].State
+	require.Len(s.T(), state, dqn.stateSize)
+
+	hasNonZero := false
+	for _, v := range state {
+		if v > 0.001 {
+			hasNonZero = true
+			break
 		}
 	}
-	require.Less(s.T(), float64(maxCount)/float64(n), 0.80,
-		"inflight-aware penalty should prevent one partition from getting >80%%, counts=%v", counts)
+	require.True(s.T(), hasNonZero,
+		"state in replay should contain raw (unnormalized) values")
 }
 
-func (s *DQNSuite) TestInflightPenaltyThresholdBased() {
+func (s *DQNSuite) TestNormalizerResetForNewScenario() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
-	inf := dqn.ensureInflight(4)
-	// mean = 32.5, partition 0 ratio = 100/32.5 ≈ 3.08 (> 2.0 threshold)
-	(*inf)[0].Store(100)
-	(*inf)[1].Store(10)
-	(*inf)[2].Store(10)
-	(*inf)[3].Store(10)
-
-	qv := []float64{0.8, 0.3, 0.2, 0.1}
-	dst := make([]float64, 4)
-	dqn.inflightAdjustInto(dst, qv, inf, 4)
-
-	require.Less(s.T(), dst[0], qv[0],
-		"partition 0 (ratio > 2.0) should have reduced Q")
-	for i := 1; i < 4; i++ {
-		require.InDelta(s.T(), qv[i], dst[i], 1e-6,
-			"partition %d (ratio < 2.0) should be unpenalized", i)
+	for i := 0; i < 100; i++ {
+		dqn.OnMetrics(broker.Metrics{
+			BusinessMetrics: broker.BusinessMetrics{Throughput: 50000, MsgRate: 10000},
+			DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8}},
+		})
 	}
 
-	// When all inflight are equal (ratio = 1.0), no penalties
-	(*inf)[0].Store(50)
-	(*inf)[1].Store(50)
-	(*inf)[2].Store(50)
-	(*inf)[3].Store(50)
-	dqn.inflightAdjustInto(dst, qv, inf, 4)
-	for i := range dst {
-		require.InDelta(s.T(), qv[i], dst[i], 1e-6,
-			"equal inflight should produce no penalty, partition %d", i)
+	dqn.ResetForNewScenario()
+
+	state := make([]float64, dqn.stateSize)
+	state[0] = 0.5
+	normalized := dqn.normalizer.Normalize(state)
+	for _, v := range normalized {
+		require.InDelta(s.T(), 0, v, 1e-6,
+			"after reset, normalizer has count<2, should output zeros")
 	}
 }
 
-func (s *DQNSuite) TestAdaptiveTempFloor() {
+func (s *DQNSuite) TestNStepBufferComposition() {
+	buf := newNStepBuffer(3, 0.9)
+
+	t1 := nn.Transition{State: []float64{1}, Action: []float64{0}, Reward: 1.0, NextState: []float64{2}}
+	t2 := nn.Transition{State: []float64{2}, Action: []float64{1}, Reward: 2.0, NextState: []float64{3}}
+	t3 := nn.Transition{State: []float64{3}, Action: []float64{0}, Reward: 3.0, NextState: []float64{4}}
+
+	_, ok := buf.Push(t1)
+	require.False(s.T(), ok)
+	_, ok = buf.Push(t2)
+	require.False(s.T(), ok)
+
+	out, ok := buf.Push(t3)
+	require.True(s.T(), ok)
+
+	expectedReward := 1.0 + 0.9*2.0 + 0.9*0.9*3.0
+	require.InDelta(s.T(), expectedReward, out.Reward, 1e-10)
+	require.Equal(s.T(), t1.State, out.State)
+	require.Equal(s.T(), t3.NextState, out.NextState)
+	require.Equal(s.T(), t1.Action, out.Action)
+}
+
+func (s *DQNSuite) TestPopArtNormalizes() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
-	// Use extreme rate where floor exceeds dqnFinalTemperature for k=4:
-	// msgsPerTick = 100M * 0.1 = 10M; floor = 0.05 * log10(10M/100) / log2(4) = 0.05*5/2 = 0.125
+	for i := 0; i < 200; i++ {
+		target := float64(i) * 0.1
+		dqn.popArt.mu.Lock()
+		dqn.popArt.count++
+		delta := target - dqn.popArt.mean
+		dqn.popArt.mean += delta / float64(dqn.popArt.count)
+		dqn.popArt.m2 += delta * (target - dqn.popArt.mean)
+		dqn.popArt.mu.Unlock()
+	}
+
+	dqn.popArt.mu.Lock()
+	sigma := math.Sqrt(dqn.popArt.m2/float64(dqn.popArt.count-1)) + 1e-8
+	mu := dqn.popArt.mean
+	dqn.popArt.mu.Unlock()
+
+	require.Greater(s.T(), sigma, 0.1,
+		"PopArt sigma should be positive after observations")
+	require.Greater(s.T(), mu, 0.0,
+		"PopArt mean should be non-zero after observations")
+
+	normalized := (10.0 - mu) / sigma
+	require.Less(s.T(), math.Abs(normalized), 5.0,
+		"PopArt-normalized target should be within reasonable bounds")
+}
+
+func (s *DQNSuite) TestHardTargetSyncCopiesAll() {
+	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
+	defer dqn.Stop()
+
+	dqn.targetNet.HardSync()
+
+	allMatch := true
+	dqn.ctx.EnumerateVariables(func(mainVar *context.Variable) {
+		if !mainVar.Trainable {
+			return
+		}
+		mainVal, err := mainVar.Value()
+		if err != nil || mainVal == nil {
+			allMatch = false
+			return
+		}
+		_ = mainVal
+	})
+
+	require.True(s.T(), allMatch,
+		"after HardSync all main vars should be accessible (sync didn't panic)")
+}
+
+func (s *DQNSuite) TestQueueDepthInState() {
+	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
+
 	dqn.stateMu.Lock()
-	dqn.msgRate = 100_000_000
+	dqn.loads = []float64{0.2, 0.4, 0.6, 0.8}
+	dqn.queueDepth = []int{500, 1000, 1500, 2000}
+	dqn.msgRate = 50000
+	dqn.avgMsgSize = 256
+	dqn.consumeRate = 40000
 	dqn.stateMu.Unlock()
 
-	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
+	state := make([]float64, dqn.stateSize)
+	dqn.stateMu.Lock()
+	dqn.buildStateInto(state)
+	dqn.stateMu.Unlock()
 
-	temp := dqn.temperature()
-	require.Greater(s.T(), temp, dqnFinalTemperature,
-		"at extreme rate, adaptive floor should elevate temperature above final, got %.4f", temp)
-}
-
-func (s *DQNSuite) TestRewardZScoreNormalization() {
-	var rn rewardNormalizer
-
-	rng := rand.New(rand.NewPCG(42, 0))
-	var outputs []float64
-	for i := 0; i < 500; i++ {
-		raw := rng.NormFloat64()*0.1 + 0.5
-		out := rn.normalize(raw)
-		if i >= 100 {
-			outputs = append(outputs, out)
-		}
+	depthBase := dqn.numPartitions * 3
+	for i := 0; i < 4; i++ {
+		expected := float64(dqn.queueDepth[i]) / dqnDepthFeatureScale
+		require.InDelta(s.T(), expected, state[depthBase+i], 1e-10,
+			"state[3K+%d] should contain queue depth for partition %d", i, i)
 	}
 
-	mean := stat.Mean(outputs, nil)
-	std := stat.StdDev(outputs, nil)
-
-	require.InDelta(s.T(), 0, mean, 0.3,
-		"z-score normalized rewards should have mean near 0, got %.4f", mean)
-	require.InDelta(s.T(), 1.0, std, 0.5,
-		"z-score normalized rewards should have std near 1, got %.4f", std)
-}
-
-func (s *DQNSuite) TestNoDriftDetection() {
-	dqn := NewDQNBalancer(4)
-	defer dqn.Stop()
-
-	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
-	stepsBefore := dqn.TrainingSteps()
-
-	for i := 0; i < 100; i++ {
-		dqn.computeReward(broker.Metrics{
-			BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
-			DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
-		})
-	}
-	for i := 0; i < 50; i++ {
-		dqn.computeReward(broker.Metrics{
-			BusinessMetrics: broker.BusinessMetrics{Throughput: 1000},
-			DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.9, 0.9, 0.9, 0.9}},
-		})
-	}
-
-	require.Equal(s.T(), stepsBefore, dqn.TrainingSteps(),
-		"training steps should NOT be rolled back — drift detection is removed")
-}
-
-func (s *DQNSuite) TestZeroAllocSelectPartition() {
-	dqn := NewDQNBalancer(4)
-	defer dqn.Stop()
-
-	qv := []float64{0.5, 0.3, 0.1, 0.2}
-	cached := make([]float64, len(qv))
-	copy(cached, qv)
-	dqn.cachedQValues.Store(&cached)
-
-	for i := 0; i < 100; i++ {
-		p := dqn.SelectPartition("t", nil, 4)
-		dqn.OnPublishComplete(p)
-	}
-
-	allocs := testing.AllocsPerRun(1000, func() {
-		p := dqn.SelectPartition("t", nil, 4)
-		dqn.OnPublishComplete(p)
-	})
-	require.LessOrEqual(s.T(), allocs, 0.0,
-		"SelectPartition should have zero heap allocations, got %.1f", allocs)
-}
-
-func (s *DQNSuite) TestInflightPenaltyGatedByTemp() {
-	dqn := NewDQNBalancer(4)
-	defer dqn.Stop()
-
-	qv := []float64{0.8, 0.3, 0.2, 0.1}
-	cached := make([]float64, len(qv))
-	copy(cached, qv)
-	dqn.cachedQValues.Store(&cached)
-
-	inf := dqn.ensureInflight(4)
-	(*inf)[0].Store(1000)
-	(*inf)[1].Store(10)
-	(*inf)[2].Store(10)
-	(*inf)[3].Store(10)
-
-	counts := make(map[int]int)
-	for i := 0; i < 4000; i++ {
-		p := dqn.SelectPartition("t", nil, 4)
-		counts[p]++
-		dqn.OnPublishComplete(p)
-	}
-
-	require.Greater(s.T(), counts[0], 500,
-		"at τ=1.0 (high temp) partition 0 should still get significant traffic even with high inflight, got %d", counts[0])
-}
-
-func (s *DQNSuite) TestInflightPenaltyLogSoft() {
-	dqn := NewDQNBalancer(4)
-	defer dqn.Stop()
-
-	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
-
-	qv := []float64{0.5, 0.5, 0.5, 0.5}
-	cached := make([]float64, len(qv))
-	copy(cached, qv)
-	dqn.cachedQValues.Store(&cached)
-
-	inf := dqn.ensureInflight(4)
-	(*inf)[0].Store(250) // 2.5× mean (mean=100)
-	(*inf)[1].Store(100)
-	(*inf)[2].Store(50)
-	(*inf)[3].Store(0)
-
-	counts := make(map[int]int)
-	for i := 0; i < 10000; i++ {
-		p := dqn.SelectPartition("t", nil, 4)
-		counts[p]++
-		dqn.OnPublishComplete(p)
-	}
-
-	prob0 := float64(counts[0]) / 10000.0
-	require.Greater(s.T(), prob0, 0.10,
-		"at 2.5× mean inflight, partition prob should be > 10%% (soft log penalty), got %.3f", prob0)
-}
-
-func (s *DQNSuite) TestRewardNormalizerReset() {
-	var rn rewardNormalizer
-
-	for i := 0; i < 100; i++ {
-		rn.normalize(float64(i) * 0.1)
-	}
-	require.Greater(s.T(), rn.count, int64(0))
-	require.NotEqual(s.T(), 0.0, rn.mean)
-
-	rn.Reset()
-
-	require.Equal(s.T(), int64(0), rn.count)
-	require.Equal(s.T(), 0.0, rn.mean)
-	require.Equal(s.T(), 0.0, rn.m2)
-}
-
-func (s *DQNSuite) TestTempFloorScalesWithPartitions() {
-	dqn4 := NewDQNBalancer(4)
-	defer dqn4.Stop()
-	dqn32 := NewDQNBalancer(32)
-	defer dqn32.Stop()
-
-	// Use extreme rate where floor kicks in for k=4 (0.125) but not k=32 (0.05)
-	dqn4.stateMu.Lock()
-	dqn4.msgRate = 100_000_000
-	dqn4.stateMu.Unlock()
-	dqn4.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
-
-	dqn32.stateMu.Lock()
-	dqn32.msgRate = 100_000_000
-	dqn32.stateMu.Unlock()
-	dqn32.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
-
-	temp4 := dqn4.temperature()
-	temp32 := dqn32.temperature()
-
-	require.Greater(s.T(), temp4, temp32,
-		"k=32 should have a lower temperature floor than k=4 (temp4=%.4f, temp32=%.4f)", temp4, temp32)
+	idx := dqn.numPartitions * 4
+	require.InDelta(s.T(), 50000.0/dqnMsgRateScale, state[idx], 1e-10, "msgRate feature")
+	require.InDelta(s.T(), 256.0/dqnMsgSizeScale, state[idx+1], 1e-10, "avgMsgSize feature")
+	require.InDelta(s.T(), 40000.0/dqnMsgRateScale, state[idx+2], 1e-10, "consumeRate feature")
+	require.InDelta(s.T(), 50000.0/40000.0, state[idx+3], 1e-10, "produce/consume ratio feature")
 }

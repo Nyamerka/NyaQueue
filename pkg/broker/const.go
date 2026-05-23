@@ -10,7 +10,7 @@ const (
 )
 
 const (
-	metricsTickInterval = 100 * time.Millisecond
+	metricsTickInterval = 50 * time.Millisecond
 	metricsWarmupTicks  = 50
 	metricsHistoryCap   = 100
 )

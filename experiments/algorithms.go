@@ -16,11 +16,10 @@ import (
 // NewBalancer receives the actual partition count k so that partition-aware
 // balancers (PSA, DQN) are initialised with the correct topology.
 type AlgorithmConfig struct {
-	Name          string
-	NewBalancer   func(k int) broker.Balancer
-	NewScheduler  func() broker.Scheduler
-	Mode          broker.ScheduleMode
-	WithOptimizer bool
+	Name         string
+	NewBalancer  func(k int) broker.Balancer
+	NewScheduler func() broker.Scheduler
+	Mode         broker.ScheduleMode
 }
 
 func AllAlgorithms() []AlgorithmConfig {
@@ -50,11 +49,10 @@ func AllAlgorithms() []AlgorithmConfig {
 			Mode:         broker.ModeStrictPriority,
 		},
 		{
-			Name:          "DQN+DDPG",
-			NewBalancer:   func(k int) broker.Balancer { return balancer.NewDQNBalancer(k) },
-			NewScheduler:  func() broker.Scheduler { return scheduler.NewDQNScheduler() },
-			Mode:          broker.ModeDQNAdaptive,
-			WithOptimizer: true,
+			Name:         "DQN+DQNSched",
+			NewBalancer:  func(k int) broker.Balancer { return balancer.NewDQNBalancer(k) },
+			NewScheduler: func() broker.Scheduler { return scheduler.NewDQNScheduler() },
+			Mode:         broker.ModeDQNAdaptive,
 		},
 	}
 }

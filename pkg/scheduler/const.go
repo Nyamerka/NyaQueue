@@ -7,7 +7,6 @@ const (
 	DefaultDQNSchedHiddenSize = 128
 	DefaultDQNSchedActions    = broker.MaxPriority
 
-	DefaultDQNSchedEpsilon       = 0.05
 	DefaultDQNSchedGamma         = 0.9
 	DefaultDQNSchedLearningRate  = 0.001
 	DefaultDQNSchedReplayBufSize = 50_000
@@ -18,8 +17,4 @@ const (
 	dqnSchedVelocityScale      = 10_000.0
 	dqnSchedGrowthPenaltyW     = 0.3
 	dqnSchedPriorityOrderBonus = 0.1
-	dqnSchedOverloadDepth      = 1_000
-	dqnSchedExpertSeeds        = 200
-	dqnSchedCrisisBufSize      = 2_000
-	dqnSchedCrisisRatio        = 0.3 // 30% of batch from crisis buffer
 )

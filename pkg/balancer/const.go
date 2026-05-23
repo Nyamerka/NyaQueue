@@ -13,7 +13,8 @@ const (
 	DefaultDQNReplayBufSize  = 50_000
 	DefaultDQNBatchSize      = 32
 	DefaultDQNMinReplay      = 64
-	DefaultDQNTrainEvery     = 4
+	DefaultDQNTrainEvery     = 1
+	DefaultDQNUpdatesPerStep = 4
 	DefaultDQNExpChannelSize = 4096
 	DefaultDQNWeightDecay    = 1e-4
 )
@@ -39,9 +40,10 @@ var dqnThroughputLogNorm = math.Log1p(dqnMaxThroughput / dqnThroughputScale)
 
 // DQN state normalization scales.
 const (
-	dqnMsgRateScale  = 100_000.0
-	dqnMsgSizeScale  = 1024.0
-	dqnInflightScale = 10_000.0
+	dqnMsgRateScale      = 100_000.0
+	dqnMsgSizeScale      = 1024.0
+	dqnInflightScale     = 10_000.0
+	dqnDepthFeatureScale = 1_000.0
 )
 
 // DQN queue-depth penalty in reward.
@@ -49,22 +51,6 @@ const (
 	dqnDepthSoftCap = 100_000.0
 	dqnDepthWeight  = 0.3
 )
-
-// Softmax (Boltzmann) exploration temperature schedule.
-// At τ=1.0 routing is ~uniform (safe as RR); as training converges τ→0.1 (greedy).
-const (
-	dqnInitialTemperature = 1.0
-	dqnFinalTemperature   = 0.1
-	dqnMinStepsForGreedy  = 50
-	dqnTempDecaySteps     = 500
-)
-
-// Inflight penalty is applied only when temperature drops below this threshold.
-// At high τ (exploration), applying penalty creates bias on near-uniform distribution.
-const dqnInflightPenaltyThreshold = (dqnInitialTemperature + dqnFinalTemperature) / 2
-
-// Differential reward EWMA smoothing factor.
-const dqnRewardEWMAAlpha = 0.1
 
 // Policy tick interval and adaptive slow-tick for low-rate scenarios.
 const (

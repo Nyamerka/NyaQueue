@@ -6,22 +6,17 @@ import (
 )
 
 // TargetNetwork maintains a separate set of weights for computing stable target Q-values
-// (Mnih 2015). It periodically performs Polyak averaging (soft update) from the main context.
+// (Mnih 2015). It periodically performs a hard copy from the main context.
 type TargetNetwork struct {
 	mu        *xsync.RBMutex
 	mainCtx   *context.Context
 	targetCtx *context.Context
 	varMap    map[string]*context.Variable
-	tau       float64
 	syncEvery int
 	steps     int
 }
 
 type TargetNetworkOption func(*TargetNetwork)
-
-func WithTau(tau float64) TargetNetworkOption {
-	return func(tn *TargetNetwork) { tn.tau = tau }
-}
 
 func WithSyncEvery(n int) TargetNetworkOption {
 	return func(tn *TargetNetwork) { tn.syncEvery = n }
@@ -34,8 +29,7 @@ func NewTargetNetwork(mainCtx *context.Context, opts ...TargetNetworkOption) *Ta
 		mu:        xsync.NewRBMutex(),
 		mainCtx:   mainCtx,
 		targetCtx: context.New(),
-		tau:       0.005,
-		syncEvery: 10,
+		syncEvery: 25,
 	}
 	for _, opt := range opts {
 		opt(tn)
@@ -60,21 +54,18 @@ func (tn *TargetNetwork) TargetCtx() *context.Context {
 	return tn.targetCtx
 }
 
-// Step increments the internal counter and performs a soft update every syncEvery steps.
+// Step increments the internal counter and performs a hard sync every syncEvery steps.
 func (tn *TargetNetwork) Step() {
 	tn.steps++
 	if tn.steps%tn.syncEvery == 0 {
-		tn.SoftUpdate()
+		tn.HardSync()
 	}
 }
 
-// SoftUpdate performs Polyak averaging: target_w = τ * main_w + (1-τ) * target_w.
-func (tn *TargetNetwork) SoftUpdate() {
+// HardSync copies all trainable variables from main to target network.
+func (tn *TargetNetwork) HardSync() {
 	tn.mu.Lock()
 	defer tn.mu.Unlock()
-
-	tau := tn.tau
-	oneMinusTau := 1.0 - tau
 
 	tn.mainCtx.EnumerateVariables(func(mainVar *context.Variable) {
 		if !mainVar.Trainable {
@@ -90,24 +81,20 @@ func (tn *TargetNetwork) SoftUpdate() {
 		if err != nil || mainVal == nil {
 			return
 		}
-		targetVal, err := targetVar.Value()
-		if err != nil || targetVal == nil {
-			return
-		}
 
 		mainVal.MustConstFlatData(func(mainFlat any) {
+			targetVal, err := targetVar.Value()
+			if err != nil || targetVal == nil {
+				return
+			}
 			targetVal.MustMutableFlatData(func(targetFlat any) {
 				switch m := mainFlat.(type) {
 				case []float32:
 					t := targetFlat.([]float32)
-					for i := range m {
-						t[i] = float32(tau)*m[i] + float32(oneMinusTau)*t[i]
-					}
+					copy(t, m)
 				case []float64:
 					t := targetFlat.([]float64)
-					for i := range m {
-						t[i] = tau*m[i] + oneMinusTau*t[i]
-					}
+					copy(t, m)
 				}
 			})
 		})

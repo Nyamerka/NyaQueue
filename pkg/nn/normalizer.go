@@ -70,3 +70,39 @@ func (rn *RunningNormalizer) NormalizeInPlace(x []float64) {
 		x[i] = (x[i] - rn.mean[i]) / (std + 1e-8)
 	}
 }
+
+// NormalizeBatch normalizes a flat buffer of concatenated state vectors in-place.
+func (rn *RunningNormalizer) NormalizeBatch(buf []float64, batchSize int) {
+	rt := rn.mu.RLock()
+	defer rn.mu.RUnlock(rt)
+
+	if rn.count < 2 {
+		for i := range buf {
+			buf[i] = 0
+		}
+		return
+	}
+
+	n := float64(rn.count)
+	for b := 0; b < batchSize; b++ {
+		offset := b * rn.size
+		for i := 0; i < rn.size && offset+i < len(buf); i++ {
+			variance := rn.m2[i] / (n - 1)
+			std := math.Sqrt(variance)
+			buf[offset+i] = (buf[offset+i] - rn.mean[i]) / (std + 1e-8)
+		}
+	}
+}
+
+// Reset clears all accumulated statistics.
+func (rn *RunningNormalizer) Reset() {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	rn.count = 0
+	for i := range rn.mean {
+		rn.mean[i] = 0
+	}
+	for i := range rn.m2 {
+		rn.m2[i] = 0
+	}
+}

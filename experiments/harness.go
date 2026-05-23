@@ -197,6 +197,15 @@ func (h *Harness) IsExternal() bool {
 	return h.external || h.mode == ModeKafka
 }
 
+// SwitchBalancer sets the balancer on the broker for the current run.
+// For in-process and local gRPC/HTTP modes, directly sets via the broker API.
+// For external modes, this is a no-op (external broker manages its own balancer).
+func (h *Harness) SwitchBalancer(alg AlgorithmConfig, k int) {
+	if brk := h.Broker(); brk != nil {
+		brk.SetBalancer(alg.NewBalancer(k))
+	}
+}
+
 // Broker returns the in-process broker (nil for Kafka mode).
 func (h *Harness) Broker() *broker.Broker {
 	if h.app != nil {

@@ -4,7 +4,6 @@ import (
 	stdctx "context"
 	"log"
 	"math"
-	"math/rand/v2"
 	"runtime"
 	"sync/atomic"
 	"time"
@@ -40,7 +39,6 @@ type DQNScheduler struct {
 	hiddenSize int
 	stateSize  int
 	numActions int
-	epsilon    float64
 	gamma      float64
 	lr         float64
 	huberDelta float64
@@ -58,7 +56,6 @@ type DQNScheduler struct {
 	trainExec             *context.Exec
 
 	replayBuffer *nn.PrioritizedReplayBuffer
-	crisisBuffer *nn.ReplayBuffer
 	betaSchedule *nn.BetaSchedule
 	normalizer   *nn.RunningNormalizer
 
@@ -94,7 +91,6 @@ const (
 
 type DQNSchedOption func(*DQNScheduler)
 
-func WithDQNSchedEpsilon(e float64) DQNSchedOption       { return func(d *DQNScheduler) { d.epsilon = e } }
 func WithDQNSchedGamma(g float64) DQNSchedOption         { return func(d *DQNScheduler) { d.gamma = g } }
 func WithDQNSchedLearningRate(lr float64) DQNSchedOption { return func(d *DQNScheduler) { d.lr = lr } }
 func WithDQNSchedHiddenSize(n int) DQNSchedOption        { return func(d *DQNScheduler) { d.hiddenSize = n } }
@@ -113,7 +109,6 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 		hiddenSize:   DefaultDQNSchedHiddenSize,
 		stateSize:    DefaultDQNSchedStateSize,
 		numActions:   DefaultDQNSchedActions,
-		epsilon:      DefaultDQNSchedEpsilon,
 		gamma:        DefaultDQNSchedGamma,
 		lr:           DefaultDQNSchedLearningRate,
 		huberDelta:   1.0,
@@ -121,7 +116,6 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 		minReplay:    DefaultDQNSchedMinReplay,
 		trainEvery:   DefaultDQNSchedTrainEvery,
 		replayBuffer: nn.NewPrioritizedReplayBuffer(DefaultDQNSchedReplayBufSize, 0.6),
-		crisisBuffer: nn.NewReplayBuffer(dqnSchedCrisisBufSize),
 		threshold:    DefaultDQNSchedThreshold,
 		expCh:        make(chan nn.Transition, DefaultDQNSchedExpChSize),
 	}
@@ -158,35 +152,7 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 		return nil
 	})
 
-	d.seedExpertTransitions()
-
 	return d
-}
-
-func (d *DQNScheduler) seedExpertTransitions() {
-	depthIdx := broker.MaxPriority * 2
-	for i := 0; i < dqnSchedExpertSeeds; i++ {
-		state := make([]float64, d.stateSize)
-		state[depthIdx] = 0.8 + rand.Float64()*0.2
-		if depthIdx+1 < d.stateSize {
-			state[depthIdx+1] = 0.5 + rand.Float64()*0.5
-		}
-		if depthIdx+2 < d.stateSize {
-			state[depthIdx+2] = 3.0 + rand.Float64()*2.0
-		}
-
-		next := make([]float64, d.stateSize)
-		copy(next, state)
-		next[depthIdx] *= 0.6
-
-		d.replayBuffer.Push(nn.Transition{
-			State:     state,
-			Action:    []float64{0},
-			Reward:    2.0,
-			NextState: next,
-			Done:      false,
-		})
-	}
 }
 
 func (d *DQNScheduler) initGoMLX() {
@@ -283,18 +249,7 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 
 	d.lastPI.Store(pi)
 
-	srt := d.stateMu.RLock()
-	eps := d.epsilon
-	d.stateMu.RUnlock(srt)
-
-	explore := rand.Float64() < eps
-
-	var threshold int
-	if explore {
-		threshold = rand.IntN(d.numActions)
-	} else {
-		threshold = int(d.cachedThreshold.Load())
-	}
+	threshold := int(d.cachedThreshold.Load())
 
 	entry, ok := pi.PopWithThreshold(threshold)
 	if !ok {
@@ -443,16 +398,7 @@ func (d *DQNScheduler) policyLoop(ctx stdctx.Context) {
 
 			d.stateMu.Lock()
 			d.threshold = threshold
-
-			depth := pi.Len()
-			velocity := depth - d.lastPolicyDepth
-			d.lastPolicyDepth = depth
-
-			if depth > dqnSchedOverloadDepth && velocity > 0 {
-				d.epsilon = 0
-			} else {
-				d.epsilon = DefaultDQNSchedEpsilon
-			}
+			d.lastPolicyDepth = pi.Len()
 			d.stateMu.Unlock()
 
 		case <-ctx.Done():
@@ -472,19 +418,13 @@ func (d *DQNScheduler) trainLoop(ctx stdctx.Context) {
 		select {
 		case t := <-d.expCh:
 			d.replayBuffer.Push(t)
-			if d.isOverloadTransition(t) {
-				d.crisisBuffer.Push(t)
-			}
 			steps++
 			if steps%d.trainEvery == 0 {
 				lastLoss = d.trainStep()
 			}
 			if steps%100 == 0 {
-				srt := d.stateMu.RLock()
-				eps := d.epsilon
-				d.stateMu.RUnlock(srt)
-				log.Printf("[dqn-sched] step=%d loss=%.4f ε=%.3f buf=%d/%d threshold=%d",
-					steps, lastLoss, eps, d.replayBuffer.Len(), d.replayBuffer.Cap(),
+				log.Printf("[dqn-sched] step=%d loss=%.4f buf=%d/%d threshold=%d",
+					steps, lastLoss, d.replayBuffer.Len(), d.replayBuffer.Cap(),
 					d.cachedThreshold.Load())
 			}
 		case <-ctx.Done():
@@ -498,20 +438,6 @@ func (d *DQNScheduler) trainLoop(ctx stdctx.Context) {
 			}
 		}
 	}
-}
-
-func (d *DQNScheduler) isOverloadTransition(t nn.Transition) bool {
-	depthIdx := broker.MaxPriority * 2
-	velocityIdx := depthIdx + 1
-	if depthIdx >= len(t.State) {
-		return false
-	}
-	depth := t.State[depthIdx]
-	var velocity float64
-	if velocityIdx < len(t.State) {
-		velocity = t.State[velocityIdx]
-	}
-	return depth > float64(dqnSchedOverloadDepth) && velocity > 0
 }
 
 func (d *DQNScheduler) buildState(pi *broker.PriorityIndex) []float64 {
@@ -566,26 +492,12 @@ func (d *DQNScheduler) trainStep() float64 {
 		return 0
 	}
 
-	mainSize := d.batchSize
-	crisisSize := 0
-	if d.crisisBuffer.Len() > 0 {
-		crisisSize = int(float64(d.batchSize) * dqnSchedCrisisRatio)
-		mainSize = d.batchSize - crisisSize
-	}
-
 	beta := d.betaSchedule.Next()
-	mainBatch, indices, isWeights := d.replayBuffer.Sample(mainSize, beta)
-	if len(mainBatch) < mainSize {
+	batch, indices, isWeights := d.replayBuffer.Sample(d.batchSize, beta)
+	bs := len(batch)
+	if bs < d.batchSize {
 		return 0
 	}
-
-	crisisBatch := d.crisisBuffer.Sample(crisisSize)
-	batch := append(mainBatch, crisisBatch...)
-
-	for range crisisBatch {
-		isWeights = append(isWeights, 1.0)
-	}
-	bs := len(batch)
 
 	statesBuf := make([]float64, bs*d.stateSize)
 	nextStatesBuf := make([]float64, bs*d.stateSize)
