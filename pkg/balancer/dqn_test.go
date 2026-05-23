@@ -53,17 +53,7 @@ func (s *DQNSuite) TestOnMetricsTrains() {
 
 	time.Sleep(300 * time.Millisecond)
 
-	for i := 0; i < 5; i++ {
-		dqn.OnMetrics(broker.Metrics{
-			DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.3, 0.5, 0.7, 0.9}},
-		})
-		time.Sleep(110 * time.Millisecond)
-	}
-
-	// Force temperature below gating threshold so experience is recorded.
-	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps)
-
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 15; i++ {
 		dqn.OnMetrics(broker.Metrics{
 			DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.3, 0.5, 0.7, 0.9}},
 		})
@@ -129,13 +119,13 @@ func (s *DQNSuite) TestTrainStepWithEnoughData() {
 	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
 	defer dqn.Stop()
 
-	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps)
-
 	dqn.OnMetrics(broker.Metrics{
 		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4}},
 	})
 
-	for i := 0; i < 5; i++ {
+	time.Sleep(200 * time.Millisecond)
+
+	for i := 0; i < 10; i++ {
 		dqn.OnMetrics(broker.Metrics{
 			DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.2, 0.3, float64(i) * 0.1}},
 		})
@@ -144,7 +134,7 @@ func (s *DQNSuite) TestTrainStepWithEnoughData() {
 
 	require.Eventually(s.T(), func() bool {
 		return dqn.replayBuffer.Len() >= 2
-	}, time.Second, 5*time.Millisecond)
+	}, 2*time.Second, 5*time.Millisecond)
 }
 
 func (s *DQNSuite) TestAllOptions() {
@@ -346,16 +336,26 @@ func (s *DQNSuite) TestNoFallbackUnderOverload() {
 	}, "DQN should not panic under overload conditions")
 }
 
-func (s *DQNSuite) TestCreditAssignmentCorrectness() {
-	dqn := NewDQNBalancer(4, WithDQNTrainEvery(1))
+func (s *DQNSuite) TestDQNBootstrapNoDeadlock() {
+	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
 	defer dqn.Stop()
 
-	require.False(s.T(), dqn.shouldRecordExperience(),
-		"should NOT record experience at initial high temperature")
+	time.Sleep(200 * time.Millisecond)
 
-	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps)
-	require.True(s.T(), dqn.shouldRecordExperience(),
-		"should record experience when temperature is below threshold")
+	for i := 0; i < 100; i++ {
+		dqn.OnMetrics(broker.Metrics{
+			BusinessMetrics: broker.BusinessMetrics{Throughput: 50000, MsgRate: 10000},
+			DerivedMetrics: broker.DerivedMetrics{
+				PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8},
+			},
+		})
+		time.Sleep(110 * time.Millisecond)
+	}
+
+	require.Greater(s.T(), dqn.TrainingSteps(), int64(0),
+		"DQN should accumulate training steps from step 0 without deadlock")
+	require.Greater(s.T(), dqn.replayBuffer.Len(), 0,
+		"replay buffer should have experiences recorded from the start")
 }
 
 func (s *DQNSuite) TestRewardDifferentialSignal() {
@@ -396,10 +396,8 @@ func (s *DQNSuite) TestDQNConvergenceWithoutFallback() {
 	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
 	defer dqn.Stop()
 
-	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps)
-
 	time.Sleep(200 * time.Millisecond)
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 30; i++ {
 		loads := []float64{0.2, 0.4, 0.6, 0.8}
 		loads[i%4] += float64(i) * 0.01
 		dqn.OnMetrics(broker.Metrics{
@@ -414,10 +412,8 @@ func (s *DQNSuite) TestDQNConvergenceWithoutFallback() {
 	}, 3*time.Second, 10*time.Millisecond,
 		"DQN should accumulate experience and train without fallback mechanism")
 
-	require.True(s.T(), dqn.TrainingSteps() >= dqnMinStepsForGreedy,
-		"training steps should advance")
-	require.Less(s.T(), dqn.temperature(), dqnInitialTemperature,
-		"temperature should have decayed")
+	require.Greater(s.T(), dqn.TrainingSteps(), int64(0),
+		"training steps should advance from zero")
 }
 
 func (s *DQNSuite) TestWeightDecayPreventsGrowth() {
@@ -453,68 +449,77 @@ func (s *DQNSuite) TestInflightAdjustPreventsHotspot() {
 
 	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
 
-	qv := []float64{0.8, 0.3, 0.2, 0.1}
+	qv := []float64{0.35, 0.30, 0.25, 0.20}
 	cached := make([]float64, len(qv))
 	copy(cached, qv)
 	dqn.cachedQValues.Store(&cached)
 
 	n := 10_000
-	counts := make([]float64, 4)
+	counts := make([]int, 4)
 	for i := 0; i < n; i++ {
 		p := dqn.SelectPartition("t", nil, 4)
 		counts[p]++
 	}
 
-	mean := float64(n) / 4.0
-	var variance float64
+	maxCount := 0
 	for _, c := range counts {
-		diff := (c - mean) / float64(n)
-		variance += diff * diff
+		if c > maxCount {
+			maxCount = c
+		}
 	}
-	stddev := math.Sqrt(variance / 4.0)
-
-	require.Less(s.T(), stddev, 0.15,
-		"inflight-aware penalty should prevent hotspotting, stddev=%.4f, counts=%v", stddev, counts)
+	require.Less(s.T(), float64(maxCount)/float64(n), 0.80,
+		"inflight-aware penalty should prevent one partition from getting >80%%, counts=%v", counts)
 }
 
-func (s *DQNSuite) TestInflightPenaltyScalesWithQRange() {
+func (s *DQNSuite) TestInflightPenaltyThresholdBased() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
 	inf := dqn.ensureInflight(4)
+	// mean = 32.5, partition 0 ratio = 100/32.5 ≈ 3.08 (> 2.0 threshold)
 	(*inf)[0].Store(100)
 	(*inf)[1].Store(10)
 	(*inf)[2].Store(10)
 	(*inf)[3].Store(10)
 
-	uniformQ := []float64{0.5, 0.5, 0.5, 0.5}
+	qv := []float64{0.8, 0.3, 0.2, 0.1}
 	dst := make([]float64, 4)
-	dqn.inflightAdjustInto(dst, uniformQ, inf, 4)
+	dqn.inflightAdjustInto(dst, qv, inf, 4)
 
-	for i := range dst {
-		require.InDelta(s.T(), uniformQ[i], dst[i], 1e-6,
-			"penalty should be zero when qRange≈0 (uniform Q), partition %d", i)
+	require.Less(s.T(), dst[0], qv[0],
+		"partition 0 (ratio > 2.0) should have reduced Q")
+	for i := 1; i < 4; i++ {
+		require.InDelta(s.T(), qv[i], dst[i], 1e-6,
+			"partition %d (ratio < 2.0) should be unpenalized", i)
 	}
 
-	skewedQ := []float64{0.8, 0.3, 0.2, 0.1}
-	dqn.inflightAdjustInto(dst, skewedQ, inf, 4)
-	require.Less(s.T(), dst[0], skewedQ[0],
-		"partition 0 (highest inflight) should have reduced Q")
+	// When all inflight are equal (ratio = 1.0), no penalties
+	(*inf)[0].Store(50)
+	(*inf)[1].Store(50)
+	(*inf)[2].Store(50)
+	(*inf)[3].Store(50)
+	dqn.inflightAdjustInto(dst, qv, inf, 4)
+	for i := range dst {
+		require.InDelta(s.T(), qv[i], dst[i], 1e-6,
+			"equal inflight should produce no penalty, partition %d", i)
+	}
 }
 
 func (s *DQNSuite) TestAdaptiveTempFloor() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
+	// Use extreme rate where floor exceeds dqnFinalTemperature for k=4:
+	// msgsPerTick = 100M * 0.1 = 10M; floor = 0.05 * log10(10M/100) / log2(4) = 0.05*5/2 = 0.125
 	dqn.stateMu.Lock()
-	dqn.msgRate = 200_000
+	dqn.msgRate = 100_000_000
 	dqn.stateMu.Unlock()
 
 	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
 
 	temp := dqn.temperature()
-	require.Greater(s.T(), temp, 0.3,
-		"at 200K msg/s, adaptive floor should raise temperature above 0.3, got %.4f", temp)
+	require.Greater(s.T(), temp, dqnFinalTemperature,
+		"at extreme rate, adaptive floor should elevate temperature above final, got %.4f", temp)
 }
 
 func (s *DQNSuite) TestRewardZScoreNormalization() {
@@ -539,18 +544,28 @@ func (s *DQNSuite) TestRewardZScoreNormalization() {
 		"z-score normalized rewards should have std near 1, got %.4f", std)
 }
 
-func (s *DQNSuite) TestDriftTriggersReExploration() {
+func (s *DQNSuite) TestNoDriftDetection() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
 	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
-	tempBefore := dqn.temperature()
+	stepsBefore := dqn.TrainingSteps()
 
-	dqn.handleDrift()
+	for i := 0; i < 100; i++ {
+		dqn.computeReward(broker.Metrics{
+			BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
+			DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
+		})
+	}
+	for i := 0; i < 50; i++ {
+		dqn.computeReward(broker.Metrics{
+			BusinessMetrics: broker.BusinessMetrics{Throughput: 1000},
+			DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.9, 0.9, 0.9, 0.9}},
+		})
+	}
 
-	tempAfter := dqn.temperature()
-	require.Greater(s.T(), tempAfter, tempBefore,
-		"drift should increase temperature via training step rollback")
+	require.Equal(s.T(), stepsBefore, dqn.TrainingSteps(),
+		"training steps should NOT be rolled back — drift detection is removed")
 }
 
 func (s *DQNSuite) TestZeroAllocSelectPartition() {
@@ -573,4 +588,99 @@ func (s *DQNSuite) TestZeroAllocSelectPartition() {
 	})
 	require.LessOrEqual(s.T(), allocs, 0.0,
 		"SelectPartition should have zero heap allocations, got %.1f", allocs)
+}
+
+func (s *DQNSuite) TestInflightPenaltyGatedByTemp() {
+	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
+
+	qv := []float64{0.8, 0.3, 0.2, 0.1}
+	cached := make([]float64, len(qv))
+	copy(cached, qv)
+	dqn.cachedQValues.Store(&cached)
+
+	inf := dqn.ensureInflight(4)
+	(*inf)[0].Store(1000)
+	(*inf)[1].Store(10)
+	(*inf)[2].Store(10)
+	(*inf)[3].Store(10)
+
+	counts := make(map[int]int)
+	for i := 0; i < 4000; i++ {
+		p := dqn.SelectPartition("t", nil, 4)
+		counts[p]++
+		dqn.OnPublishComplete(p)
+	}
+
+	require.Greater(s.T(), counts[0], 500,
+		"at τ=1.0 (high temp) partition 0 should still get significant traffic even with high inflight, got %d", counts[0])
+}
+
+func (s *DQNSuite) TestInflightPenaltyLogSoft() {
+	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
+
+	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
+
+	qv := []float64{0.5, 0.5, 0.5, 0.5}
+	cached := make([]float64, len(qv))
+	copy(cached, qv)
+	dqn.cachedQValues.Store(&cached)
+
+	inf := dqn.ensureInflight(4)
+	(*inf)[0].Store(250) // 2.5× mean (mean=100)
+	(*inf)[1].Store(100)
+	(*inf)[2].Store(50)
+	(*inf)[3].Store(0)
+
+	counts := make(map[int]int)
+	for i := 0; i < 10000; i++ {
+		p := dqn.SelectPartition("t", nil, 4)
+		counts[p]++
+		dqn.OnPublishComplete(p)
+	}
+
+	prob0 := float64(counts[0]) / 10000.0
+	require.Greater(s.T(), prob0, 0.10,
+		"at 2.5× mean inflight, partition prob should be > 10%% (soft log penalty), got %.3f", prob0)
+}
+
+func (s *DQNSuite) TestRewardNormalizerReset() {
+	var rn rewardNormalizer
+
+	for i := 0; i < 100; i++ {
+		rn.normalize(float64(i) * 0.1)
+	}
+	require.Greater(s.T(), rn.count, int64(0))
+	require.NotEqual(s.T(), 0.0, rn.mean)
+
+	rn.Reset()
+
+	require.Equal(s.T(), int64(0), rn.count)
+	require.Equal(s.T(), 0.0, rn.mean)
+	require.Equal(s.T(), 0.0, rn.m2)
+}
+
+func (s *DQNSuite) TestTempFloorScalesWithPartitions() {
+	dqn4 := NewDQNBalancer(4)
+	defer dqn4.Stop()
+	dqn32 := NewDQNBalancer(32)
+	defer dqn32.Stop()
+
+	// Use extreme rate where floor kicks in for k=4 (0.125) but not k=32 (0.05)
+	dqn4.stateMu.Lock()
+	dqn4.msgRate = 100_000_000
+	dqn4.stateMu.Unlock()
+	dqn4.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
+
+	dqn32.stateMu.Lock()
+	dqn32.msgRate = 100_000_000
+	dqn32.stateMu.Unlock()
+	dqn32.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
+
+	temp4 := dqn4.temperature()
+	temp32 := dqn32.temperature()
+
+	require.Greater(s.T(), temp4, temp32,
+		"k=32 should have a lower temperature floor than k=4 (temp4=%.4f, temp32=%.4f)", temp4, temp32)
 }

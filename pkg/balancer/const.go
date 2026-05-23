@@ -59,8 +59,9 @@ const (
 	dqnTempDecaySteps     = 500
 )
 
-// Credit-assignment gating: only record transitions when τ < this threshold.
-const dqnExperienceRecordThreshold = 0.5
+// Inflight penalty is applied only when temperature drops below this threshold.
+// At high τ (exploration), applying penalty creates bias on near-uniform distribution.
+const dqnInflightPenaltyThreshold = (dqnInitialTemperature + dqnFinalTemperature) / 2
 
 // Differential reward EWMA smoothing factor.
 const dqnRewardEWMAAlpha = 0.1
@@ -71,9 +72,6 @@ const (
 	dqnSlowPolicyTickInterval = 500 * time.Millisecond
 	dqnLowRateThreshold       = 5_000.0
 )
-
-// Drift detection: re-exploration triggered when ewmaReward < peakReward * threshold.
-const dqnDriftThreshold = 0.7
 
 // PSA constants.
 const (

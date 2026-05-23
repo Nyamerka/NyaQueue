@@ -263,6 +263,10 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	}
 
 	if strings.Contains(alg.Name, "DQN") {
+		if brk := h.Broker(); brk != nil {
+			brk.ResetBalancerForScenario()
+		}
+
 		warmup := dqnWarmupDuration
 		if topicCfg.NumPartitions > 4 {
 			warmup = dqnWarmupDuration * time.Duration(topicCfg.NumPartitions/4)

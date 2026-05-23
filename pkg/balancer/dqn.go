@@ -93,7 +93,6 @@ type DQNBalancer struct {
 
 	trainingSteps atomic.Int64
 	ewmaReward    atomic.Uint64 // float64 bits — differential reward baseline
-	peakReward    atomic.Uint64 // float64 bits — best EWMA seen (drift detection)
 
 	rewardNorm rewardNormalizer
 
@@ -276,7 +275,7 @@ func (d *DQNBalancer) temperature() float64 {
 	if rate > 0 {
 		msgsPerTick := rate * dqnPolicyTickInterval.Seconds()
 		if msgsPerTick > 100 {
-			floor := 0.15 * math.Log10(msgsPerTick/100)
+			floor := 0.05 * math.Log10(msgsPerTick/100) / math.Log2(float64(d.numPartitions))
 			if base < floor {
 				base = floor
 			}
@@ -322,8 +321,10 @@ func (d *DQNBalancer) softmaxSelectWith(qValues, probs []float64) int {
 }
 
 // inflightAdjustInto writes inflight-penalized Q-values into dst.
-// Penalty is proportional to (excess inflight / mean inflight) * qRange,
-// dynamically scaling with the Q-value spread (no magic constants).
+// Uses logarithmic penalty with a 2× mean activation threshold:
+// - Only penalizes partitions with significantly more than fair share (ratio > 2.0)
+// - log(ratio) provides soft dampening instead of aggressive elimination
+// - Scaled by τ: at lower τ (more greedy) stronger correction, preventing stale routing
 func (d *DQNBalancer) inflightAdjustInto(dst, qv []float64, inf *[]atomic.Int64, n int) {
 	var totalInflight int64
 	for i := 0; i < n; i++ {
@@ -334,25 +335,23 @@ func (d *DQNBalancer) inflightAdjustInto(dst, qv []float64, inf *[]atomic.Int64,
 		return
 	}
 
-	qRange := slices.Max(qv[:n]) - slices.Min(qv[:n])
-	if qRange < 1e-6 {
-		copy(dst[:n], qv[:n])
-		return
-	}
 	meanInflight := float64(totalInflight) / float64(n)
+	tau := d.temperature()
 
 	for i := 0; i < n; i++ {
-		excess := float64((*inf)[i].Load()) - meanInflight
-		penalty := 0.0
-		if excess > 0 && meanInflight > 0 {
-			penalty = qRange * (excess / meanInflight)
+		infl := float64((*inf)[i].Load())
+		ratio := infl / max(meanInflight, 1.0)
+
+		if ratio > 2.0 {
+			dst[i] = qv[i] - tau*math.Log(ratio)
+		} else {
+			dst[i] = qv[i]
 		}
-		dst[i] = qv[i] - penalty
 	}
 }
 
 func (d *DQNBalancer) shouldRecordExperience() bool {
-	return d.temperature() < dqnExperienceRecordThreshold
+	return d.cachedQValues.Load() != nil
 }
 
 func (d *DQNBalancer) ensureInflight(n int) *[]atomic.Int64 {
@@ -376,11 +375,19 @@ func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions in
 
 		bp := float64BufPool.Get().(*[]float64)
 		buf := *bp
-		adjusted := buf[:numPartitions]
 		probs := buf[numPartitions : numPartitions*2]
 
-		d.inflightAdjustInto(adjusted, qv, inf, numPartitions)
-		idx := d.softmaxSelectWith(adjusted, probs)
+		tau := d.temperature()
+		var selected []float64
+		if tau < dqnInflightPenaltyThreshold {
+			adjusted := buf[:numPartitions]
+			d.inflightAdjustInto(adjusted, qv, inf, numPartitions)
+			selected = adjusted
+		} else {
+			selected = qv
+		}
+
+		idx := d.softmaxSelectWith(selected, probs)
 
 		float64BufPool.Put(bp)
 		(*inf)[idx].Add(1)
@@ -633,30 +640,7 @@ func (d *DQNBalancer) computeReward(m broker.Metrics) float64 {
 	newEWMA := prevEWMA + dqnRewardEWMAAlpha*(rawReward-prevEWMA)
 	d.ewmaReward.Store(math.Float64bits(newEWMA))
 
-	peak := math.Float64frombits(d.peakReward.Load())
-	if newEWMA > peak {
-		d.peakReward.Store(math.Float64bits(newEWMA))
-	} else if peak > 0 && newEWMA < peak*dqnDriftThreshold {
-		d.handleDrift()
-	}
-
 	return d.rewardNorm.normalize(diff)
-}
-
-// handleDrift is called when EWMA reward drops below dqnDriftThreshold of peak.
-// Rolls back training steps to increase temperature and trigger re-exploration.
-func (d *DQNBalancer) handleDrift() {
-	peak := math.Float64frombits(d.peakReward.Load())
-	ewma := math.Float64frombits(d.ewmaReward.Load())
-	log.Printf("[dqn-bal] drift detected (peak=%.4f, ewma=%.4f), re-exploring", peak, ewma)
-
-	current := d.trainingSteps.Load()
-	rollback := int64(dqnTempDecaySteps) / 3
-	if current > rollback {
-		d.trainingSteps.Store(current - rollback)
-	} else {
-		d.trainingSteps.Store(0)
-	}
 }
 
 // rewardNormalizer applies Z-score normalization using Welford's online algorithm.
@@ -682,6 +666,19 @@ func (rn *rewardNormalizer) normalize(raw float64) float64 {
 		return 0
 	}
 	return (raw - rn.mean) / std
+}
+
+func (rn *rewardNormalizer) Reset() {
+	rn.count = 0
+	rn.mean = 0
+	rn.m2 = 0
+}
+
+// ResetForNewScenario resets accumulated reward statistics for a clean training signal.
+// Should be called before each new scenario warmup to prevent cross-scenario pollution.
+func (d *DQNBalancer) ResetForNewScenario() {
+	d.rewardNorm.Reset()
+	d.ewmaReward.Store(math.Float64bits(0))
 }
 
 func (d *DQNBalancer) trainStep() float64 {

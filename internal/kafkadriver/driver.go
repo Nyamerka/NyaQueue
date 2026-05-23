@@ -127,7 +127,6 @@ func (h *KafkaHarness) writerFor(topic string) *kafka.Writer {
 			BatchBytes:   1 << 20,
 			RequiredAcks: kafka.RequireOne,
 			Compression:  kafka.Lz4,
-			Async:        true,
 		}
 	})
 	return w

@@ -38,6 +38,12 @@ type BaseThroughputSetter interface {
 	SetBaseThroughput(t float64)
 }
 
+// ScenarioResetter is optionally implemented by balancers that accumulate
+// statistics across scenarios and need a clean slate before each new one.
+type ScenarioResetter interface {
+	ResetForNewScenario()
+}
+
 type Scheduler interface {
 	Next(partition *Partition, consumerOffset uint64) (*Message, uint64, error)
 	Enqueue(msg *Message, walOffset int64)
@@ -125,6 +131,15 @@ func (b *Broker) SetBalancer(bal Balancer) {
 				}
 			}
 			return
+		}
+	}
+}
+
+func (b *Broker) ResetBalancerForScenario() {
+	snap := b.runtime.Load()
+	if snap != nil && snap.balancer != nil {
+		if r, ok := snap.balancer.(ScenarioResetter); ok {
+			r.ResetForNewScenario()
 		}
 	}
 }
