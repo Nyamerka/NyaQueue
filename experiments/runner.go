@@ -246,10 +246,10 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 			delCtx, delCancel := context.WithTimeout(ctx, 5*time.Second)
 			_ = h.DeleteTopic(delCtx, topic)
 			delCancel()
-			return err
+			return oops.Wrapf(err, "topic already exists, retrying after delete")
 		}
 		if isRetryableError(err) {
-			return err
+			return oops.Wrapf(err, "retryable create topic error")
 		}
 		return backoff.Permanent(err)
 	}, newExpBackoff())
@@ -276,7 +276,7 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 
 		log.Printf("  [dqn-warmup] running %v warmup for %s/%s (k=%d, rate=%d, producers=%d) ...",
 			warmup, sc.Name, alg.Name, topicCfg.NumPartitions, warmupSc.RatePerSec, warmupSc.Producers)
-		_ = runScenario(ctx, h, warmupSc, alg.Name, "nyaqueue", ModeInProcess, topicCfg.NumPartitions, warmup, topic)
+		_ = runScenario(ctx, h, warmupSc, alg.Name, "nyaqueue", mode, topicCfg.NumPartitions, warmup, topic)
 	}
 
 	log.Printf("  running %s / %s / %s for %v (seed=%d) ...", sc.Name, alg.Name, mode, dur, sc.Seed)

@@ -13,6 +13,7 @@ import (
 
 	"github.com/Nyamerka/NyaQueue/benchmarks"
 	"github.com/Nyamerka/NyaQueue/experiments"
+	"github.com/alitto/pond/v2"
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/basicflag"
 	"github.com/knadh/koanf/providers/env"
@@ -57,10 +58,11 @@ func main() {
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
+	sigPool := pond.NewPool(1)
+	sigPool.Submit(func() {
 		<-sig
 		cancel()
-	}()
+	})
 
 	modes := parseModes(modeStr)
 	scenarios := parseScenarios(scenarioStr)

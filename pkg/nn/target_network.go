@@ -11,6 +11,7 @@ type TargetNetwork struct {
 	mu        *xsync.RBMutex
 	mainCtx   *context.Context
 	targetCtx *context.Context
+	varMap    map[string]*context.Variable
 	tau       float64
 	syncEvery int
 	steps     int
@@ -40,11 +41,14 @@ func NewTargetNetwork(mainCtx *context.Context, opts ...TargetNetworkOption) *Ta
 		opt(tn)
 	}
 
+	tn.varMap = make(map[string]*context.Variable)
 	mainCtx.EnumerateVariables(func(v *context.Variable) {
 		if v.Trainable {
-			if _, err := v.CloneToContext(tn.targetCtx); err != nil {
+			cloned, err := v.CloneToContext(tn.targetCtx)
+			if err != nil {
 				panic("target network: failed to clone variable " + v.ScopeAndName() + ": " + err.Error())
 			}
+			tn.varMap[v.ScopeAndName()] = cloned
 		}
 	})
 
@@ -77,13 +81,8 @@ func (tn *TargetNetwork) SoftUpdate() {
 			return
 		}
 
-		var targetVar *context.Variable
-		tn.targetCtx.EnumerateVariables(func(tv *context.Variable) {
-			if tv.ScopeAndName() == mainVar.ScopeAndName() {
-				targetVar = tv
-			}
-		})
-		if targetVar == nil {
+		targetVar, ok := tn.varMap[mainVar.ScopeAndName()]
+		if !ok {
 			return
 		}
 

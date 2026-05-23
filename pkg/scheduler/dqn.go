@@ -27,13 +27,13 @@ import (
 	_ "github.com/gomlx/gomlx/backends/simplego"
 )
 
-// DQNScheduler adaptively sets the priority threshold via DQN.
-// State: [level_distribution, avg_wait_per_level, queue_depth, consumer_lag]; Action: threshold.
 type schedPolicySnap struct {
 	state     []float64
 	threshold int
 }
 
+// DQNScheduler adaptively sets the priority threshold via DQN.
+// State: [level_distribution, avg_wait_per_level, queue_depth, consumer_lag]; Action: threshold.
 type DQNScheduler struct {
 	weightsMu *xsync.RBMutex
 

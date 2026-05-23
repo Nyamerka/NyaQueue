@@ -2,15 +2,17 @@ package balancer
 
 import (
 	"math"
+	"math/rand/v2"
 	"runtime"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	"github.com/alitto/pond/v2"
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"gonum.org/v1/gonum/stat"
 )
 
 type DQNSuite struct {
@@ -188,19 +190,15 @@ func (s *DQNSuite) TestConcurrentSelectAndOnMetrics() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
-	var wg sync.WaitGroup
+	pool := pond.NewPool(51)
 	for i := 0; i < 50; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		pool.Submit(func() {
 			for j := 0; j < 200; j++ {
 				dqn.SelectPartition("t", []byte{1}, 4)
 			}
-		}()
+		})
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	pool.Submit(func() {
 		for j := 0; j < 100; j++ {
 			dqn.OnMetrics(broker.Metrics{
 				DerivedMetrics: broker.DerivedMetrics{
@@ -208,8 +206,8 @@ func (s *DQNSuite) TestConcurrentSelectAndOnMetrics() {
 				},
 			})
 		}
-	}()
-	wg.Wait()
+	})
+	pool.StopAndWait()
 }
 
 func (s *DQNSuite) TestDroppedExperienceCounter() {
@@ -447,4 +445,132 @@ func (s *DQNSuite) TestWeightDecayPreventsGrowth() {
 
 	require.Greater(s.T(), initialWeightNorm, 0.0,
 		"initial weight norm should be positive")
+}
+
+func (s *DQNSuite) TestInflightAdjustPreventsHotspot() {
+	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
+
+	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
+
+	qv := []float64{0.8, 0.3, 0.2, 0.1}
+	cached := make([]float64, len(qv))
+	copy(cached, qv)
+	dqn.cachedQValues.Store(&cached)
+
+	n := 10_000
+	counts := make([]float64, 4)
+	for i := 0; i < n; i++ {
+		p := dqn.SelectPartition("t", nil, 4)
+		counts[p]++
+	}
+
+	mean := float64(n) / 4.0
+	var variance float64
+	for _, c := range counts {
+		diff := (c - mean) / float64(n)
+		variance += diff * diff
+	}
+	stddev := math.Sqrt(variance / 4.0)
+
+	require.Less(s.T(), stddev, 0.15,
+		"inflight-aware penalty should prevent hotspotting, stddev=%.4f, counts=%v", stddev, counts)
+}
+
+func (s *DQNSuite) TestInflightPenaltyScalesWithQRange() {
+	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
+
+	inf := dqn.ensureInflight(4)
+	(*inf)[0].Store(100)
+	(*inf)[1].Store(10)
+	(*inf)[2].Store(10)
+	(*inf)[3].Store(10)
+
+	uniformQ := []float64{0.5, 0.5, 0.5, 0.5}
+	dst := make([]float64, 4)
+	dqn.inflightAdjustInto(dst, uniformQ, inf, 4)
+
+	for i := range dst {
+		require.InDelta(s.T(), uniformQ[i], dst[i], 1e-6,
+			"penalty should be zero when qRange≈0 (uniform Q), partition %d", i)
+	}
+
+	skewedQ := []float64{0.8, 0.3, 0.2, 0.1}
+	dqn.inflightAdjustInto(dst, skewedQ, inf, 4)
+	require.Less(s.T(), dst[0], skewedQ[0],
+		"partition 0 (highest inflight) should have reduced Q")
+}
+
+func (s *DQNSuite) TestAdaptiveTempFloor() {
+	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
+
+	dqn.stateMu.Lock()
+	dqn.msgRate = 200_000
+	dqn.stateMu.Unlock()
+
+	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
+
+	temp := dqn.temperature()
+	require.Greater(s.T(), temp, 0.3,
+		"at 200K msg/s, adaptive floor should raise temperature above 0.3, got %.4f", temp)
+}
+
+func (s *DQNSuite) TestRewardZScoreNormalization() {
+	var rn rewardNormalizer
+
+	rng := rand.New(rand.NewPCG(42, 0))
+	var outputs []float64
+	for i := 0; i < 500; i++ {
+		raw := rng.NormFloat64()*0.1 + 0.5
+		out := rn.normalize(raw)
+		if i >= 100 {
+			outputs = append(outputs, out)
+		}
+	}
+
+	mean := stat.Mean(outputs, nil)
+	std := stat.StdDev(outputs, nil)
+
+	require.InDelta(s.T(), 0, mean, 0.3,
+		"z-score normalized rewards should have mean near 0, got %.4f", mean)
+	require.InDelta(s.T(), 1.0, std, 0.5,
+		"z-score normalized rewards should have std near 1, got %.4f", std)
+}
+
+func (s *DQNSuite) TestDriftTriggersReExploration() {
+	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
+
+	dqn.trainingSteps.Store(dqnMinStepsForGreedy + dqnTempDecaySteps + 100)
+	tempBefore := dqn.temperature()
+
+	dqn.handleDrift()
+
+	tempAfter := dqn.temperature()
+	require.Greater(s.T(), tempAfter, tempBefore,
+		"drift should increase temperature via training step rollback")
+}
+
+func (s *DQNSuite) TestZeroAllocSelectPartition() {
+	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
+
+	qv := []float64{0.5, 0.3, 0.1, 0.2}
+	cached := make([]float64, len(qv))
+	copy(cached, qv)
+	dqn.cachedQValues.Store(&cached)
+
+	for i := 0; i < 100; i++ {
+		p := dqn.SelectPartition("t", nil, 4)
+		dqn.OnPublishComplete(p)
+	}
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		p := dqn.SelectPartition("t", nil, 4)
+		dqn.OnPublishComplete(p)
+	})
+	require.LessOrEqual(s.T(), allocs, 0.0,
+		"SelectPartition should have zero heap allocations, got %.1f", allocs)
 }

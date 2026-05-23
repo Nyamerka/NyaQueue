@@ -119,7 +119,7 @@ services:
       KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
     volumes:
       - kafka-data:/bitnami/kafka
-    cpus: "0.8"
+    cpus: "2.0"
     mem_limit: "2g"
 
   experiment:

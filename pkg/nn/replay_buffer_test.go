@@ -1,6 +1,7 @@
 package nn
 
 import (
+	"math/rand/v2"
 	"sync"
 	"testing"
 
@@ -300,4 +301,40 @@ func (s *PrioritizedReplayBufferSuite) TestUpdatePriority() {
 	b.UpdatePriority(2, 50.0)
 	b.UpdatePriority(-1, 1.0)
 	b.UpdatePriority(100, 1.0)
+}
+
+func (s *PrioritizedReplayBufferSuite) TestSumTreeSampleLogN() {
+	for _, cap := range []int{100, 1000, 10000, 50000} {
+		st := NewSumTree(cap)
+		for i := 0; i < cap; i++ {
+			st.Add(Transition{
+				State:  []float64{float64(i)},
+				Action: []float64{0},
+				Reward: float64(i),
+			}, float64(i+1))
+		}
+
+		total := st.Total()
+		require.Greater(s.T(), total, 0.0)
+
+		for i := 0; i < 100; i++ {
+			idx := st.Sample(rand.Float64() * total)
+			require.GreaterOrEqual(s.T(), idx, 0)
+			require.Less(s.T(), idx, cap)
+		}
+	}
+
+	st := NewSumTree(50000)
+	for i := 0; i < 50000; i++ {
+		st.Add(Transition{State: []float64{0}, Action: []float64{0}}, 1.0)
+	}
+
+	depth := 0
+	idx := 1
+	for idx < st.capacity {
+		idx = 2 * idx
+		depth++
+	}
+	require.LessOrEqual(s.T(), depth, 17,
+		"tree depth should be O(log N) for capacity 50000, got %d", depth)
 }

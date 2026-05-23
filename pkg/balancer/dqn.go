@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"runtime"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,14 +29,19 @@ import (
 	_ "github.com/gomlx/gomlx/backends/simplego"
 )
 
-// DQNBalancer selects partitions via a DQN with softmax (Boltzmann) routing.
-// State: [partition_loads, predicted_loads, inflight, msg_rate, avg_msg_size]; Action: partition index.
+var float64BufPool = sync.Pool{New: func() any {
+	buf := make([]float64, 256)
+	return &buf
+}}
+
 type policySnap struct {
 	state  []float64
 	action int
 	gen    int64
 }
 
+// DQNBalancer selects partitions via a DQN with softmax (Boltzmann) routing.
+// State: [partition_loads, predicted_loads, inflight, msg_rate, avg_msg_size]; Action: partition index.
 type DQNBalancer struct {
 	weightsMu *xsync.RBMutex
 
@@ -89,8 +95,7 @@ type DQNBalancer struct {
 	ewmaReward    atomic.Uint64 // float64 bits — differential reward baseline
 	peakReward    atomic.Uint64 // float64 bits — best EWMA seen (drift detection)
 
-	boosterMu *xsync.RBMutex
-	booster   atomic.Pointer[dqnBooster]
+	rewardNorm rewardNormalizer
 
 	policyStateBuf []float64
 }
@@ -115,7 +120,6 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 	d := &DQNBalancer{
 		weightsMu:     xsync.NewRBMutex(),
 		stateMu:       xsync.NewRBMutex(),
-		boosterMu:     xsync.NewRBMutex(),
 		numPartitions: numPartitions,
 		hiddenSize:    DefaultDQNHiddenSize,
 		gamma:         DefaultDQNGamma,
@@ -254,7 +258,8 @@ func (d *DQNBalancer) forward(state []float64) []float64 {
 	return tensorToFloat64Slice(result)
 }
 
-// temperature returns the current Boltzmann temperature based on training progress.
+// temperature returns the current Boltzmann temperature based on training progress,
+// with a rate-adaptive floor that prevents hotspotting at high throughput.
 func (d *DQNBalancer) temperature() float64 {
 	steps := d.trainingSteps.Load()
 	if steps < dqnMinStepsForGreedy {
@@ -262,16 +267,40 @@ func (d *DQNBalancer) temperature() float64 {
 	}
 	progress := float64(steps-dqnMinStepsForGreedy) / float64(dqnTempDecaySteps)
 	progress = math.Min(progress, 1.0)
-	return dqnInitialTemperature * math.Pow(dqnFinalTemperature/dqnInitialTemperature, progress)
+	base := dqnInitialTemperature * math.Pow(dqnFinalTemperature/dqnInitialTemperature, progress)
+
+	srt := d.stateMu.RLock()
+	rate := d.msgRate
+	d.stateMu.RUnlock(srt)
+
+	if rate > 0 {
+		msgsPerTick := rate * dqnPolicyTickInterval.Seconds()
+		if msgsPerTick > 100 {
+			floor := 0.15 * math.Log10(msgsPerTick/100)
+			if base < floor {
+				base = floor
+			}
+		}
+	}
+	return base
 }
 
 // softmaxSelect samples a partition from Q-values using Boltzmann exploration.
 // At high τ the distribution is ~uniform; as τ→0 it converges to argmax.
 func (d *DQNBalancer) softmaxSelect(qValues []float64) int {
+	bp := float64BufPool.Get().(*[]float64)
+	probs := (*bp)[:len(qValues)]
+	idx := d.softmaxSelectWith(qValues, probs)
+	float64BufPool.Put(bp)
+	return idx
+}
+
+// softmaxSelectWith samples using a caller-provided probs buffer (zero-alloc).
+func (d *DQNBalancer) softmaxSelectWith(qValues, probs []float64) int {
 	tau := d.temperature()
 	maxQ := slices.Max(qValues)
+	probs = probs[:len(qValues)]
 
-	probs := make([]float64, len(qValues))
 	sum := 0.0
 	for i, q := range qValues {
 		probs[i] = math.Exp((q - maxQ) / tau)
@@ -290,6 +319,36 @@ func (d *DQNBalancer) softmaxSelect(qValues []float64) int {
 		}
 	}
 	return len(qValues) - 1
+}
+
+// inflightAdjustInto writes inflight-penalized Q-values into dst.
+// Penalty is proportional to (excess inflight / mean inflight) * qRange,
+// dynamically scaling with the Q-value spread (no magic constants).
+func (d *DQNBalancer) inflightAdjustInto(dst, qv []float64, inf *[]atomic.Int64, n int) {
+	var totalInflight int64
+	for i := 0; i < n; i++ {
+		totalInflight += (*inf)[i].Load()
+	}
+	if totalInflight == 0 {
+		copy(dst[:n], qv[:n])
+		return
+	}
+
+	qRange := slices.Max(qv[:n]) - slices.Min(qv[:n])
+	if qRange < 1e-6 {
+		copy(dst[:n], qv[:n])
+		return
+	}
+	meanInflight := float64(totalInflight) / float64(n)
+
+	for i := 0; i < n; i++ {
+		excess := float64((*inf)[i].Load()) - meanInflight
+		penalty := 0.0
+		if excess > 0 && meanInflight > 0 {
+			penalty = qRange * (excess / meanInflight)
+		}
+		dst[i] = qv[i] - penalty
+	}
 }
 
 func (d *DQNBalancer) shouldRecordExperience() bool {
@@ -314,10 +373,16 @@ func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions in
 
 	if cached := d.cachedQValues.Load(); cached != nil && len(*cached) >= numPartitions {
 		qv := (*cached)[:numPartitions]
-		if b := d.booster.Load(); b != nil {
-			qv = b.addResidual(qv)
-		}
-		idx := d.softmaxSelect(qv)
+
+		bp := float64BufPool.Get().(*[]float64)
+		buf := *bp
+		adjusted := buf[:numPartitions]
+		probs := buf[numPartitions : numPartitions*2]
+
+		d.inflightAdjustInto(adjusted, qv, inf, numPartitions)
+		idx := d.softmaxSelectWith(adjusted, probs)
+
+		float64BufPool.Put(bp)
 		(*inf)[idx].Add(1)
 		return idx
 	}
@@ -575,7 +640,48 @@ func (d *DQNBalancer) computeReward(m broker.Metrics) float64 {
 		d.handleDrift()
 	}
 
-	return diff
+	return d.rewardNorm.normalize(diff)
+}
+
+// handleDrift is called when EWMA reward drops below dqnDriftThreshold of peak.
+// Rolls back training steps to increase temperature and trigger re-exploration.
+func (d *DQNBalancer) handleDrift() {
+	peak := math.Float64frombits(d.peakReward.Load())
+	ewma := math.Float64frombits(d.ewmaReward.Load())
+	log.Printf("[dqn-bal] drift detected (peak=%.4f, ewma=%.4f), re-exploring", peak, ewma)
+
+	current := d.trainingSteps.Load()
+	rollback := int64(dqnTempDecaySteps) / 3
+	if current > rollback {
+		d.trainingSteps.Store(current - rollback)
+	} else {
+		d.trainingSteps.Store(0)
+	}
+}
+
+// rewardNormalizer applies Z-score normalization using Welford's online algorithm.
+// Ensures gradient signal remains strong even when raw reward is near zero.
+type rewardNormalizer struct {
+	count int64
+	mean  float64
+	m2    float64
+}
+
+func (rn *rewardNormalizer) normalize(raw float64) float64 {
+	rn.count++
+	delta := raw - rn.mean
+	rn.mean += delta / float64(rn.count)
+	delta2 := raw - rn.mean
+	rn.m2 += delta * delta2
+
+	if rn.count < 10 {
+		return raw
+	}
+	std := math.Sqrt(rn.m2 / float64(rn.count-1))
+	if std < 1e-8 {
+		return 0
+	}
+	return (raw - rn.mean) / std
 }
 
 func (d *DQNBalancer) trainStep() float64 {

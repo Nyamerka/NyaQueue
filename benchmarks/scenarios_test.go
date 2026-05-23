@@ -21,7 +21,7 @@ func (s *ScenariosSuite) TestAllScenariosNotEmpty() {
 }
 
 func (s *ScenariosSuite) TestScenarioNames() {
-	expected := []string{"uniform", "skewed", "bursty", "growing", "mixed_priority", "overload", "overload_k32", "overload_k16"}
+	expected := []string{"uniform", "skewed", "bursty", "growing", "mixed_priority", "overload", "overload_k16", "overload_k32"}
 	all := AllScenarios()
 	names := make([]string, len(all))
 	for i, sc := range all {

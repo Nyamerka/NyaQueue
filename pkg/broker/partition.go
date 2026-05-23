@@ -85,31 +85,34 @@ func (p *Partition) Append(msg *Message) (uint64, error) {
 	return offsets[0], nil
 }
 
-// AppendBatch writes a slice of messages to the WAL in a single WriteBatch
-// call, removing per-message fsync overhead. Returns the offsets assigned to
-// each message.
 // LastFlushLatency returns the duration of the most recent WAL write batch.
 func (p *Partition) LastFlushLatency() time.Duration {
 	return time.Duration(p.lastFlushNs.Load())
 }
 
+// AppendBatch writes a slice of messages to the WAL in a single WriteBatch
+// call, removing per-message fsync overhead. Returns the offsets assigned to
+// each message.
 func (p *Partition) AppendBatch(msgs []*Message) ([]uint64, error) {
 	if len(msgs) == 0 {
 		return nil, nil
 	}
 
-	var batch wal.Batch
-	offsets := make([]uint64, len(msgs))
-	buffers := make([][]byte, len(msgs))
-
 	appendTime := time.Now().UnixNano()
 
-	p.mu.Lock()
+	buffers := make([][]byte, len(msgs))
 	for i, msg := range msgs {
 		msg.Header.AppendTime = appendTime
-		offsets[i] = p.nextOffset
 		buffers[i] = msg.MarshalPooled()
-		batch.Write(p.nextOffset, buffers[i])
+	}
+
+	var batch wal.Batch
+	offsets := make([]uint64, len(msgs))
+
+	p.mu.Lock()
+	for i, buf := range buffers {
+		offsets[i] = p.nextOffset
+		batch.Write(p.nextOffset, buf)
 		p.nextOffset++
 	}
 
@@ -183,9 +186,10 @@ func (p *Partition) AppendBatchCompressed(msgs []*Message, codec Codec) ([]uint6
 	batch.Write(baseOffset, header)
 	p.nextOffset++
 
+	redirectBuf := make([]byte, 13*(n-1))
 	for i := 1; i < n; i++ {
 		offsets[i] = p.nextOffset
-		redirect := make([]byte, 13)
+		redirect := redirectBuf[(i-1)*13 : i*13]
 		redirect[0] = walRedirectMagic
 		binary.BigEndian.PutUint64(redirect[1:9], baseOffset)
 		binary.BigEndian.PutUint32(redirect[9:13], uint32(i))

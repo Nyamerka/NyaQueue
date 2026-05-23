@@ -121,10 +121,13 @@ func (h *KafkaHarness) writerFor(topic string) *kafka.Writer {
 		return &kafka.Writer{
 			Addr:         kafka.TCP(h.brokers...),
 			Topic:        topic,
-			Balancer:     &kafka.RoundRobin{},
+			Balancer:     &kafka.LeastBytes{},
 			BatchTimeout: 5 * time.Millisecond,
-			BatchSize:    16,
-			RequiredAcks: kafka.RequireAll,
+			BatchSize:    1024,
+			BatchBytes:   1 << 20,
+			RequiredAcks: kafka.RequireOne,
+			Compression:  kafka.Lz4,
+			Async:        true,
 		}
 	})
 	return w

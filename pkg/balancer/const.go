@@ -72,7 +72,7 @@ const (
 	dqnLowRateThreshold       = 5_000.0
 )
 
-// GB-DQN drift detection: booster created when ewmaReward < peakReward * threshold.
+// Drift detection: re-exploration triggered when ewmaReward < peakReward * threshold.
 const dqnDriftThreshold = 0.7
 
 // PSA constants.

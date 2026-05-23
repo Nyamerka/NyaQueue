@@ -4,7 +4,6 @@ import (
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 )
 
-// FIFO reads messages sequentially from the WAL by consumer offset.
 type FIFO struct{}
 
 func NewFIFO() *FIFO { return &FIFO{} }
