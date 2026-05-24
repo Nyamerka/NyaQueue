@@ -566,7 +566,8 @@ func (s *DQNSuite) TestMaxLoadPenaltyInReward() {
 func (s *DQNSuite) TestExpChannelBlockingSend() {
 	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
 
-	close(dqn.expCh)
+	// Stop goroutines before replacing expCh to avoid a data race on the field.
+	dqn.Stop()
 	dqn.expCh = make(chan nn.Transition, 1)
 	dqn.expCh <- nn.Transition{}
 
@@ -583,7 +584,6 @@ func (s *DQNSuite) TestExpChannelBlockingSend() {
 
 	require.Less(s.T(), elapsed, 50*time.Millisecond,
 		"OnMetrics should not block for more than ~1ms on a full channel")
-	dqn.Stop()
 }
 
 func (s *DQNSuite) TestExperienceCountTracking() {
