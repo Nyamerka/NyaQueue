@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/balancer"
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
@@ -269,4 +270,26 @@ func (s *HTTPTransportSuite) TestSetBalancerRPCHTTP() {
 
 	err = s.client.SetBalancer(ctx, "psa", 8)
 	require.NoError(s.T(), err, "SetBalancer PSA should succeed via HTTP")
+}
+
+func (s *HTTPTransportSuite) TestRunnerWarmupEarlyExitViaRPC() {
+	dqn := balancer.NewDQNBalancer(4)
+	defer dqn.Stop()
+	s.broker.SetBalancer(dqn)
+
+	metrics := broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000, MsgRate: 10000},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8}},
+	}
+
+	for i := 0; i < 20; i++ {
+		dqn.OnMetrics(metrics)
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	ctx := context.Background()
+	seen, err := s.client.GetBalancerStats(ctx)
+	require.NoError(s.T(), err, "GetBalancerStats should succeed via HTTP")
+	require.GreaterOrEqual(s.T(), seen, int64(1),
+		"after multiple OnMetrics calls, ExperiencesSeen should be at least 1")
 }

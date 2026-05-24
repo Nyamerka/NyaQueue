@@ -3,7 +3,9 @@ package kafkadriver
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v3"
@@ -23,10 +25,11 @@ type Message struct {
 }
 
 type KafkaHarness struct {
-	brokers   []string
-	producer  *kgo.Client
-	consumers *xsync.MapOf[readerKey, *kgo.Client]
-	mu        sync.Mutex
+	brokers        []string
+	producer       *kgo.Client
+	consumers      *xsync.MapOf[readerKey, *kgo.Client]
+	mu             sync.Mutex
+	loggedFirstErr atomic.Bool
 }
 
 type readerKey struct {
@@ -54,12 +57,31 @@ func (h *KafkaHarness) ensureProducer() (*kgo.Client, error) {
 		kgo.ProducerLinger(5*time.Millisecond),
 		kgo.ProducerBatchMaxBytes(1<<20),
 		kgo.ProducerBatchCompression(kgo.Lz4Compression()),
+		kgo.RetryBackoffFn(func(attempt int) time.Duration {
+			d := time.Duration(attempt) * 250 * time.Millisecond
+			if d > 5*time.Second {
+				d = 5 * time.Second
+			}
+			return d
+		}),
+		kgo.RequestRetries(20),
+		kgo.RetryTimeout(30*time.Second),
 	)
 	if err != nil {
 		return nil, oops.Wrapf(err, "create franz-go producer")
 	}
 	h.producer = cl
 	return cl, nil
+}
+
+// resetProducer closes the current producer so the next call recreates it.
+func (h *KafkaHarness) resetProducer() {
+	h.mu.Lock()
+	if h.producer != nil {
+		h.producer.Close()
+		h.producer = nil
+	}
+	h.mu.Unlock()
 }
 
 func (h *KafkaHarness) CreateTopic(ctx context.Context, name string, partitions int) error {
@@ -125,25 +147,37 @@ func (h *KafkaHarness) DeleteTopic(ctx context.Context, name string) error {
 	return nil
 }
 
+const produceMaxAttempts = 3
+
 func (h *KafkaHarness) Produce(ctx context.Context, topic string, key, value []byte) error {
-	cl, err := h.ensureProducer()
-	if err != nil {
-		return oops.Wrapf(err, "ensure producer for Produce")
-	}
 	rec := &kgo.Record{
 		Topic: topic,
 		Key:   key,
 		Value: value,
 	}
-	result := cl.ProduceSync(ctx, rec)
-	return result.FirstErr()
+	var lastErr error
+	for attempt := 0; attempt < produceMaxAttempts; attempt++ {
+		cl, err := h.ensureProducer()
+		if err != nil {
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+			continue
+		}
+		result := cl.ProduceSync(ctx, rec)
+		if err := result.FirstErr(); err != nil {
+			if !h.loggedFirstErr.Swap(true) {
+				log.Printf("[kafka-produce] first error: %v", err)
+			}
+			lastErr = err
+			h.resetProducer()
+			continue
+		}
+		return nil
+	}
+	return oops.Wrapf(lastErr, "produce topic=%q exhausted %d attempts", topic, produceMaxAttempts)
 }
 
 func (h *KafkaHarness) ProduceBatch(ctx context.Context, topic string, msgs []kgo.Record) error {
-	cl, err := h.ensureProducer()
-	if err != nil {
-		return oops.Wrapf(err, "ensure producer for ProduceBatch")
-	}
 	recs := make([]*kgo.Record, len(msgs))
 	for i := range msgs {
 		recs[i] = &kgo.Record{
@@ -152,8 +186,26 @@ func (h *KafkaHarness) ProduceBatch(ctx context.Context, topic string, msgs []kg
 			Value: msgs[i].Value,
 		}
 	}
-	results := cl.ProduceSync(ctx, recs...)
-	return results.FirstErr()
+	var lastErr error
+	for attempt := 0; attempt < produceMaxAttempts; attempt++ {
+		cl, err := h.ensureProducer()
+		if err != nil {
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+			continue
+		}
+		results := cl.ProduceSync(ctx, recs...)
+		if err := results.FirstErr(); err != nil {
+			if !h.loggedFirstErr.Swap(true) {
+				log.Printf("[kafka-produce-batch] first error: %v", err)
+			}
+			lastErr = err
+			h.resetProducer()
+			continue
+		}
+		return nil
+	}
+	return oops.Wrapf(lastErr, "produce-batch topic=%q exhausted %d attempts", topic, produceMaxAttempts)
 }
 
 func (h *KafkaHarness) Consume(ctx context.Context, topic, group string, partition int, maxBytes int) ([]Message, error) {
@@ -172,11 +224,6 @@ func (h *KafkaHarness) Consume(ctx context.Context, topic, group string, partiti
 		})
 	})
 
-	if len(msgs) > 0 {
-		if err := cl.CommitUncommittedOffsets(ctx); err != nil {
-			return msgs, oops.Wrapf(err, "commit offsets")
-		}
-	}
 	return msgs, nil
 }
 
@@ -185,16 +232,11 @@ func (h *KafkaHarness) consumerFor(topic, group string, partition int) *kgo.Clie
 	cl, _ := h.consumers.LoadOrCompute(rk, func() *kgo.Client {
 		opts := []kgo.Opt{
 			kgo.SeedBrokers(h.brokers...),
-			kgo.ConsumeTopics(topic),
 			kgo.FetchMaxWait(10 * time.Millisecond),
 			kgo.FetchMaxBytes(int32(1 << 20)),
-		}
-		if group != "" {
-			opts = append(opts, kgo.ConsumerGroup(group))
-		} else {
-			opts = append(opts, kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+			kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
 				topic: {int32(partition): kgo.NewOffset().AtStart()},
-			}))
+			}),
 		}
 		cl, err := kgo.NewClient(opts...)
 		if err != nil {

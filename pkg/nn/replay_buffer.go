@@ -4,8 +4,6 @@ import (
 	"math"
 	"math/rand/v2"
 	"sync/atomic"
-
-	"github.com/puzpuzpuz/xsync/v3"
 )
 
 type Transition struct {
@@ -156,8 +154,10 @@ func (st *SumTree) Priority(idx int) float64 {
 
 // PrioritizedReplayBuffer samples transitions proportional to priority^alpha
 // using a SumTree for O(log N) sampling (vs O(N) linear scan).
+//
+// Not safe for concurrent use; designed for the single-writer trainLoop pattern
+// where Push and Sample are called from the same goroutine.
 type PrioritizedReplayBuffer struct {
-	mu          *xsync.RBMutex
 	sumTree     *SumTree
 	alpha       float64
 	maxPriority float64
@@ -165,7 +165,6 @@ type PrioritizedReplayBuffer struct {
 
 func NewPrioritizedReplayBuffer(capacity int, alpha float64) *PrioritizedReplayBuffer {
 	return &PrioritizedReplayBuffer{
-		mu:          xsync.NewRBMutex(),
 		sumTree:     NewSumTree(capacity),
 		alpha:       alpha,
 		maxPriority: 1.0,
@@ -173,9 +172,6 @@ func NewPrioritizedReplayBuffer(capacity int, alpha float64) *PrioritizedReplayB
 }
 
 func (b *PrioritizedReplayBuffer) Push(t Transition) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	cp := Transition{
 		State:     append([]float64(nil), t.State...),
 		Action:    append([]float64(nil), t.Action...),
@@ -192,9 +188,6 @@ func (b *PrioritizedReplayBuffer) Push(t Transition) {
 // using stratified sampling over the SumTree. O(B * log N) total.
 // IS-weights are computed as w_i = (N * P(i))^(-beta) / max(w), normalized so max=1.0.
 func (b *PrioritizedReplayBuffer) Sample(batchSize int, beta float64) ([]Transition, []int, []float64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	n := b.sumTree.size
 	if n == 0 {
 		return nil, nil, nil
@@ -245,9 +238,6 @@ func (b *PrioritizedReplayBuffer) Sample(batchSize int, beta float64) ([]Transit
 }
 
 func (b *PrioritizedReplayBuffer) UpdatePriority(idx int, tdError float64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	if idx < 0 || idx >= b.sumTree.size {
 		return
 	}
@@ -259,14 +249,10 @@ func (b *PrioritizedReplayBuffer) UpdatePriority(idx int, tdError float64) {
 }
 
 func (b *PrioritizedReplayBuffer) Cap() int {
-	rt := b.mu.RLock()
-	defer b.mu.RUnlock(rt)
 	return b.sumTree.capacity
 }
 
 func (b *PrioritizedReplayBuffer) Len() int {
-	rt := b.mu.RLock()
-	defer b.mu.RUnlock(rt)
 	return b.sumTree.size
 }
 

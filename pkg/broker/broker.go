@@ -44,6 +44,17 @@ type ScenarioResetter interface {
 	ResetForNewScenario()
 }
 
+// BalancerTyper is optionally implemented by balancers to identify their type
+// for warm-restart (reusing weights across scenarios).
+type BalancerTyper interface {
+	BalancerType() string
+}
+
+// PartitionCounter is optionally implemented by partition-aware balancers.
+type PartitionCounter interface {
+	NumPartitions() int
+}
+
 // ExperienceCounter is optionally implemented by DQN-based balancers to report
 // the total number of experiences (n-step transitions) emitted so far.
 type ExperienceCounter interface {
@@ -139,6 +150,42 @@ func (b *Broker) SetBalancer(bal Balancer) {
 			return
 		}
 	}
+}
+
+// ReplaceBalancerSameAlgorithm checks if the new balancer is the same type and
+// compatible with the old one. If so, it resets the old balancer for a new
+// scenario (keeping learned weights) and returns true. Otherwise, it performs
+// a full replacement via SetBalancer and returns false.
+func (b *Broker) ReplaceBalancerSameAlgorithm(newBal Balancer) bool {
+	old := b.runtime.Load()
+	if old == nil || old.balancer == nil {
+		b.SetBalancer(newBal)
+		return false
+	}
+
+	oldTyper, oldOk := old.balancer.(BalancerTyper)
+	newTyper, newOk := newBal.(BalancerTyper)
+	if !oldOk || !newOk || oldTyper.BalancerType() != newTyper.BalancerType() {
+		b.SetBalancer(newBal)
+		return false
+	}
+
+	oldPC, oldHasPC := old.balancer.(PartitionCounter)
+	newPC, newHasPC := newBal.(PartitionCounter)
+	if oldHasPC && newHasPC && oldPC.NumPartitions() != newPC.NumPartitions() {
+		b.SetBalancer(newBal)
+		return false
+	}
+
+	if r, ok := old.balancer.(ScenarioResetter); ok {
+		r.ResetForNewScenario()
+	}
+
+	if s, ok := newBal.(Stopper); ok {
+		go s.Stop()
+	}
+
+	return true
 }
 
 func (b *Broker) ResetBalancerForScenario() {

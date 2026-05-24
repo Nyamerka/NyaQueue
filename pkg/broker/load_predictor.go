@@ -296,11 +296,12 @@ func (lp *LoadPredictor) yuleWalker(vals []float64, mean float64, p int) []float
 	return a
 }
 
-// RingBuffer is a circular buffer for time-series data, safe for concurrent use.
+// RingBuffer is a circular buffer for time-series data.
+// Push is lockless via atomic increment; Values/ValuesInto use RLock for consistency.
 type RingBuffer struct {
 	mu       xsync.RBMutex
 	data     []float64
-	writeIdx int64
+	writeIdx atomic.Int64
 }
 
 func NewRingBuffer(size int) *RingBuffer {
@@ -308,10 +309,9 @@ func NewRingBuffer(size int) *RingBuffer {
 }
 
 func (rb *RingBuffer) Push(v float64) {
-	rb.mu.Lock()
-	rb.data[rb.writeIdx%int64(len(rb.data))] = v
-	rb.writeIdx++
-	rb.mu.Unlock()
+	idx := rb.writeIdx.Add(1) - 1
+	slot := idx % int64(len(rb.data))
+	rb.data[slot] = v
 }
 
 // Values allocates and returns a copy of the buffer contents in chronological order.
@@ -319,7 +319,7 @@ func (rb *RingBuffer) Values() []float64 {
 	t := rb.mu.RLock()
 	defer rb.mu.RUnlock(t)
 
-	w := rb.writeIdx
+	w := rb.writeIdx.Load()
 	size := int64(len(rb.data))
 	if w == 0 {
 		return nil
@@ -340,7 +340,7 @@ func (rb *RingBuffer) ValuesInto(dst []float64) int {
 	t := rb.mu.RLock()
 	defer rb.mu.RUnlock(t)
 
-	w := rb.writeIdx
+	w := rb.writeIdx.Load()
 	size := int64(len(rb.data))
 	if w == 0 {
 		return 0

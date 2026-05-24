@@ -262,3 +262,29 @@ func (s *LoadPredictorSuite) TestConcurrentUpdateAndPredict() {
 
 	wg.Wait()
 }
+
+func (s *LoadPredictorSuite) TestRingBufferLocklessPushUnderLoad() {
+	rb := NewRingBuffer(128)
+
+	var wg sync.WaitGroup
+	const goroutines = 16
+	const pushes = 100_000
+
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(offset int) {
+			defer wg.Done()
+			for i := 0; i < pushes; i++ {
+				rb.Push(float64(offset*pushes + i))
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	vals := rb.Values()
+	require.LessOrEqual(s.T(), len(vals), 128,
+		"Values() should return at most capacity elements")
+	require.Greater(s.T(), len(vals), 0,
+		"Values() should return at least one element")
+}

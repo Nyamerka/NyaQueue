@@ -43,6 +43,7 @@ func NewHTTPServer(b *broker.Broker) *HTTPServer {
 	mux.HandleFunc("POST /topics/{topic}/offsets", s.handleCommit)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("POST /admin/balancer", s.handleSetBalancer)
+	mux.HandleFunc("GET /admin/balancer/stats", s.handleBalancerStats)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -418,6 +419,15 @@ func stringToBalancerKind(algo string) broker.BalancerKind {
 	default:
 		return broker.KindRoundRobin
 	}
+}
+
+type HTTPBalancerStatsResponse struct {
+	ExperiencesSeen int64 `json:"experiences_seen"`
+}
+
+func (s *HTTPServer) handleBalancerStats(w http.ResponseWriter, _ *http.Request) {
+	seen := s.broker.BalancerExperiencesSeen()
+	writeJSON(w, http.StatusOK, HTTPBalancerStatsResponse{ExperiencesSeen: seen})
 }
 
 func (s *HTTPServer) handleMetrics(w http.ResponseWriter, _ *http.Request) {

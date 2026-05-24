@@ -262,16 +262,31 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	}
 	h.SetManagedTopic(topic)
 
-	if err := h.SwitchBalancer(alg, topicCfg.NumPartitions); err != nil {
-		return ExperimentResult{}, oops.Wrapf(err, "switch balancer for %s/%s", sc.Name, alg.Name)
+	replaced := false
+	if brk := h.Broker(); brk != nil {
+		newBal := alg.NewBalancer(topicCfg.NumPartitions)
+		replaced = brk.ReplaceBalancerSameAlgorithm(newBal)
+	} else {
+		if err := h.SwitchBalancer(alg, topicCfg.NumPartitions); err != nil {
+			return ExperimentResult{}, oops.Wrapf(err, "switch balancer for %s/%s", sc.Name, alg.Name)
+		}
 	}
 	if brk := h.Broker(); brk != nil {
 		brk.SetScheduler(topic, alg.NewScheduler())
 	}
 
 	if strings.Contains(alg.Name, "DQN") {
-		if brk := h.Broker(); brk != nil {
-			brk.ResetBalancerForScenario()
+		const miniWarmupDuration = 5 * time.Second
+		if replaced {
+			log.Printf("  [dqn-warmup] weights preserved, mini-warmup %v for %s/%s",
+				miniWarmupDuration, sc.Name, alg.Name)
+			warmupSc := sc
+			warmupSc.Duration = miniWarmupDuration
+			if warmupSc.RatePerSec == 0 {
+				warmupSc.RatePerSec = 5000 * min(warmupSc.Producers, topicCfg.NumPartitions)
+			}
+			_ = runScenario(ctx, h, warmupSc, alg.Name, "nyaqueue", mode, topicCfg.NumPartitions, miniWarmupDuration, topic)
+			goto postWarmup
 		}
 
 		maxWarmup := dqnWarmupMaxDuration
@@ -308,17 +323,16 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 			case <-minDeadline:
 				minElapsed = true
 			case <-ticker.C:
-				if brk := h.Broker(); brk != nil && minElapsed {
-					seen := brk.BalancerExperiencesSeen()
-					if seen >= dqnWarmupTargetExp {
+				if minElapsed {
+					seen, err := h.BalancerExperiencesSeen(ctx)
+					if err == nil && seen >= dqnWarmupTargetExp {
 						log.Printf("  [dqn-warmup] reached %d experiences, finishing early", seen)
 						break warmupLoop
 					}
 				}
 			case <-deadline:
-				if brk := h.Broker(); brk != nil {
-					log.Printf("  [dqn-warmup] max warmup reached, experiences=%d", brk.BalancerExperiencesSeen())
-				}
+				seen, _ := h.BalancerExperiencesSeen(ctx)
+				log.Printf("  [dqn-warmup] max warmup reached, experiences=%d", seen)
 				break warmupLoop
 			case <-warmupDone:
 				break warmupLoop
@@ -329,6 +343,7 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		cancelWarmup()
 		<-warmupDone
 	}
+postWarmup:
 
 	log.Printf("  running %s / %s / %s for %v (seed=%d) ...", sc.Name, alg.Name, mode, dur, sc.Seed)
 	result := runScenario(ctx, h, sc, alg.Name, "nyaqueue", mode, topicCfg.NumPartitions, dur, topic)

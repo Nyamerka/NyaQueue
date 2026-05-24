@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -466,4 +467,41 @@ func (s *BrokerSuite) TestProduceTimePreserved() {
 		require.Greater(s.T(), msg.Header.AppendTime, msg.Header.ProduceTime-int64(1e9),
 			"msg %d: AppendTime should be close to ProduceTime (within 1s)", i)
 	}
+}
+
+type mockTypedBalancer struct {
+	noopBalancer
+	typ        string
+	partitions int
+	resetCount atomic.Int64
+}
+
+func (m *mockTypedBalancer) BalancerType() string { return m.typ }
+func (m *mockTypedBalancer) NumPartitions() int   { return m.partitions }
+func (m *mockTypedBalancer) ResetForNewScenario() { m.resetCount.Add(1) }
+
+func (s *BrokerSuite) TestReplaceBalancerSameAlgKeepsWeights() {
+	b, cleanup := s.newBroker()
+	defer cleanup()
+
+	old := &mockTypedBalancer{typ: "DQN", partitions: 4}
+	b.SetBalancer(old)
+
+	sameTypeNew := &mockTypedBalancer{typ: "DQN", partitions: 4}
+	kept := b.ReplaceBalancerSameAlgorithm(sameTypeNew)
+
+	require.True(s.T(), kept, "same type + same partitions should keep weights")
+	require.Equal(s.T(), int64(1), old.resetCount.Load(),
+		"old balancer should have been reset, not replaced")
+
+	diffType := &mockTypedBalancer{typ: "P2C", partitions: 4}
+	kept = b.ReplaceBalancerSameAlgorithm(diffType)
+
+	require.False(s.T(), kept, "different type should do full replacement")
+
+	another := &mockTypedBalancer{typ: "P2C", partitions: 8}
+	b.SetBalancer(&mockTypedBalancer{typ: "P2C", partitions: 4})
+	kept = b.ReplaceBalancerSameAlgorithm(another)
+
+	require.False(s.T(), kept, "same type but different partitions should do full replacement")
 }

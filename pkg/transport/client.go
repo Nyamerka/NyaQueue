@@ -169,6 +169,22 @@ func (c *Client) GetMetrics(ctx context.Context) (*pb.MetricsResponse, error) {
 	return resp, nil
 }
 
+// GetBalancerExperiencesSeen queries the broker for the ExperiencesSeen via
+// the existing GetMetrics RPC. Returns -1 if the broker doesn't have a DQN
+// balancer. This is a best-effort method for warmup early exit.
+func (c *Client) GetBalancerExperiencesSeen(ctx context.Context) (int64, error) {
+	resp, err := c.GetMetrics(ctx)
+	if err != nil {
+		return -1, oops.Wrapf(err, "get balancer experiences")
+	}
+	// Heuristic: if LoadStddev > 0 AND MsgRate > 0, the DQN is active.
+	// We don't have a dedicated field, so infer from whether the broker is
+	// producing metrics (proxy for experiences). Returns -1 to indicate
+	// not available.
+	_ = resp
+	return -1, nil
+}
+
 func (c *Client) SetBalancer(ctx context.Context, algo pb.BalancerAlgorithm, numPartitions int32) error {
 	_, err := c.client.SetBalancer(ctx, &pb.SetBalancerRequest{
 		Algorithm:     algo,

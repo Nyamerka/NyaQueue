@@ -20,7 +20,6 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
 	"github.com/gomlx/gomlx/pkg/ml/train/losses"
 	"github.com/gomlx/gomlx/pkg/ml/train/optimizers"
-	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/samber/oops"
 	"golang.org/x/sync/errgroup"
 
@@ -35,8 +34,6 @@ type schedPolicySnap struct {
 // DQNScheduler adaptively sets the priority threshold via DQN.
 // State: [level_distribution, avg_wait_per_level, queue_depth, consumer_lag]; Action: threshold.
 type DQNScheduler struct {
-	weightsMu *xsync.RBMutex
-
 	hiddenSize int
 	stateSize  int
 	numActions int
@@ -64,12 +61,10 @@ type DQNScheduler struct {
 	eg     *errgroup.Group
 	cancel stdctx.CancelFunc
 
-	stateMu   *xsync.RBMutex
-	lastState []float64
-	lastPI    atomic.Pointer[broker.PriorityIndex]
-	threshold int
+	lastPI atomic.Pointer[broker.PriorityIndex]
 
-	cachedThreshold atomic.Int32
+	cachedThreshold      atomic.Int32
+	cachedThresholdProbs atomic.Pointer[[]float64]
 
 	prevSnap atomic.Pointer[schedPolicySnap]
 	currSnap atomic.Pointer[schedPolicySnap]
@@ -79,10 +74,10 @@ type DQNScheduler struct {
 
 	prevTotalDepth  atomic.Int64
 	prevRewardDepth atomic.Int64
-	produceRate     float64
-	consumeRate     float64
+	produceRate     atomic.Uint64
+	consumeRate     atomic.Uint64
 
-	lastPolicyDepth int // protected by stateMu
+	experiencesSeen atomic.Int64
 
 	noiseValueIn  int
 	noiseValueOut int
@@ -110,8 +105,6 @@ func WithDQNSchedBatchSize(n int) DQNSchedOption { return func(d *DQNScheduler) 
 
 func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 	d := &DQNScheduler{
-		weightsMu:    xsync.NewRBMutex(),
-		stateMu:      xsync.NewRBMutex(),
 		hiddenSize:   DefaultDQNSchedHiddenSize,
 		stateSize:    DefaultDQNSchedStateSize,
 		numActions:   DefaultDQNSchedActions,
@@ -122,7 +115,6 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 		minReplay:    DefaultDQNSchedMinReplay,
 		trainEvery:   DefaultDQNSchedTrainEvery,
 		replayBuffer: nn.NewPrioritizedReplayBuffer(DefaultDQNSchedReplayBufSize, 0.6),
-		threshold:    DefaultDQNSchedThreshold,
 		expCh:        make(chan nn.Transition, DefaultDQNSchedExpChSize),
 	}
 
@@ -131,7 +123,7 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 	}
 
 	d.hiddenSize = max(DefaultDQNSchedHiddenSize, d.stateSize*3)
-	d.cachedThreshold.Store(int32(d.threshold))
+	d.cachedThreshold.Store(int32(DefaultDQNSchedThreshold))
 	d.betaSchedule = nn.NewBetaSchedule(0.4, 1.0, DefaultDQNSchedReplayBufSize/d.batchSize)
 	d.normalizer = nn.NewRunningNormalizer(d.stateSize)
 	d.initGoMLX()
@@ -302,6 +294,9 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 	d.lastPI.Store(pi)
 
 	threshold := int(d.cachedThreshold.Load())
+	if probs := d.cachedThresholdProbs.Load(); probs != nil && len(*probs) > 0 {
+		threshold = sampleCDFSched(*probs)
+	}
 
 	entry, ok := pi.PopWithThreshold(threshold)
 	if !ok {
@@ -327,10 +322,8 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 func (d *DQNScheduler) Enqueue(_ *broker.Message, _ int64) {}
 
 func (d *DQNScheduler) OnMetrics(m broker.Metrics) {
-	d.stateMu.Lock()
-	d.produceRate = m.MsgRate
-	d.consumeRate = m.ConsumeRate
-	d.stateMu.Unlock()
+	d.produceRate.Store(math.Float64bits(m.MsgRate))
+	d.consumeRate.Store(math.Float64bits(m.ConsumeRate))
 
 	prev := d.prevSnap.Load()
 	curr := d.currSnap.Load()
@@ -348,6 +341,7 @@ func (d *DQNScheduler) OnMetrics(m broker.Metrics) {
 		Done:      false,
 	}
 
+	d.experiencesSeen.Add(1)
 	select {
 	case d.expCh <- t:
 	case <-time.After(time.Millisecond):
@@ -429,17 +423,14 @@ func (d *DQNScheduler) policyLoop(ctx stdctx.Context) {
 			}
 
 			state := d.buildState(pi)
-
-			d.stateMu.Lock()
-			d.lastState = state
-			d.stateMu.Unlock()
-
-			rt := d.weightsMu.RLock()
 			q := d.forward(state)
-			d.weightsMu.RUnlock(rt)
 
 			threshold := argmaxSched(q)
 			d.cachedThreshold.Store(int32(threshold))
+
+			tau := currentTemperatureSched(d.experiencesSeen.Load())
+			probs := softmaxFromQSched(q, tau)
+			d.cachedThresholdProbs.Store(&probs)
 
 			snap := &schedPolicySnap{
 				state:     state,
@@ -447,11 +438,6 @@ func (d *DQNScheduler) policyLoop(ctx stdctx.Context) {
 			}
 			d.prevSnap.Store(d.currSnap.Load())
 			d.currSnap.Store(snap)
-
-			d.stateMu.Lock()
-			d.threshold = threshold
-			d.lastPolicyDepth = pi.Len()
-			d.stateMu.Unlock()
 
 		case <-ctx.Done():
 			return
@@ -527,11 +513,11 @@ func (d *DQNScheduler) buildState(pi *broker.PriorityIndex) []float64 {
 
 	ratioIdx := velocityIdx + 1
 	if ratioIdx < d.stateSize {
-		d.stateMu.Lock()
-		if d.consumeRate > 0 {
-			state[ratioIdx] = d.produceRate / d.consumeRate
+		cr := math.Float64frombits(d.consumeRate.Load())
+		if cr > 0 {
+			pr := math.Float64frombits(d.produceRate.Load())
+			state[ratioIdx] = pr / cr
 		}
-		d.stateMu.Unlock()
 	}
 
 	d.normalizer.Observe(state)
@@ -572,12 +558,10 @@ func (d *DQNScheduler) trainStep() float64 {
 	statesT := tensors.FromFlatDataAndDimensions(statesBuf, bs, d.stateSize)
 	nextStatesT := tensors.FromFlatDataAndDimensions(nextStatesBuf, bs, d.stateSize)
 
-	rt := d.weightsMu.RLock()
 	bestActionsT := d.bestActionsExec.MustExec1(nextStatesT)
 	nextQT := d.targetQForActionsExec.MustExec1(nextStatesT, bestActionsT)
 	actionsT := tensors.FromFlatDataAndDimensions(actions, bs)
 	currentQT := d.batchQExec.MustExec1(statesT, actionsT)
-	d.weightsMu.RUnlock(rt)
 
 	maxNextQ := tensorToFloat64Sched(nextQT)
 	currentQ := tensorToFloat64Sched(currentQT)
@@ -590,9 +574,6 @@ func (d *DQNScheduler) trainStep() float64 {
 		tdError := targets[i] - currentQ[i]
 		d.replayBuffer.UpdatePriority(idx, tdError)
 	}
-
-	d.weightsMu.Lock()
-	defer d.weightsMu.Unlock()
 
 	targetsT := tensors.FromFlatDataAndDimensions(targets, bs)
 	isWeightsT := tensors.FromFlatDataAndDimensions(isWeights, bs)
@@ -635,6 +616,62 @@ func argmaxSched(s []float64) int {
 		}
 	}
 	return best
+}
+
+const (
+	schedBoltzmannTauStart     = 0.5
+	schedBoltzmannTauEnd       = 0.05
+	schedBoltzmannAnnealingExp = 20_000
+)
+
+func currentTemperatureSched(experiencesSeen int64) float64 {
+	if experiencesSeen >= schedBoltzmannAnnealingExp {
+		return schedBoltzmannTauEnd
+	}
+	progress := float64(experiencesSeen) / float64(schedBoltzmannAnnealingExp)
+	return schedBoltzmannTauEnd + 0.5*(schedBoltzmannTauStart-schedBoltzmannTauEnd)*(1+math.Cos(progress*math.Pi))
+}
+
+func softmaxFromQSched(q []float64, tau float64) []float64 {
+	if tau <= 0 {
+		tau = 1e-8
+	}
+	maxQ := q[0]
+	for _, v := range q[1:] {
+		if v > maxQ {
+			maxQ = v
+		}
+	}
+	probs := make([]float64, len(q))
+	var sum float64
+	for i, v := range q {
+		e := math.Exp((v - maxQ) / tau)
+		probs[i] = e
+		sum += e
+	}
+	if sum > 0 {
+		for i := range probs {
+			probs[i] /= sum
+		}
+	} else {
+		u := 1.0 / float64(len(probs))
+		for i := range probs {
+			probs[i] = u
+		}
+	}
+	return probs
+}
+
+func sampleCDFSched(probs []float64) int {
+	r := rand.Float64()
+	var cumulative float64
+	for i, p := range probs {
+		cumulative += p
+		if r < cumulative {
+			return i
+		}
+	}
+	return len(probs) - 1
 }
 
 func tensorToFloat64Sched(t *tensors.Tensor) []float64 {

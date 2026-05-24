@@ -249,6 +249,27 @@ func algNameToHTTP(name string) string {
 	}
 }
 
+// BalancerExperiencesSeen returns experience count across all modes.
+// For external modes, queries the broker via the HTTP admin endpoint.
+func (h *Harness) BalancerExperiencesSeen(ctx context.Context) (int64, error) {
+	if brk := h.Broker(); brk != nil {
+		return brk.BalancerExperiencesSeen(), nil
+	}
+	if h.httpClient != nil {
+		return h.httpClient.GetBalancerStats(ctx)
+	}
+	addr := h.httpBrokerAddr
+	if addr == "" {
+		addr = h.brokerAddr
+	}
+	if addr != "" {
+		tmpClient := transport.NewHTTPClient(addr)
+		defer tmpClient.Close()
+		return tmpClient.GetBalancerStats(ctx)
+	}
+	return -1, nil
+}
+
 // Broker returns the in-process broker (nil for Kafka mode).
 func (h *Harness) Broker() *broker.Broker {
 	if h.app != nil {

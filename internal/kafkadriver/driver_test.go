@@ -104,3 +104,69 @@ func TestKafkaHarnessConsumerCachedAcrossCalls(t *testing.T) {
 		t.Fatalf("expected cached consumer, got distinct instances: %p vs %p", c1, c2)
 	}
 }
+
+func TestKafkaProducerRecoversFromInitFailure(t *testing.T) {
+	broker := kafkaBroker()
+	if !kafkaAvailable(broker) {
+		t.Skipf("kafka not available at %s, set KAFKA_BROKER to run", broker)
+	}
+
+	h := New([]string{"127.0.0.1:1"})
+	defer h.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := h.Produce(ctx, "no-such-topic", []byte("k"), []byte("x"))
+	require.Error(t, err, "produce to unreachable broker should fail")
+
+	h.Close()
+
+	h2 := New([]string{broker})
+	defer h2.Close()
+
+	topic := "test-recovery-" + t.Name()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel2()
+	_ = h2.DeleteTopic(ctx2, topic)
+	require.NoError(t, h2.CreateTopic(ctx2, topic, 1))
+	defer func() { _ = h2.DeleteTopic(ctx2, topic) }()
+
+	err = h2.Produce(ctx2, topic, []byte("k"), []byte("ok"))
+	require.NoError(t, err, "produce to valid broker after reconnect should succeed")
+}
+
+func TestKafkaSingleClientNoRebalance(t *testing.T) {
+	broker := kafkaBroker()
+	if !kafkaAvailable(broker) {
+		t.Skipf("kafka not available at %s, set KAFKA_BROKER to run", broker)
+	}
+
+	h := New([]string{broker})
+	defer h.Close()
+
+	topic := "test-single-client-" + t.Name()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	_ = h.DeleteTopic(ctx, topic)
+	require.NoError(t, h.CreateTopic(ctx, topic, 4))
+	defer func() { _ = h.DeleteTopic(ctx, topic) }()
+
+	recs := make([]kgo.Record, 20)
+	for i := range recs {
+		recs[i] = kgo.Record{Key: []byte("k"), Value: []byte("v"), Partition: int32(i % 4)}
+	}
+	require.NoError(t, h.ProduceBatch(ctx, topic, recs))
+
+	time.Sleep(500 * time.Millisecond)
+
+	c0 := h.consumerFor(topic, "", 0)
+	c1 := h.consumerFor(topic, "", 1)
+	c2 := h.consumerFor(topic, "", 2)
+	c3 := h.consumerFor(topic, "", 3)
+
+	require.Same(t, c0, c1, "partitions 0 and 1 should share the same kgo.Client")
+	require.Same(t, c1, c2, "partitions 1 and 2 should share the same kgo.Client")
+	require.Same(t, c2, c3, "partitions 2 and 3 should share the same kgo.Client")
+}
