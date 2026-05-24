@@ -129,6 +129,8 @@ type DQNBalancer struct {
 	cachedArgmax  atomic.Int32
 	deterministic bool
 
+	weightsMu sync.RWMutex
+
 	prevSnap atomic.Pointer[policySnap]
 	currSnap atomic.Pointer[policySnap]
 
@@ -381,7 +383,10 @@ func (d *DQNBalancer) forward(state []float64) []float64 {
 	epsAI := sampleNoise(d.noiseAdvIn)
 	epsAO := sampleNoise(d.noiseAdvOut)
 
+	d.weightsMu.RLock()
 	result := d.fwdExec.MustExec1(norm, epsVI, epsVO, epsAI, epsAO)
+	d.weightsMu.RUnlock()
+
 	float64BufPool.Put(buf)
 	return tensorToFloat64Slice(result)
 }
@@ -786,6 +791,8 @@ func (d *DQNBalancer) trainStep() float64 {
 	statesT := tensors.FromFlatDataAndDimensions(statesBuf, bs, d.stateSize)
 	nextStatesT := tensors.FromFlatDataAndDimensions(nextStatesBuf, bs, d.stateSize)
 
+	d.weightsMu.Lock()
+
 	bestActionsT := d.bestActionsExec.MustExec1(nextStatesT)
 	nextQT := d.targetQForActionsExec.MustExec1(nextStatesT, bestActionsT)
 	actionsT := tensors.FromFlatDataAndDimensions(actions, bs)
@@ -827,6 +834,8 @@ func (d *DQNBalancer) trainStep() float64 {
 	lossT := d.trainExec.MustExec1(statesT, targetsT, actionsT, isWeightsT)
 
 	d.targetNet.Step()
+
+	d.weightsMu.Unlock()
 
 	lossVals := tensorToFloat64Slice(lossT)
 	if len(lossVals) > 0 {

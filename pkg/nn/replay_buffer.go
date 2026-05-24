@@ -161,6 +161,7 @@ type PrioritizedReplayBuffer struct {
 	sumTree     *SumTree
 	alpha       float64
 	maxPriority float64
+	atomicLen   atomic.Int64
 }
 
 func NewPrioritizedReplayBuffer(capacity int, alpha float64) *PrioritizedReplayBuffer {
@@ -182,6 +183,7 @@ func (b *PrioritizedReplayBuffer) Push(t Transition) {
 
 	priority := math.Pow(b.maxPriority, b.alpha)
 	b.sumTree.Add(cp, priority)
+	b.atomicLen.Store(int64(b.sumTree.size))
 }
 
 // Sample returns a batch of transitions sampled proportional to priority^alpha
@@ -252,8 +254,9 @@ func (b *PrioritizedReplayBuffer) Cap() int {
 	return b.sumTree.capacity
 }
 
+// Len is safe to call from any goroutine.
 func (b *PrioritizedReplayBuffer) Len() int {
-	return b.sumTree.size
+	return int(b.atomicLen.Load())
 }
 
 // BetaSchedule linearly anneals beta from start to end over a given number of steps.

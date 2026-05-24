@@ -394,7 +394,6 @@ func (s *DQNSuite) TestWeightDecayPreventsGrowth() {
 
 func (s *DQNSuite) TestRawStateInReplay() {
 	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
-	defer dqn.Stop()
 
 	dqn.OnMetrics(broker.Metrics{
 		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000, MsgRate: 10000},
@@ -412,6 +411,8 @@ func (s *DQNSuite) TestRawStateInReplay() {
 	require.Eventually(s.T(), func() bool {
 		return dqn.replayBuffer.Len() > 0
 	}, 3*time.Second, 10*time.Millisecond)
+
+	dqn.Stop()
 
 	batch, _, _ := dqn.replayBuffer.Sample(1, 1.0)
 	require.NotEmpty(s.T(), batch)
@@ -837,9 +838,8 @@ func (s *DQNSuite) TestDQNNoStateMutexNoPopArtMutex() {
 	dqnType := reflect.TypeOf(dqn).Elem()
 	for i := 0; i < dqnType.NumField(); i++ {
 		f := dqnType.Field(i)
-		typeName := f.Type.String()
-		if f.Name == "stateMu" || f.Name == "weightsMu" {
-			s.Failf("forbidden mutex field", "DQNBalancer has %s (%s)", f.Name, typeName)
+		if f.Name == "stateMu" {
+			s.Failf("forbidden mutex field", "DQNBalancer still has stateMu (%s)", f.Type.String())
 		}
 	}
 

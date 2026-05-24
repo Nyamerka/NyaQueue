@@ -309,9 +309,11 @@ func NewRingBuffer(size int) *RingBuffer {
 }
 
 func (rb *RingBuffer) Push(v float64) {
+	rb.mu.Lock()
 	idx := rb.writeIdx.Add(1) - 1
 	slot := idx % int64(len(rb.data))
 	rb.data[slot] = v
+	rb.mu.Unlock()
 }
 
 // Values allocates and returns a copy of the buffer contents in chronological order.
