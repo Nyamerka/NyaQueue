@@ -247,6 +247,33 @@ func (c *HTTPClient) ListTopics(ctx context.Context) ([]HTTPTopicInfo, error) {
 	return infos, nil
 }
 
+func (c *HTTPClient) SetBalancer(ctx context.Context, algorithm string, numPartitions int) error {
+	body, err := json.Marshal(HTTPSetBalancerRequest{
+		Algorithm:     algorithm,
+		NumPartitions: numPartitions,
+	})
+	if err != nil {
+		return oops.Wrapf(err, "marshal")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/admin/balancer", bytes.NewReader(body))
+	if err != nil {
+		return oops.Wrapf(err, "new request")
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return oops.Wrapf(err, "do request")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		return readHTTPError(resp)
+	}
+	return nil
+}
+
 func readHTTPError(resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	var errResp HTTPErrorResponse

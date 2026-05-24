@@ -430,3 +430,16 @@ func (s *ConfigWiringSuite) TestMaxQueuedRequestsSemaphore() {
 	require.NotNil(s.T(), srv.reqSem)
 	require.Equal(s.T(), 1, cap(srv.reqSem))
 }
+
+func (s *TransportSuite) TestSetBalancerRPCGRPC() {
+	ctx := context.Background()
+
+	err := s.client.SetBalancer(ctx, pb.BalancerAlgorithm_POWER_OF_TWO_CHOICES, 4)
+	require.NoError(s.T(), err, "SetBalancer should succeed via gRPC")
+
+	err = s.client.SetBalancer(ctx, pb.BalancerAlgorithm_ROUND_ROBIN, 4)
+	require.NoError(s.T(), err, "SetBalancer to RoundRobin should succeed")
+
+	err = s.client.SetBalancer(ctx, pb.BalancerAlgorithm_PSA, 8)
+	require.NoError(s.T(), err, "SetBalancer to PSA should succeed")
+}

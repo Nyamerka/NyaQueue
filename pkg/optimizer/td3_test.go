@@ -10,13 +10,13 @@ import (
 	"github.com/stretchr/testify/suite"
 )
 
-type DDPGSuite struct {
+type TD3Suite struct {
 	suite.Suite
 }
 
-func TestDDPGSuite(t *testing.T) { suite.Run(t, new(DDPGSuite)) }
+func TestTD3Suite(t *testing.T) { suite.Run(t, new(TD3Suite)) }
 
-func (s *DDPGSuite) TestAct() {
+func (s *TD3Suite) TestAct() {
 	tests := []struct {
 		name       string
 		stateSize  int
@@ -29,7 +29,7 @@ func (s *DDPGSuite) TestAct() {
 
 	for _, tc := range tests {
 		s.Run(tc.name, func() {
-			d := NewDDPG(tc.stateSize, tc.actionSize, 0.001, 32)
+			d := NewTD3(tc.stateSize, tc.actionSize, 0.001, 32)
 			state := make([]float64, tc.stateSize)
 			for i := range state {
 				state[i] = float64(i) * 0.1
@@ -45,8 +45,8 @@ func (s *DDPGSuite) TestAct() {
 	}
 }
 
-func (s *DDPGSuite) TestStoreAndTrain() {
-	d := NewDDPG(5, 3, 0.001, 32)
+func (s *TD3Suite) TestStoreAndTrain() {
+	d := NewTD3(5, 3, 0.001, 32)
 
 	for i := 0; i < 200; i++ {
 		state := []float64{float64(i), 0.1, 0.2, 0.3, 0.4}
@@ -58,20 +58,22 @@ func (s *DDPGSuite) TestStoreAndTrain() {
 	require.NotPanics(s.T(), func() { d.Train(32) })
 }
 
-func (s *DDPGSuite) TestTrainInsufficientData() {
-	d := NewDDPG(5, 3, 0.001, 32)
+func (s *TD3Suite) TestTrainInsufficientData() {
+	d := NewTD3(5, 3, 0.001, 32)
 	d.Store([]float64{1, 2, 3, 4, 5}, []float64{0.1, 0.2, 0.3}, 1.0, []float64{2, 3, 4, 5, 6}, false)
 
 	require.NotPanics(s.T(), func() { d.Train(64) })
 }
 
-func (s *DDPGSuite) TestResetNoise() {
-	d := NewDDPG(5, 3, 0.001, 32)
-	require.NotPanics(s.T(), func() { d.ResetNoise() })
+func (s *TD3Suite) TestResetNoise() {
+	d := NewTD3(5, 3, 0.001, 32)
+	d.sigma = 0.01
+	d.ResetNoise()
+	require.Equal(s.T(), td3ExploreNoiseInit, d.sigma)
 }
 
-func (s *DDPGSuite) TestActorForwardOutputInRange() {
-	d := NewDDPG(5, 3, 0.001, 32)
+func (s *TD3Suite) TestActorForwardOutputInRange() {
+	d := NewTD3(5, 3, 0.001, 32)
 	state := []float64{0.1, 0.2, 0.3, 0.4, 0.5}
 
 	d.mu.Lock()
@@ -86,22 +88,76 @@ func (s *DDPGSuite) TestActorForwardOutputInRange() {
 	}
 }
 
-func (s *DDPGSuite) TestCriticBatchedReturnsCorrectShape() {
-	d := NewDDPG(5, 3, 0.001, 32)
+func (s *TD3Suite) TestTwinCriticsBothReturnCorrectShape() {
+	d := NewTD3(5, 3, 0.001, 32)
 
-	states := tensors.FromFlatDataAndDimensions([]float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.5, 0.4, 0.3, 0.2, 0.1}, 2, 5)
-	actions := tensors.FromFlatDataAndDimensions([]float64{0.1, 0.2, 0.3, 0.3, 0.2, 0.1}, 2, 3)
+	states := tensors.FromFlatDataAndDimensions(
+		[]float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.5, 0.4, 0.3, 0.2, 0.1}, 2, 5)
+	actions := tensors.FromFlatDataAndDimensions(
+		[]float64{0.1, 0.2, 0.3, 0.3, 0.2, 0.1}, 2, 3)
 
 	d.mu.Lock()
-	result := d.targetCriticExec.MustExec1(states, actions)
+	q1 := tensorToFloat64(d.targetCritic1Exec.MustExec1(states, actions))
+	q2 := tensorToFloat64(d.targetCritic2Exec.MustExec1(states, actions))
 	d.mu.Unlock()
 
-	out := tensorToFloat64(result)
-	require.Len(s.T(), out, 2, "batched critic should return one Q-value per sample")
+	require.Len(s.T(), q1, 2, "critic1 should return one Q per sample")
+	require.Len(s.T(), q2, 2, "critic2 should return one Q per sample")
 }
 
-func (s *DDPGSuite) TestTrainUpdatesActorWeights() {
-	d := NewDDPG(5, 3, 0.01, 32)
+func (s *TD3Suite) TestTwinCriticsAreDifferent() {
+	d := NewTD3(5, 3, 0.001, 32)
+
+	for i := 0; i < 200; i++ {
+		d.Store(
+			[]float64{float64(i) * 0.01, 0.1, 0.2, 0.3, 0.4},
+			[]float64{0.1, -0.2, 0.3},
+			1.0,
+			[]float64{float64(i+1) * 0.01, 0.2, 0.3, 0.4, 0.5},
+			false,
+		)
+	}
+	for i := 0; i < 5; i++ {
+		d.Train(32)
+	}
+
+	states := tensors.FromFlatDataAndDimensions(
+		[]float64{0.5, 0.5, 0.5, 0.5, 0.5}, 1, 5)
+	actions := tensors.FromFlatDataAndDimensions(
+		[]float64{0.1, 0.2, 0.3}, 1, 3)
+
+	d.mu.Lock()
+	q1 := tensorToFloat64(d.targetCritic1Exec.MustExec1(states, actions))
+	q2 := tensorToFloat64(d.targetCritic2Exec.MustExec1(states, actions))
+	d.mu.Unlock()
+
+	require.NotEqual(s.T(), q1[0], q2[0],
+		"twin critics should have different Q-values after independent training")
+}
+
+func (s *TD3Suite) TestDelayedActorUpdate() {
+	d := NewTD3(5, 3, 0.01, 32)
+
+	for i := 0; i < 200; i++ {
+		d.Store(
+			[]float64{float64(i) * 0.01, 0.1, 0.2, 0.3, 0.4},
+			[]float64{0.1, -0.2, 0.3},
+			1.0,
+			[]float64{float64(i+1) * 0.01, 0.2, 0.3, 0.4, 0.5},
+			false,
+		)
+	}
+
+	d.Train(32)
+	require.Equal(s.T(), 1, d.criticStep)
+
+	d.Train(32)
+	require.Equal(s.T(), 2, d.criticStep,
+		"after 2 critic steps, delayed actor update should have triggered")
+}
+
+func (s *TD3Suite) TestTrainUpdatesActorWeights() {
+	d := NewTD3(5, 3, 0.01, 32)
 
 	state := []float64{0.5, 0.5, 0.5, 0.5, 0.5}
 	actionBefore := d.Act(state)
@@ -115,7 +171,10 @@ func (s *DDPGSuite) TestTrainUpdatesActorWeights() {
 			false,
 		)
 	}
-	d.Train(32)
+
+	for i := 0; i < 4; i++ {
+		d.Train(32)
+	}
 
 	actionAfter := d.Act(state)
 
@@ -129,11 +188,10 @@ func (s *DDPGSuite) TestTrainUpdatesActorWeights() {
 	require.True(s.T(), changed, "actor should produce different actions after training")
 }
 
-func (s *DDPGSuite) TestSoftUpdateChangesTarget() {
-	d := NewDDPG(5, 3, 0.001, 32)
+func (s *TD3Suite) TestSoftUpdateChangesTarget() {
+	d := NewTD3(5, 3, 0.001, 32)
 
 	state := []float64{0.5, 0.5, 0.5, 0.5, 0.5}
-
 	mainAction := d.Act(state)
 	require.Len(s.T(), mainAction, 3)
 
@@ -146,7 +204,10 @@ func (s *DDPGSuite) TestSoftUpdateChangesTarget() {
 			false,
 		)
 	}
-	d.Train(32)
+
+	for i := 0; i < 4; i++ {
+		d.Train(32)
+	}
 
 	actionAfter := d.Act(state)
 
@@ -160,8 +221,8 @@ func (s *DDPGSuite) TestSoftUpdateChangesTarget() {
 	require.True(s.T(), changed, "target network should update via soft update")
 }
 
-func (s *DDPGSuite) TestBatchedTrainMultipleSteps() {
-	d := NewDDPG(5, 3, 0.001, 32)
+func (s *TD3Suite) TestBatchedTrainMultipleSteps() {
+	d := NewTD3(5, 3, 0.001, 32)
 
 	for i := 0; i < 300; i++ {
 		d.Store(
@@ -180,8 +241,8 @@ func (s *DDPGSuite) TestBatchedTrainMultipleSteps() {
 	})
 }
 
-func (s *DDPGSuite) TestSoftUpdateDtypeRobust() {
-	d := NewDDPG(5, 3, 0.001, 32)
+func (s *TD3Suite) TestSoftUpdateDtypeRobust() {
+	d := NewTD3(5, 3, 0.001, 32)
 	require.NotPanics(s.T(), func() {
 		d.mu.Lock()
 		d.softUpdate()
@@ -190,8 +251,8 @@ func (s *DDPGSuite) TestSoftUpdateDtypeRobust() {
 	require.Greater(s.T(), len(d.varPairs), 0, "varPairs should be populated")
 }
 
-func (s *DDPGSuite) TestSoftUpdateBlendedWeights() {
-	d := NewDDPG(5, 3, 0.001, 32)
+func (s *TD3Suite) TestSoftUpdateBlendedWeights() {
+	d := NewTD3(5, 3, 0.001, 32)
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -208,7 +269,7 @@ func (s *DDPGSuite) TestSoftUpdateBlendedWeights() {
 
 	expectedBuf := make([]float64, len(tgtFlat))
 	for i := range expectedBuf {
-		expectedBuf[i] = (1-ddpgTau)*tgtFlat[i] + ddpgTau*srcFlat[i]
+		expectedBuf[i] = (1-td3Tau)*tgtFlat[i] + td3Tau*srcFlat[i]
 	}
 
 	d.softUpdate()
@@ -221,23 +282,8 @@ func (s *DDPGSuite) TestSoftUpdateBlendedWeights() {
 	}
 }
 
-func flattenTensorValue(v interface{}) []float64 {
-	switch d := v.(type) {
-	case []float64:
-		return d
-	case [][]float64:
-		var out []float64
-		for _, row := range d {
-			out = append(out, row...)
-		}
-		return out
-	default:
-		return nil
-	}
-}
-
-func (s *DDPGSuite) TestStoreDeepCopies() {
-	d := NewDDPG(5, 3, 0.001, 32)
+func (s *TD3Suite) TestStoreDeepCopies() {
+	d := NewTD3(5, 3, 0.001, 32)
 	state := []float64{1, 2, 3, 4, 5}
 	action := []float64{0.1, 0.2, 0.3}
 	nextState := []float64{2, 3, 4, 5, 6}
@@ -253,30 +299,30 @@ func (s *DDPGSuite) TestStoreDeepCopies() {
 	require.Equal(s.T(), 2.0, batch[0].NextState[0], "Store must deep-copy nextState")
 }
 
-func (s *DDPGSuite) TestPreAllocatedBuffersProperty() {
+func (s *TD3Suite) TestPreAllocatedBuffersProperty() {
 	batchSize := 32
-	d := NewDDPG(5, 3, 0.001, batchSize)
+	d := NewTD3(5, 3, 0.001, batchSize)
 	require.GreaterOrEqual(s.T(), len(d.statesBuf), batchSize*d.stateSize)
 	require.GreaterOrEqual(s.T(), len(d.actionsBuf), batchSize*d.actionSize)
 	require.GreaterOrEqual(s.T(), len(d.rewardsBuf), batchSize)
 	require.GreaterOrEqual(s.T(), len(d.targetQBuf), batchSize)
 }
 
-func (s *DDPGSuite) TestNoiseDecay() {
-	d := NewDDPG(5, 3, 0.001, 32)
+func (s *TD3Suite) TestNoiseDecay() {
+	d := NewTD3(5, 3, 0.001, 32)
 	d.SetNoiseDecay(0.9, 0.01)
 
-	initial := d.noise.Sigma()
+	initial := d.Sigma()
 	for i := 0; i < 50; i++ {
-		d.noise.Sample()
+		d.DecayNoise()
 	}
-	after := d.noise.Sigma()
+	after := d.Sigma()
 	require.Less(s.T(), after, initial, "sigma should decay over steps")
 	require.GreaterOrEqual(s.T(), after, 0.01, "sigma should not go below floor")
 }
 
-func (s *DDPGSuite) TestConcurrentActAndTrain() {
-	d := NewDDPG(5, 3, 0.001, 32)
+func (s *TD3Suite) TestConcurrentActAndTrain() {
+	d := NewTD3(5, 3, 0.001, 32)
 
 	for i := 0; i < 200; i++ {
 		d.Store(
@@ -309,7 +355,7 @@ func (s *DDPGSuite) TestConcurrentActAndTrain() {
 	wg.Wait()
 }
 
-func (s *DDPGSuite) TestOptimizer_EmergencyRollback() {
+func (s *TD3Suite) TestOptimizer_EmergencyRollback() {
 	opt := &Optimizer{
 		minApplyInterval: DefaultMinApplyInterval,
 	}
@@ -338,7 +384,7 @@ func (s *DDPGSuite) TestOptimizer_EmergencyRollback() {
 	require.Equal(s.T(), 2, opt.lowDeliveryTicksInARow, "counter frozen after rollback")
 }
 
-func (s *DDPGSuite) TestOptimizer_EmergencyRollback_Recovery() {
+func (s *TD3Suite) TestOptimizer_EmergencyRollback_Recovery() {
 	opt := &Optimizer{
 		minApplyInterval: DefaultMinApplyInterval,
 	}
@@ -355,4 +401,45 @@ func (s *DDPGSuite) TestOptimizer_EmergencyRollback_Recovery() {
 	opt.checkEmergencyRollback(healthy)
 	require.Equal(s.T(), 0, opt.lowDeliveryTicksInARow, "good tick should reset counter")
 	require.False(s.T(), opt.rolledBack)
+}
+
+func flattenTensorValue(v interface{}) []float64 {
+	switch d := v.(type) {
+	case []float64:
+		return d
+	case [][]float64:
+		var out []float64
+		for _, row := range d {
+			out = append(out, row...)
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func (s *TD3Suite) TestGaussianExplorationNoise() {
+	d := NewTD3(5, 3, 0.001, 32)
+	d.sigma = 0.5
+	state := []float64{0.5, 0.5, 0.5, 0.5, 0.5}
+
+	var actions [][]float64
+	for i := 0; i < 50; i++ {
+		actions = append(actions, d.Act(state))
+	}
+
+	differ := false
+	for i := 1; i < len(actions); i++ {
+		for j := range actions[i] {
+			if actions[i][j] != actions[0][j] {
+				differ = true
+				break
+			}
+		}
+		if differ {
+			break
+		}
+	}
+	require.True(s.T(), differ,
+		"Gaussian noise should produce variation in actions across calls")
 }

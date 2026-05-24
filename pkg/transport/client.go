@@ -169,6 +169,17 @@ func (c *Client) GetMetrics(ctx context.Context) (*pb.MetricsResponse, error) {
 	return resp, nil
 }
 
+func (c *Client) SetBalancer(ctx context.Context, algo pb.BalancerAlgorithm, numPartitions int32) error {
+	_, err := c.client.SetBalancer(ctx, &pb.SetBalancerRequest{
+		Algorithm:     algo,
+		NumPartitions: numPartitions,
+	})
+	if err != nil {
+		return oops.Wrapf(err, "set-balancer algorithm=%s k=%d", algo, numPartitions)
+	}
+	return nil
+}
+
 // BufferedProducer accumulates messages and sends them in batches via a single
 // Produce RPC, amortising the per-RPC cost across many messages.
 type BufferedProducer struct {

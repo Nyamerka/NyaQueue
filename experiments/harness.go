@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v3"
-	kafka "github.com/segmentio/kafka-go"
+	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/Nyamerka/NyaQueue/internal/app"
 	"github.com/Nyamerka/NyaQueue/internal/kafkadriver"
@@ -97,11 +97,15 @@ func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 	k := cfg.NumPartitions
 	balancerFactory := func() broker.Balancer { return cfg.Algorithm.NewBalancer(k) }
 
+	appOpts := []app.Option{app.WithBalancerFactory(balancerFactory)}
+	if cfg.Algorithm.UseOptimizer && cfg.Algorithm.OptimizerOpts != nil {
+		params, optCfg := cfg.Algorithm.OptimizerOpts()
+		appOpts = append(appOpts, app.WithOptimizer(params, optCfg))
+	}
+
 	switch cfg.Mode {
 	case ModeInProcess:
-		a, err := app.New(cfg.BrokerConfig, cfg.DataDir,
-			app.WithBalancerFactory(balancerFactory),
-		)
+		a, err := app.New(cfg.BrokerConfig, cfg.DataDir, appOpts...)
 		if err != nil {
 			return nil, oops.Wrapf(err, "app new")
 		}
@@ -124,11 +128,8 @@ func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 				return nil, oops.Wrapf(err, "external grpc broker not ready at %s", cfg.BrokerAddr)
 			}
 		} else {
-			// Local broker with gRPC: loopback connection inside the same process.
-			a, err := app.New(cfg.BrokerConfig, cfg.DataDir,
-				app.WithBalancerFactory(balancerFactory),
-				app.WithGRPC(":0"),
-			)
+			grpcOpts := append(appOpts, app.WithGRPC(":0"))
+			a, err := app.New(cfg.BrokerConfig, cfg.DataDir, grpcOpts...)
 			if err != nil {
 				return nil, oops.Wrapf(err, "app new")
 			}
@@ -164,10 +165,8 @@ func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 				return nil, oops.Wrapf(err, "external http broker not ready at %s", httpAddr)
 			}
 		} else {
-			a, err := app.New(cfg.BrokerConfig, cfg.DataDir,
-				app.WithBalancerFactory(balancerFactory),
-				app.WithHTTP(":0"),
-			)
+			httpOpts := append(appOpts, app.WithHTTP(":0"))
+			a, err := app.New(cfg.BrokerConfig, cfg.DataDir, httpOpts...)
 			if err != nil {
 				return nil, oops.Wrapf(err, "app new")
 			}
@@ -199,10 +198,54 @@ func (h *Harness) IsExternal() bool {
 
 // SwitchBalancer sets the balancer on the broker for the current run.
 // For in-process and local gRPC/HTTP modes, directly sets via the broker API.
-// For external modes, this is a no-op (external broker manages its own balancer).
-func (h *Harness) SwitchBalancer(alg AlgorithmConfig, k int) {
+// For external modes, calls the admin RPC to switch the balancer.
+func (h *Harness) SwitchBalancer(alg AlgorithmConfig, k int) error {
 	if brk := h.Broker(); brk != nil {
 		brk.SetBalancer(alg.NewBalancer(k))
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	protoAlgo := algNameToProto(alg.Name)
+
+	switch h.mode {
+	case ModeGRPC:
+		if h.grpc != nil {
+			return h.grpc.SetBalancer(ctx, protoAlgo, int32(k))
+		}
+	case ModeHTTP:
+		if h.httpClient != nil {
+			return h.httpClient.SetBalancer(ctx, algNameToHTTP(alg.Name), k)
+		}
+	}
+	return nil
+}
+
+func algNameToProto(name string) pb.BalancerAlgorithm {
+	switch {
+	case name == "RR+FIFO":
+		return pb.BalancerAlgorithm_ROUND_ROBIN
+	case name == "P2C+FIFO":
+		return pb.BalancerAlgorithm_POWER_OF_TWO_CHOICES
+	case name == "PSA+FIFO":
+		return pb.BalancerAlgorithm_PSA
+	default:
+		return pb.BalancerAlgorithm_DQN
+	}
+}
+
+func algNameToHTTP(name string) string {
+	switch {
+	case name == "RR+FIFO":
+		return "round_robin"
+	case name == "P2C+FIFO":
+		return "power_of_two_choices"
+	case name == "PSA+FIFO":
+		return "psa"
+	default:
+		return "dqn"
 	}
 }
 
@@ -371,11 +414,11 @@ func (h *Harness) PublishBatch(ctx context.Context, topic string, items []BatchI
 		return len(results), nil
 
 	case ModeKafka:
-		kmsgs := make([]kafka.Message, len(items))
+		recs := make([]kgo.Record, len(items))
 		for i, it := range items {
-			kmsgs[i] = kafka.Message{Key: it.Key, Value: it.Value}
+			recs[i] = kgo.Record{Key: it.Key, Value: it.Value}
 		}
-		if err := h.kfk.ProduceBatch(ctx, topic, kmsgs); err != nil {
+		if err := h.kfk.ProduceBatch(ctx, topic, recs); err != nil {
 			return 0, oops.Wrapf(err, "produce batch kafka topic=%q", topic)
 		}
 		return len(items), nil
@@ -465,7 +508,11 @@ func (h *Harness) ConsumeBatch(ctx context.Context, topic, group string, partiti
 		if len(msgs) == 0 {
 			return nil, ErrNoMessage
 		}
-		return []*ConsumedMessage{{Value: msgs[0].Value, Offset: msgs[0].Offset}}, nil
+		result := make([]*ConsumedMessage, len(msgs))
+		for i, msg := range msgs {
+			result[i] = &ConsumedMessage{Value: msg.Value, Offset: msg.Offset}
+		}
+		return result, nil
 	}
 
 	return nil, oops.Errorf("unsupported mode")

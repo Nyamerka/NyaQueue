@@ -4,6 +4,7 @@ import (
 	stdctx "context"
 	"log"
 	"math"
+	"math/rand/v2"
 	"runtime"
 	"sync/atomic"
 	"time"
@@ -82,6 +83,11 @@ type DQNScheduler struct {
 	consumeRate     float64
 
 	lastPolicyDepth int // protected by stateMu
+
+	noiseValueIn  int
+	noiseValueOut int
+	noiseAdvIn    int
+	noiseAdvOut   int
 }
 
 const (
@@ -165,11 +171,23 @@ func (d *DQNScheduler) initGoMLX() {
 		optimizers.ParamAdamWeightDecay: 1e-4,
 	})
 
-	d.fwdExec = context.MustNewExec(d.backend, d.ctx, func(ctx *context.Context, state *Node) *Node {
-		return d.qNetworkGraph(ctx, state)
-	})
+	initExec := context.MustNewExec(d.backend, d.ctx,
+		func(ctx *context.Context, state *Node) *Node {
+			return d.qNetworkGraph(ctx, state)
+		})
 	dummyState := make([]float64, d.stateSize)
-	d.fwdExec.MustExec(dummyState)
+	initExec.MustExec(dummyState)
+	initExec.Finalize()
+
+	d.noiseValueIn = d.hiddenSize / 4
+	d.noiseValueOut = 1
+	d.noiseAdvIn = d.hiddenSize / 4
+	d.noiseAdvOut = d.numActions
+
+	d.fwdExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
+		func(ctx *context.Context, state, epsValueIn, epsValueOut, epsAdvIn, epsAdvOut *Node) *Node {
+			return d.qNetworkGraphExternalNoise(ctx, state, epsValueIn, epsValueOut, epsAdvIn, epsAdvOut)
+		})
 
 	d.targetNet = nn.NewTargetNetwork(d.ctx)
 
@@ -218,12 +236,35 @@ func (d *DQNScheduler) qNetworkBatch(ctx *context.Context, x *Node) *Node {
 	vStream := layers.Dense(ctx.In("value_hidden"), h, true, d.hiddenSize/4)
 	vStream = layers.LayerNormalization(ctx.In("ln_vh"), vStream, -1).Done()
 	vStream = activations.Relu(vStream)
-	v := layers.Dense(ctx.In("value_out"), vStream, true, 1)
+	v := nn.NoisyLinear(ctx.In("value_out"), vStream, 1, nn.DefaultNoisySigmaInit)
 
 	aStream := layers.Dense(ctx.In("adv_hidden"), h, true, d.hiddenSize/4)
 	aStream = layers.LayerNormalization(ctx.In("ln_ah"), aStream, -1).Done()
 	aStream = activations.Relu(aStream)
-	a := layers.Dense(ctx.In("adv_out"), aStream, true, d.numActions)
+	a := nn.NoisyLinear(ctx.In("adv_out"), aStream, d.numActions, nn.DefaultNoisySigmaInit)
+
+	aMean := ReduceMean(a, -1)
+	aMean = ExpandDims(aMean, -1)
+	return Add(v, Sub(a, aMean))
+}
+
+func (d *DQNScheduler) qNetworkBatchExternalNoise(ctx *context.Context, x *Node, epsValueIn, epsValueOut, epsAdvIn, epsAdvOut *Node) *Node {
+	h := layers.Dense(ctx.In("feature1"), x, true, d.hiddenSize)
+	h = layers.LayerNormalization(ctx.In("ln1"), h, -1).Done()
+	h = activations.Relu(h)
+	h = layers.Dense(ctx.In("feature2"), h, true, d.hiddenSize/2)
+	h = layers.LayerNormalization(ctx.In("ln2"), h, -1).Done()
+	h = activations.Relu(h)
+
+	vStream := layers.Dense(ctx.In("value_hidden"), h, true, d.hiddenSize/4)
+	vStream = layers.LayerNormalization(ctx.In("ln_vh"), vStream, -1).Done()
+	vStream = activations.Relu(vStream)
+	v := nn.NoisyLinearExternal(ctx.In("value_out"), vStream, epsValueIn, epsValueOut, 1, nn.DefaultNoisySigmaInit)
+
+	aStream := layers.Dense(ctx.In("adv_hidden"), h, true, d.hiddenSize/4)
+	aStream = layers.LayerNormalization(ctx.In("ln_ah"), aStream, -1).Done()
+	aStream = activations.Relu(aStream)
+	a := nn.NoisyLinearExternal(ctx.In("adv_out"), aStream, epsAdvIn, epsAdvOut, d.numActions, nn.DefaultNoisySigmaInit)
 
 	aMean := ReduceMean(a, -1)
 	aMean = ExpandDims(aMean, -1)
@@ -236,8 +277,19 @@ func (d *DQNScheduler) qNetworkGraph(ctx *context.Context, state *Node) *Node {
 	return Reshape(q, d.numActions)
 }
 
+func (d *DQNScheduler) qNetworkGraphExternalNoise(ctx *context.Context, state, epsValueIn, epsValueOut, epsAdvIn, epsAdvOut *Node) *Node {
+	x := InsertAxes(state, 0)
+	q := d.qNetworkBatchExternalNoise(ctx, x, epsValueIn, epsValueOut, epsAdvIn, epsAdvOut)
+	return Reshape(q, d.numActions)
+}
+
 func (d *DQNScheduler) forward(state []float64) []float64 {
-	result := d.fwdExec.MustExec1(state)
+	epsVI := sampleNoiseSched(d.noiseValueIn)
+	epsVO := sampleNoiseSched(d.noiseValueOut)
+	epsAI := sampleNoiseSched(d.noiseAdvIn)
+	epsAO := sampleNoiseSched(d.noiseAdvOut)
+
+	result := d.fwdExec.MustExec1(state, epsVI, epsVO, epsAI, epsAO)
 	return tensorToFloat64Sched(result)
 }
 
@@ -298,7 +350,7 @@ func (d *DQNScheduler) OnMetrics(m broker.Metrics) {
 
 	select {
 	case d.expCh <- t:
-	default:
+	case <-time.After(time.Millisecond):
 	}
 }
 
@@ -553,6 +605,14 @@ func (d *DQNScheduler) trainStep() float64 {
 		return lossVals[0]
 	}
 	return 0
+}
+
+func sampleNoiseSched(n int) []float64 {
+	eps := make([]float64, n)
+	for i := range eps {
+		eps[i] = rand.NormFloat64()
+	}
+	return eps
 }
 
 func padOrTruncSched(s []float64, n int) []float64 {

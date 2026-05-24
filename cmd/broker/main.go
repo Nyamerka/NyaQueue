@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/Nyamerka/NyaQueue/internal/app"
+	_ "github.com/Nyamerka/NyaQueue/pkg/balancer"
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/env"

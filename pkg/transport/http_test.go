@@ -257,3 +257,16 @@ func (s *HTTPConfigWiringSuite) TestHTTPMaxQueuedRequests() {
 	require.NotNil(s.T(), srv.reqSem)
 	require.Equal(s.T(), 2, cap(srv.reqSem))
 }
+
+func (s *HTTPTransportSuite) TestSetBalancerRPCHTTP() {
+	ctx := context.Background()
+
+	err := s.client.SetBalancer(ctx, "round_robin", 4)
+	require.NoError(s.T(), err, "SetBalancer RR should succeed via HTTP")
+
+	err = s.client.SetBalancer(ctx, "P2C", 4)
+	require.NoError(s.T(), err, "SetBalancer P2C should succeed via HTTP")
+
+	err = s.client.SetBalancer(ctx, "psa", 8)
+	require.NoError(s.T(), err, "SetBalancer PSA should succeed via HTTP")
+}

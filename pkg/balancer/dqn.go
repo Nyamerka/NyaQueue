@@ -4,6 +4,7 @@ import (
 	stdctx "context"
 	"log"
 	"math"
+	"math/rand/v2"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -35,7 +36,15 @@ var float64BufPool = sync.Pool{New: func() any {
 type policySnap struct {
 	state  []float64
 	action int
-	gen    int64
+}
+
+type stateSnapshot struct {
+	loads          []float64
+	predictedLoads []float64
+	queueDepth     []int
+	msgRate        float64
+	avgMsgSize     float64
+	consumeRate    float64
 }
 
 type nStepBuffer struct {
@@ -122,6 +131,8 @@ type DQNBalancer struct {
 	avgMsgSize     float64
 	consumeRate    float64
 
+	atomicState atomic.Pointer[stateSnapshot]
+
 	droppedExperience atomic.Int64
 	inflight          atomic.Pointer[[]atomic.Int64]
 
@@ -129,16 +140,14 @@ type DQNBalancer struct {
 
 	prevSnap atomic.Pointer[policySnap]
 	currSnap atomic.Pointer[policySnap]
-	snapGen  atomic.Int64
 
-	lastProcessedGen atomic.Int64
-
-	trainingSteps atomic.Int64
+	experiencesSeen atomic.Int64
+	trainingSteps   atomic.Int64
 
 	nStep *nStepBuffer
 
 	popArt struct {
-		mu    sync.Mutex
+		mu    sync.Mutex // low-contention: only touched in trainLoop, intentionally stdlib
 		mean  float64
 		m2    float64
 		count int64
@@ -154,6 +163,13 @@ type DQNBalancer struct {
 	}
 
 	policyStateBuf []float64
+
+	// Noise dimensions for NoisyLinearExternal inference.
+	// Computed once during initGoMLX from hiddenSize/numPartitions.
+	noiseValueIn  int // hiddenSize / 4  (input features of value NoisyLinear)
+	noiseValueOut int // 1               (output features of value NoisyLinear)
+	noiseAdvIn    int // hiddenSize / 4  (input features of advantage NoisyLinear)
+	noiseAdvOut   int // numPartitions   (output features of advantage NoisyLinear)
 }
 
 // DQNOption configures a DQNBalancer.
@@ -240,14 +256,34 @@ func (d *DQNBalancer) initGoMLX() {
 		optimizers.ParamAdamWeightDecay: DefaultDQNWeightDecay,
 	})
 
-	d.fwdExec = context.MustNewExec(d.backend, d.ctx, func(ctx *context.Context, state *Node) *Node {
-		return d.qNetworkGraph(ctx, state)
-	})
+	// Phase 1: create ALL variables (including NoisyLinear's sigma + RNG state)
+	// by building one noisy graph on the non-Reuse context.
+	initExec := context.MustNewExec(d.backend, d.ctx,
+		func(ctx *context.Context, state *Node) *Node {
+			return d.qNetworkGraph(ctx, state)
+		})
 	dummyState := make([]float64, d.stateSize)
-	d.fwdExec.MustExec(dummyState)
+	initExec.MustExec(dummyState)
+	initExec.Finalize()
+
+	// Compute noise dimensions from the dueling architecture.
+	d.noiseValueIn = d.hiddenSize / 4
+	d.noiseValueOut = 1
+	d.noiseAdvIn = d.hiddenSize / 4
+	d.noiseAdvOut = d.numPartitions
+
+	// Phase 2: inference exec uses NoisyLinearExternal — noise is sampled in
+	// Go (rand/v2.NormFloat64) and passed as graph inputs. This preserves
+	// NoisyNet exploration while avoiding the shared #rngState concurrency bug.
+	d.fwdExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
+		func(ctx *context.Context, state, epsValueIn, epsValueOut, epsAdvIn, epsAdvOut *Node) *Node {
+			return d.qNetworkGraphExternalNoise(ctx, state, epsValueIn, epsValueOut, epsAdvIn, epsAdvOut)
+		})
 
 	d.targetNet = nn.NewTargetNetwork(d.ctx)
 
+	// Phase 3: training execs use full NoisyLinear (with noise via ctx.RandomNormal).
+	// All of these run sequentially in the trainLoop goroutine.
 	d.bestActionsExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
 		func(ctx *context.Context, states *Node) *Node {
 			q := d.qNetworkBatch(ctx, states)
@@ -293,12 +329,35 @@ func (d *DQNBalancer) qNetworkBatch(ctx *context.Context, x *Node) *Node {
 	vStream := layers.Dense(ctx.In("value_hidden"), h, true, d.hiddenSize/4)
 	vStream = layers.LayerNormalization(ctx.In("ln_vh"), vStream, -1).Done()
 	vStream = activations.Relu(vStream)
-	v := layers.Dense(ctx.In("value_out"), vStream, true, 1)
+	v := nn.NoisyLinear(ctx.In("value_out"), vStream, 1, nn.DefaultNoisySigmaInit)
 
 	aStream := layers.Dense(ctx.In("adv_hidden"), h, true, d.hiddenSize/4)
 	aStream = layers.LayerNormalization(ctx.In("ln_ah"), aStream, -1).Done()
 	aStream = activations.Relu(aStream)
-	a := layers.Dense(ctx.In("adv_out"), aStream, true, d.numPartitions)
+	a := nn.NoisyLinear(ctx.In("adv_out"), aStream, d.numPartitions, nn.DefaultNoisySigmaInit)
+
+	aMean := ReduceMean(a, -1)
+	aMean = ExpandDims(aMean, -1)
+	return Add(v, Sub(a, aMean))
+}
+
+func (d *DQNBalancer) qNetworkBatchExternalNoise(ctx *context.Context, x *Node, epsValueIn, epsValueOut, epsAdvIn, epsAdvOut *Node) *Node {
+	h := layers.Dense(ctx.In("feature1"), x, true, d.hiddenSize)
+	h = layers.LayerNormalization(ctx.In("ln1"), h, -1).Done()
+	h = activations.Relu(h)
+	h = layers.Dense(ctx.In("feature2"), h, true, d.hiddenSize/2)
+	h = layers.LayerNormalization(ctx.In("ln2"), h, -1).Done()
+	h = activations.Relu(h)
+
+	vStream := layers.Dense(ctx.In("value_hidden"), h, true, d.hiddenSize/4)
+	vStream = layers.LayerNormalization(ctx.In("ln_vh"), vStream, -1).Done()
+	vStream = activations.Relu(vStream)
+	v := nn.NoisyLinearExternal(ctx.In("value_out"), vStream, epsValueIn, epsValueOut, 1, nn.DefaultNoisySigmaInit)
+
+	aStream := layers.Dense(ctx.In("adv_hidden"), h, true, d.hiddenSize/4)
+	aStream = layers.LayerNormalization(ctx.In("ln_ah"), aStream, -1).Done()
+	aStream = activations.Relu(aStream)
+	a := nn.NoisyLinearExternal(ctx.In("adv_out"), aStream, epsAdvIn, epsAdvOut, d.numPartitions, nn.DefaultNoisySigmaInit)
 
 	aMean := ReduceMean(a, -1)
 	aMean = ExpandDims(aMean, -1)
@@ -311,12 +370,24 @@ func (d *DQNBalancer) qNetworkGraph(ctx *context.Context, state *Node) *Node {
 	return Reshape(q, d.numPartitions)
 }
 
+func (d *DQNBalancer) qNetworkGraphExternalNoise(ctx *context.Context, state, epsValueIn, epsValueOut, epsAdvIn, epsAdvOut *Node) *Node {
+	x := InsertAxes(state, 0)
+	q := d.qNetworkBatchExternalNoise(ctx, x, epsValueIn, epsValueOut, epsAdvIn, epsAdvOut)
+	return Reshape(q, d.numPartitions)
+}
+
 func (d *DQNBalancer) forward(state []float64) []float64 {
 	buf := float64BufPool.Get().(*[]float64)
 	norm := (*buf)[:len(state)]
 	copy(norm, state)
 	d.normalizer.NormalizeInPlace(norm)
-	result := d.fwdExec.MustExec1(norm)
+
+	epsVI := sampleNoise(d.noiseValueIn)
+	epsVO := sampleNoise(d.noiseValueOut)
+	epsAI := sampleNoise(d.noiseAdvIn)
+	epsAO := sampleNoise(d.noiseAdvOut)
+
+	result := d.fwdExec.MustExec1(norm, epsVI, epsVO, epsAI, epsAO)
 	float64BufPool.Put(buf)
 	return tensorToFloat64Slice(result)
 }
@@ -357,31 +428,47 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 
 	d.fallbackP2C.OnMetrics(m)
 
-	d.stateMu.Lock()
+	snap := &stateSnapshot{
+		msgRate:     m.MsgRate,
+		avgMsgSize:  m.AvgMsgSize,
+		consumeRate: m.ConsumeRate,
+	}
 	if len(m.PartitionLoads) > 0 {
-		if cap(d.loads) < len(m.PartitionLoads) {
-			d.loads = make([]float64, len(m.PartitionLoads))
-		}
-		d.loads = d.loads[:len(m.PartitionLoads)]
-		copy(d.loads, m.PartitionLoads)
+		snap.loads = append([]float64(nil), m.PartitionLoads...)
 	}
 	if len(m.PredictedLoads) > 0 {
-		if cap(d.predictedLoads) < len(m.PredictedLoads) {
-			d.predictedLoads = make([]float64, len(m.PredictedLoads))
-		}
-		d.predictedLoads = d.predictedLoads[:len(m.PredictedLoads)]
-		copy(d.predictedLoads, m.PredictedLoads)
+		snap.predictedLoads = append([]float64(nil), m.PredictedLoads...)
 	}
 	if len(m.QueueDepth) > 0 {
-		if cap(d.queueDepth) < len(m.QueueDepth) {
-			d.queueDepth = make([]int, len(m.QueueDepth))
-		}
-		d.queueDepth = d.queueDepth[:len(m.QueueDepth)]
-		copy(d.queueDepth, m.QueueDepth)
+		snap.queueDepth = append([]int(nil), m.QueueDepth...)
 	}
-	d.msgRate = m.MsgRate
-	d.avgMsgSize = m.AvgMsgSize
-	d.consumeRate = m.ConsumeRate
+	d.atomicState.Store(snap)
+
+	d.stateMu.Lock()
+	if snap.loads != nil {
+		if cap(d.loads) < len(snap.loads) {
+			d.loads = make([]float64, len(snap.loads))
+		}
+		d.loads = d.loads[:len(snap.loads)]
+		copy(d.loads, snap.loads)
+	}
+	if snap.predictedLoads != nil {
+		if cap(d.predictedLoads) < len(snap.predictedLoads) {
+			d.predictedLoads = make([]float64, len(snap.predictedLoads))
+		}
+		d.predictedLoads = d.predictedLoads[:len(snap.predictedLoads)]
+		copy(d.predictedLoads, snap.predictedLoads)
+	}
+	if snap.queueDepth != nil {
+		if cap(d.queueDepth) < len(snap.queueDepth) {
+			d.queueDepth = make([]int, len(snap.queueDepth))
+		}
+		d.queueDepth = d.queueDepth[:len(snap.queueDepth)]
+		copy(d.queueDepth, snap.queueDepth)
+	}
+	d.msgRate = snap.msgRate
+	d.avgMsgSize = snap.avgMsgSize
+	d.consumeRate = snap.consumeRate
 	d.stateMu.Unlock()
 
 	if !d.shouldRecordExperience() {
@@ -390,8 +477,7 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 
 	prev := d.prevSnap.Load()
 	curr := d.currSnap.Load()
-	if prev != nil && curr != nil && curr.gen > d.lastProcessedGen.Load() {
-		d.lastProcessedGen.Store(curr.gen)
+	if prev != nil && curr != nil {
 		raw := nn.Transition{
 			State:     append([]float64(nil), prev.state...),
 			Action:    []float64{float64(prev.action)},
@@ -400,9 +486,10 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 			Done:      false,
 		}
 		if multi, ok := d.nStep.Push(raw); ok {
+			d.experiencesSeen.Add(1)
 			select {
 			case d.expCh <- multi:
-			default:
+			case <-time.After(time.Millisecond):
 				d.droppedExperience.Add(1)
 			}
 		}
@@ -429,6 +516,10 @@ func (d *DQNBalancer) Temperature() float64 {
 
 func (d *DQNBalancer) TrainingSteps() int64 {
 	return d.trainingSteps.Load()
+}
+
+func (d *DQNBalancer) ExperiencesSeen() int64 {
+	return d.experiencesSeen.Load()
 }
 
 func (d *DQNBalancer) OnPublishComplete(partition int) {
@@ -508,13 +599,11 @@ func (d *DQNBalancer) policyLoop(ctx stdctx.Context) {
 
 			d.cachedQValues.Store(&qValues)
 
-			gen := d.snapGen.Add(1)
 			stateCopy := make([]float64, len(d.policyStateBuf))
 			copy(stateCopy, d.policyStateBuf)
 			snap := &policySnap{
 				state:  stateCopy,
 				action: argmax(qValues[:d.numPartitions]),
-				gen:    gen,
 			}
 
 			d.prevSnap.Store(d.currSnap.Load())
@@ -601,6 +690,16 @@ func (d *DQNBalancer) computeReward(m broker.Metrics) float64 {
 	balanceW := dqnBaseBalanceWeight + (dqnMaxBalanceWeight-dqnBaseBalanceWeight)*pressure
 
 	raw := balanceW*balancePenalty + (1-balanceW)*utilityReward
+
+	maxLoad := 0.0
+	for _, l := range m.PartitionLoads {
+		if l > maxLoad {
+			maxLoad = l
+		}
+	}
+	if maxLoad > 1.0 {
+		raw -= dqnMaxLoadWeight * (maxLoad - 1.0)
+	}
 
 	var totalDepth int
 	for _, dep := range m.QueueDepth {
@@ -732,6 +831,14 @@ func (d *DQNBalancer) trainStep() float64 {
 		return lossVals[0]
 	}
 	return 0
+}
+
+func sampleNoise(n int) []float64 {
+	eps := make([]float64, n)
+	for i := range eps {
+		eps[i] = rand.NormFloat64()
+	}
+	return eps
 }
 
 func padOrTrunc(s []float64, n int) []float64 {

@@ -17,4 +17,5 @@ service NyaQueue {
   rpc ListTopics(ListTopicsRequest)     returns (ListTopicsResponse);
 
   rpc GetMetrics(MetricsRequest)        returns (MetricsResponse);
+  rpc SetBalancer(SetBalancerRequest)   returns (SetBalancerResponse);
 }

@@ -44,6 +44,12 @@ type ScenarioResetter interface {
 	ResetForNewScenario()
 }
 
+// ExperienceCounter is optionally implemented by DQN-based balancers to report
+// the total number of experiences (n-step transitions) emitted so far.
+type ExperienceCounter interface {
+	ExperiencesSeen() int64
+}
+
 type Scheduler interface {
 	Next(partition *Partition, consumerOffset uint64) (*Message, uint64, error)
 	Enqueue(msg *Message, walOffset int64)
@@ -142,6 +148,16 @@ func (b *Broker) ResetBalancerForScenario() {
 			r.ResetForNewScenario()
 		}
 	}
+}
+
+func (b *Broker) BalancerExperiencesSeen() int64 {
+	snap := b.runtime.Load()
+	if snap != nil && snap.balancer != nil {
+		if ec, ok := snap.balancer.(ExperienceCounter); ok {
+			return ec.ExperiencesSeen()
+		}
+	}
+	return -1
 }
 
 func (b *Broker) SetScheduler(topic string, sched Scheduler) {

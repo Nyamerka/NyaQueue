@@ -315,6 +315,31 @@ func (s *Server) ListTopics(_ context.Context, _ *pb.ListTopicsRequest) (*pb.Lis
 	return &pb.ListTopicsResponse{Topics: infos}, nil
 }
 
+func (s *Server) SetBalancer(_ context.Context, req *pb.SetBalancerRequest) (*pb.SetBalancerResponse, error) {
+	kind := protoToBalancerKind(req.Algorithm)
+	bal, err := broker.BalancerFromKind(kind, int(req.NumPartitions))
+	if err != nil {
+		return nil, oops.Wrapf(err, "set-balancer algorithm=%s k=%d", req.Algorithm, req.NumPartitions)
+	}
+	s.broker.SetBalancer(bal)
+	return &pb.SetBalancerResponse{}, nil
+}
+
+func protoToBalancerKind(algo pb.BalancerAlgorithm) broker.BalancerKind {
+	switch algo {
+	case pb.BalancerAlgorithm_ROUND_ROBIN:
+		return broker.KindRoundRobin
+	case pb.BalancerAlgorithm_POWER_OF_TWO_CHOICES:
+		return broker.KindPowerOfTwoChoices
+	case pb.BalancerAlgorithm_PSA:
+		return broker.KindPSA
+	case pb.BalancerAlgorithm_DQN:
+		return broker.KindDQN
+	default:
+		return broker.KindRoundRobin
+	}
+}
+
 func (s *Server) GetMetrics(_ context.Context, _ *pb.MetricsRequest) (*pb.MetricsResponse, error) {
 	m := s.broker.Metrics()
 

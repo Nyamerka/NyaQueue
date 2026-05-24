@@ -26,6 +26,7 @@ const (
 	NyaQueue_DeleteTopic_FullMethodName = "/nyaqueue.NyaQueue/DeleteTopic"
 	NyaQueue_ListTopics_FullMethodName  = "/nyaqueue.NyaQueue/ListTopics"
 	NyaQueue_GetMetrics_FullMethodName  = "/nyaqueue.NyaQueue/GetMetrics"
+	NyaQueue_SetBalancer_FullMethodName = "/nyaqueue.NyaQueue/SetBalancer"
 )
 
 // NyaQueueClient is the client API for NyaQueue service.
@@ -39,6 +40,7 @@ type NyaQueueClient interface {
 	DeleteTopic(ctx context.Context, in *DeleteTopicRequest, opts ...grpc.CallOption) (*DeleteTopicResponse, error)
 	ListTopics(ctx context.Context, in *ListTopicsRequest, opts ...grpc.CallOption) (*ListTopicsResponse, error)
 	GetMetrics(ctx context.Context, in *MetricsRequest, opts ...grpc.CallOption) (*MetricsResponse, error)
+	SetBalancer(ctx context.Context, in *SetBalancerRequest, opts ...grpc.CallOption) (*SetBalancerResponse, error)
 }
 
 type nyaQueueClient struct {
@@ -119,6 +121,16 @@ func (c *nyaQueueClient) GetMetrics(ctx context.Context, in *MetricsRequest, opt
 	return out, nil
 }
 
+func (c *nyaQueueClient) SetBalancer(ctx context.Context, in *SetBalancerRequest, opts ...grpc.CallOption) (*SetBalancerResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetBalancerResponse)
+	err := c.cc.Invoke(ctx, NyaQueue_SetBalancer_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // NyaQueueServer is the server API for NyaQueue service.
 // All implementations must embed UnimplementedNyaQueueServer
 // for forward compatibility.
@@ -130,6 +142,7 @@ type NyaQueueServer interface {
 	DeleteTopic(context.Context, *DeleteTopicRequest) (*DeleteTopicResponse, error)
 	ListTopics(context.Context, *ListTopicsRequest) (*ListTopicsResponse, error)
 	GetMetrics(context.Context, *MetricsRequest) (*MetricsResponse, error)
+	SetBalancer(context.Context, *SetBalancerRequest) (*SetBalancerResponse, error)
 	mustEmbedUnimplementedNyaQueueServer()
 }
 
@@ -160,6 +173,9 @@ func (UnimplementedNyaQueueServer) ListTopics(context.Context, *ListTopicsReques
 }
 func (UnimplementedNyaQueueServer) GetMetrics(context.Context, *MetricsRequest) (*MetricsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetMetrics not implemented")
+}
+func (UnimplementedNyaQueueServer) SetBalancer(context.Context, *SetBalancerRequest) (*SetBalancerResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetBalancer not implemented")
 }
 func (UnimplementedNyaQueueServer) mustEmbedUnimplementedNyaQueueServer() {}
 func (UnimplementedNyaQueueServer) testEmbeddedByValue()                  {}
@@ -308,6 +324,24 @@ func _NyaQueue_GetMetrics_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _NyaQueue_SetBalancer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetBalancerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NyaQueueServer).SetBalancer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NyaQueue_SetBalancer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NyaQueueServer).SetBalancer(ctx, req.(*SetBalancerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // NyaQueue_ServiceDesc is the grpc.ServiceDesc for NyaQueue service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -342,6 +376,10 @@ var NyaQueue_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetMetrics",
 			Handler:    _NyaQueue_GetMetrics_Handler,
+		},
+		{
+			MethodName: "SetBalancer",
+			Handler:    _NyaQueue_SetBalancer_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

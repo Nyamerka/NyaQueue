@@ -3,13 +3,14 @@ package kafkadriver
 import (
 	"context"
 	"errors"
-	"net"
-	"strconv"
+	"sync"
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/samber/oops"
-	"github.com/segmentio/kafka-go"
+	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 var ErrTopicNotFound = oops.Errorf("kafka: topic not found")
@@ -22,9 +23,10 @@ type Message struct {
 }
 
 type KafkaHarness struct {
-	brokers []string
-	writers *xsync.MapOf[string, *kafka.Writer]
-	readers *xsync.MapOf[readerKey, *kafka.Reader]
+	brokers   []string
+	producer  *kgo.Client
+	consumers *xsync.MapOf[readerKey, *kgo.Client]
+	mu        sync.Mutex
 }
 
 type readerKey struct {
@@ -35,72 +37,87 @@ type readerKey struct {
 
 func New(brokers []string) *KafkaHarness {
 	return &KafkaHarness{
-		brokers: brokers,
-		writers: xsync.NewMapOf[string, *kafka.Writer](),
-		readers: xsync.NewMapOf[readerKey, *kafka.Reader](),
+		brokers:   brokers,
+		consumers: xsync.NewMapOf[readerKey, *kgo.Client](),
 	}
+}
+
+func (h *KafkaHarness) ensureProducer() (*kgo.Client, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.producer != nil {
+		return h.producer, nil
+	}
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(h.brokers...),
+		kgo.RequiredAcks(kgo.LeaderAck()),
+		kgo.ProducerLinger(5*time.Millisecond),
+		kgo.ProducerBatchMaxBytes(1<<20),
+		kgo.ProducerBatchCompression(kgo.Lz4Compression()),
+	)
+	if err != nil {
+		return nil, oops.Wrapf(err, "create franz-go producer")
+	}
+	h.producer = cl
+	return cl, nil
 }
 
 func (h *KafkaHarness) CreateTopic(ctx context.Context, name string, partitions int) error {
-	conn, err := kafka.DialContext(ctx, "tcp", h.brokers[0])
+	cl, err := kgo.NewClient(kgo.SeedBrokers(h.brokers...))
 	if err != nil {
-		return oops.Wrapf(err, "dial")
+		return oops.Wrapf(err, "dial admin client")
 	}
-	defer conn.Close()
+	defer cl.Close()
 
-	controller, err := conn.Controller()
+	req := kmsg.NewPtrCreateTopicsRequest()
+	topic := kmsg.NewCreateTopicsRequestTopic()
+	topic.Topic = name
+	topic.NumPartitions = int32(partitions)
+	topic.ReplicationFactor = 1
+	req.Topics = append(req.Topics, topic)
+
+	resp, err := req.RequestWith(ctx, cl)
 	if err != nil {
-		return oops.Wrapf(err, "controller")
+		return oops.Wrapf(err, "create topic %q", name)
 	}
-
-	controllerConn, err := kafka.Dial("tcp", net.JoinHostPort(controller.Host, strconv.Itoa(controller.Port)))
-	if err != nil {
-		return oops.Wrapf(err, "dial controller")
+	for _, t := range resp.Topics {
+		if errCode := kerr.ErrorForCode(t.ErrorCode); errCode != nil {
+			return oops.Wrapf(errCode, "create topic %q", name)
+		}
 	}
-	defer controllerConn.Close()
-
-	return controllerConn.CreateTopics(kafka.TopicConfig{
-		Topic:             name,
-		NumPartitions:     partitions,
-		ReplicationFactor: 1,
-	})
+	return nil
 }
 
-// DeleteTopic removes a topic from Kafka. Returns ErrTopicNotFound when the
-// topic does not exist so callers can skip first-run cleanup.
 func (h *KafkaHarness) DeleteTopic(ctx context.Context, name string) error {
-	conn, err := kafka.DialContext(ctx, "tcp", h.brokers[0])
+	cl, err := kgo.NewClient(kgo.SeedBrokers(h.brokers...))
 	if err != nil {
-		return oops.Wrapf(err, "dial")
+		return oops.Wrapf(err, "dial admin client")
 	}
-	defer conn.Close()
+	defer cl.Close()
 
-	controller, err := conn.Controller()
+	req := kmsg.NewPtrDeleteTopicsRequest()
+	req.TopicNames = []string{name}
+	reqTopic := kmsg.NewDeleteTopicsRequestTopic()
+	reqTopic.Topic = kmsg.StringPtr(name)
+	req.Topics = append(req.Topics, reqTopic)
+
+	resp, err := req.RequestWith(ctx, cl)
 	if err != nil {
-		return oops.Wrapf(err, "controller")
+		return oops.Wrapf(err, "delete topic %q", name)
 	}
-
-	controllerConn, err := kafka.Dial("tcp", net.JoinHostPort(controller.Host, strconv.Itoa(controller.Port)))
-	if err != nil {
-		return oops.Wrapf(err, "dial controller")
-	}
-	defer controllerConn.Close()
-
-	if err := controllerConn.DeleteTopics(name); err != nil {
-		var kerr kafka.Error
-		if errors.As(err, &kerr) && kerr == kafka.UnknownTopicOrPartition {
-			return ErrTopicNotFound
+	for _, t := range resp.Topics {
+		if errCode := kerr.ErrorForCode(t.ErrorCode); errCode != nil {
+			if errors.Is(errCode, kerr.UnknownTopicOrPartition) {
+				return ErrTopicNotFound
+			}
+			return oops.Wrapf(errCode, "delete topic %q", name)
 		}
-		return oops.Wrapf(err, "delete kafka topic %q", name)
 	}
 
-	if w, ok := h.writers.LoadAndDelete(name); ok {
-		_ = w.Close()
-	}
-	h.readers.Range(func(k readerKey, r *kafka.Reader) bool {
+	h.consumers.Range(func(k readerKey, c *kgo.Client) bool {
 		if k.topic == name {
-			_ = r.Close()
-			h.readers.Delete(k)
+			c.Close()
+			h.consumers.Delete(k)
 		}
 		return true
 	})
@@ -109,86 +126,94 @@ func (h *KafkaHarness) DeleteTopic(ctx context.Context, name string) error {
 }
 
 func (h *KafkaHarness) Produce(ctx context.Context, topic string, key, value []byte) error {
-	return h.ProduceBatch(ctx, topic, []kafka.Message{{Key: key, Value: value}})
+	cl, err := h.ensureProducer()
+	if err != nil {
+		return oops.Wrapf(err, "ensure producer for Produce")
+	}
+	rec := &kgo.Record{
+		Topic: topic,
+		Key:   key,
+		Value: value,
+	}
+	result := cl.ProduceSync(ctx, rec)
+	return result.FirstErr()
 }
 
-func (h *KafkaHarness) ProduceBatch(ctx context.Context, topic string, msgs []kafka.Message) error {
-	return h.writerFor(topic).WriteMessages(ctx, msgs...)
-}
-
-func (h *KafkaHarness) writerFor(topic string) *kafka.Writer {
-	w, _ := h.writers.LoadOrCompute(topic, func() *kafka.Writer {
-		return &kafka.Writer{
-			Addr:         kafka.TCP(h.brokers...),
-			Topic:        topic,
-			Balancer:     &kafka.LeastBytes{},
-			BatchTimeout: 5 * time.Millisecond,
-			BatchSize:    1024,
-			BatchBytes:   1 << 20,
-			RequiredAcks: kafka.RequireOne,
-			Compression:  kafka.Lz4,
+func (h *KafkaHarness) ProduceBatch(ctx context.Context, topic string, msgs []kgo.Record) error {
+	cl, err := h.ensureProducer()
+	if err != nil {
+		return oops.Wrapf(err, "ensure producer for ProduceBatch")
+	}
+	recs := make([]*kgo.Record, len(msgs))
+	for i := range msgs {
+		recs[i] = &kgo.Record{
+			Topic: topic,
+			Key:   msgs[i].Key,
+			Value: msgs[i].Value,
 		}
-	})
-	return w
+	}
+	results := cl.ProduceSync(ctx, recs...)
+	return results.FirstErr()
 }
 
 func (h *KafkaHarness) Consume(ctx context.Context, topic, group string, partition int, maxBytes int) ([]Message, error) {
-	r := h.readerFor(topic, group, partition, maxBytes)
-
-	msgs := make([]Message, 0, 16)
-	for i := 0; i < 16; i++ {
-		msg, err := r.FetchMessage(ctx)
-		if err != nil {
-			if len(msgs) > 0 {
-				break
-			}
-			return nil, oops.Wrapf(err, "kafka fetch topic=%q part=%d", topic, partition)
-		}
-		msgs = append(msgs, Message{
-			Key:    msg.Key,
-			Value:  msg.Value,
-			Offset: msg.Offset,
-		})
+	cl := h.consumerFor(topic, group, partition)
+	fetches := cl.PollFetches(ctx)
+	if errs := fetches.Errors(); len(errs) > 0 {
+		return nil, oops.Wrapf(errs[0].Err, "kafka fetch topic=%q part=%d", topic, partition)
 	}
-	if len(msgs) > 0 {
-		last := msgs[len(msgs)-1]
-		_ = r.CommitMessages(ctx, kafka.Message{
-			Topic:     topic,
-			Partition: partition,
-			Offset:    last.Offset,
+
+	var msgs []Message
+	fetches.EachRecord(func(rec *kgo.Record) {
+		msgs = append(msgs, Message{
+			Key:    rec.Key,
+			Value:  rec.Value,
+			Offset: rec.Offset,
 		})
+	})
+
+	if len(msgs) > 0 {
+		if err := cl.CommitUncommittedOffsets(ctx); err != nil {
+			return msgs, oops.Wrapf(err, "commit offsets")
+		}
 	}
 	return msgs, nil
 }
 
-func (h *KafkaHarness) readerFor(topic, group string, partition, maxBytes int) *kafka.Reader {
+func (h *KafkaHarness) consumerFor(topic, group string, partition int) *kgo.Client {
 	rk := readerKey{topic: topic, group: group, partition: partition}
-	r, _ := h.readers.LoadOrCompute(rk, func() *kafka.Reader {
-		cfg := kafka.ReaderConfig{
-			Brokers:        h.brokers,
-			Topic:          topic,
-			MaxBytes:       maxBytes,
-			MaxWait:        10 * time.Millisecond,
-			CommitInterval: 0,
+	cl, _ := h.consumers.LoadOrCompute(rk, func() *kgo.Client {
+		opts := []kgo.Opt{
+			kgo.SeedBrokers(h.brokers...),
+			kgo.ConsumeTopics(topic),
+			kgo.FetchMaxWait(10 * time.Millisecond),
+			kgo.FetchMaxBytes(int32(1 << 20)),
 		}
 		if group != "" {
-			cfg.GroupID = group
+			opts = append(opts, kgo.ConsumerGroup(group))
 		} else {
-			cfg.Partition = partition
-			cfg.StartOffset = kafka.FirstOffset
+			opts = append(opts, kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+				topic: {int32(partition): kgo.NewOffset().AtStart()},
+			}))
 		}
-		return kafka.NewReader(cfg)
+		cl, err := kgo.NewClient(opts...)
+		if err != nil {
+			panic("kafkadriver: failed to create consumer: " + err.Error())
+		}
+		return cl
 	})
-	return r
+	return cl
 }
 
 func (h *KafkaHarness) Close() error {
-	h.writers.Range(func(_ string, w *kafka.Writer) bool {
-		w.Close()
-		return true
-	})
-	h.readers.Range(func(_ readerKey, r *kafka.Reader) bool {
-		r.Close()
+	h.mu.Lock()
+	if h.producer != nil {
+		h.producer.Close()
+		h.producer = nil
+	}
+	h.mu.Unlock()
+	h.consumers.Range(func(_ readerKey, c *kgo.Client) bool {
+		c.Close()
 		return true
 	})
 	return nil

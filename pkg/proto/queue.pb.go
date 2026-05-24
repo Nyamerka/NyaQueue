@@ -24,7 +24,7 @@ var File_queue_proto protoreflect.FileDescriptor
 
 const file_queue_proto_rawDesc = "" +
 	"\n" +
-	"\vqueue.proto\x12\bnyaqueue\x1a\rrequest.proto\x1a\x0eresponse.proto2\xeb\x03\n" +
+	"\vqueue.proto\x12\bnyaqueue\x1a\rrequest.proto\x1a\x0eresponse.proto2\xb7\x04\n" +
 	"\bNyaQueue\x12>\n" +
 	"\aProduce\x12\x18.nyaqueue.ProduceRequest\x1a\x19.nyaqueue.ProduceResponse\x12>\n" +
 	"\aConsume\x12\x18.nyaqueue.ConsumeRequest\x1a\x19.nyaqueue.ConsumeResponse\x12;\n" +
@@ -34,7 +34,8 @@ const file_queue_proto_rawDesc = "" +
 	"\n" +
 	"ListTopics\x12\x1b.nyaqueue.ListTopicsRequest\x1a\x1c.nyaqueue.ListTopicsResponse\x12A\n" +
 	"\n" +
-	"GetMetrics\x12\x18.nyaqueue.MetricsRequest\x1a\x19.nyaqueue.MetricsResponseB(Z&github.com/Nyamerka/NyaQueue/pkg/protob\x06proto3"
+	"GetMetrics\x12\x18.nyaqueue.MetricsRequest\x1a\x19.nyaqueue.MetricsResponse\x12J\n" +
+	"\vSetBalancer\x12\x1c.nyaqueue.SetBalancerRequest\x1a\x1d.nyaqueue.SetBalancerResponseB(Z&github.com/Nyamerka/NyaQueue/pkg/protob\x06proto3"
 
 var file_queue_proto_goTypes = []any{
 	(*ProduceRequest)(nil),      // 0: nyaqueue.ProduceRequest
@@ -44,13 +45,15 @@ var file_queue_proto_goTypes = []any{
 	(*DeleteTopicRequest)(nil),  // 4: nyaqueue.DeleteTopicRequest
 	(*ListTopicsRequest)(nil),   // 5: nyaqueue.ListTopicsRequest
 	(*MetricsRequest)(nil),      // 6: nyaqueue.MetricsRequest
-	(*ProduceResponse)(nil),     // 7: nyaqueue.ProduceResponse
-	(*ConsumeResponse)(nil),     // 8: nyaqueue.ConsumeResponse
-	(*CommitResponse)(nil),      // 9: nyaqueue.CommitResponse
-	(*CreateTopicResponse)(nil), // 10: nyaqueue.CreateTopicResponse
-	(*DeleteTopicResponse)(nil), // 11: nyaqueue.DeleteTopicResponse
-	(*ListTopicsResponse)(nil),  // 12: nyaqueue.ListTopicsResponse
-	(*MetricsResponse)(nil),     // 13: nyaqueue.MetricsResponse
+	(*SetBalancerRequest)(nil),  // 7: nyaqueue.SetBalancerRequest
+	(*ProduceResponse)(nil),     // 8: nyaqueue.ProduceResponse
+	(*ConsumeResponse)(nil),     // 9: nyaqueue.ConsumeResponse
+	(*CommitResponse)(nil),      // 10: nyaqueue.CommitResponse
+	(*CreateTopicResponse)(nil), // 11: nyaqueue.CreateTopicResponse
+	(*DeleteTopicResponse)(nil), // 12: nyaqueue.DeleteTopicResponse
+	(*ListTopicsResponse)(nil),  // 13: nyaqueue.ListTopicsResponse
+	(*MetricsResponse)(nil),     // 14: nyaqueue.MetricsResponse
+	(*SetBalancerResponse)(nil), // 15: nyaqueue.SetBalancerResponse
 }
 var file_queue_proto_depIdxs = []int32{
 	0,  // 0: nyaqueue.NyaQueue.Produce:input_type -> nyaqueue.ProduceRequest
@@ -60,15 +63,17 @@ var file_queue_proto_depIdxs = []int32{
 	4,  // 4: nyaqueue.NyaQueue.DeleteTopic:input_type -> nyaqueue.DeleteTopicRequest
 	5,  // 5: nyaqueue.NyaQueue.ListTopics:input_type -> nyaqueue.ListTopicsRequest
 	6,  // 6: nyaqueue.NyaQueue.GetMetrics:input_type -> nyaqueue.MetricsRequest
-	7,  // 7: nyaqueue.NyaQueue.Produce:output_type -> nyaqueue.ProduceResponse
-	8,  // 8: nyaqueue.NyaQueue.Consume:output_type -> nyaqueue.ConsumeResponse
-	9,  // 9: nyaqueue.NyaQueue.Commit:output_type -> nyaqueue.CommitResponse
-	10, // 10: nyaqueue.NyaQueue.CreateTopic:output_type -> nyaqueue.CreateTopicResponse
-	11, // 11: nyaqueue.NyaQueue.DeleteTopic:output_type -> nyaqueue.DeleteTopicResponse
-	12, // 12: nyaqueue.NyaQueue.ListTopics:output_type -> nyaqueue.ListTopicsResponse
-	13, // 13: nyaqueue.NyaQueue.GetMetrics:output_type -> nyaqueue.MetricsResponse
-	7,  // [7:14] is the sub-list for method output_type
-	0,  // [0:7] is the sub-list for method input_type
+	7,  // 7: nyaqueue.NyaQueue.SetBalancer:input_type -> nyaqueue.SetBalancerRequest
+	8,  // 8: nyaqueue.NyaQueue.Produce:output_type -> nyaqueue.ProduceResponse
+	9,  // 9: nyaqueue.NyaQueue.Consume:output_type -> nyaqueue.ConsumeResponse
+	10, // 10: nyaqueue.NyaQueue.Commit:output_type -> nyaqueue.CommitResponse
+	11, // 11: nyaqueue.NyaQueue.CreateTopic:output_type -> nyaqueue.CreateTopicResponse
+	12, // 12: nyaqueue.NyaQueue.DeleteTopic:output_type -> nyaqueue.DeleteTopicResponse
+	13, // 13: nyaqueue.NyaQueue.ListTopics:output_type -> nyaqueue.ListTopicsResponse
+	14, // 14: nyaqueue.NyaQueue.GetMetrics:output_type -> nyaqueue.MetricsResponse
+	15, // 15: nyaqueue.NyaQueue.SetBalancer:output_type -> nyaqueue.SetBalancerResponse
+	8,  // [8:16] is the sub-list for method output_type
+	0,  // [0:8] is the sub-list for method input_type
 	0,  // [0:0] is the sub-list for extension type_name
 	0,  // [0:0] is the sub-list for extension extendee
 	0,  // [0:0] is the sub-list for field type_name

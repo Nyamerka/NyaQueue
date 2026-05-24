@@ -47,6 +47,7 @@ type Runner struct {
 	Duration       time.Duration // override scenario duration if > 0
 	BrokerAddr     string        // gRPC broker address for external mode
 	HTTPBrokerAddr string        // HTTP broker address for external mode (default: BrokerAddr)
+	SkipWarmup     bool          // skip initial 10s discard warmup (CI smoke uses true)
 
 	OnScenarioComplete func(results []ExperimentResult)
 
@@ -73,7 +74,7 @@ func (r *Runner) RunAll(ctx context.Context) ([]ExperimentResult, error) {
 	disabledModes := make(map[Mode]bool)
 	const failFastThreshold = 3
 
-	if len(r.Scenarios) > 0 {
+	if len(r.Scenarios) > 0 && !r.SkipWarmup {
 		r.runWarmup(ctx)
 	}
 
@@ -135,8 +136,11 @@ func (r *Runner) RunAll(ctx context.Context) ([]ExperimentResult, error) {
 }
 
 const (
-	warmupDuration    = 10 * time.Second
-	dqnWarmupDuration = 30 * time.Second
+	warmupDuration        = 10 * time.Second
+	dqnWarmupDuration     = 30 * time.Second
+	dqnWarmupMaxDuration  = 5 * time.Minute
+	dqnWarmupTargetExp    = 2000
+	dqnWarmupPollInterval = time.Second
 )
 
 func (r *Runner) runWarmup(ctx context.Context) {
@@ -258,8 +262,9 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	}
 	h.SetManagedTopic(topic)
 
-	// Apply the balancer and scheduler for this algorithm.
-	h.SwitchBalancer(alg, topicCfg.NumPartitions)
+	if err := h.SwitchBalancer(alg, topicCfg.NumPartitions); err != nil {
+		return ExperimentResult{}, oops.Wrapf(err, "switch balancer for %s/%s", sc.Name, alg.Name)
+	}
 	if brk := h.Broker(); brk != nil {
 		brk.SetScheduler(topic, alg.NewScheduler())
 	}
@@ -269,20 +274,60 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 			brk.ResetBalancerForScenario()
 		}
 
-		warmup := dqnWarmupDuration
+		maxWarmup := dqnWarmupMaxDuration
+		minWarmup := dqnWarmupDuration
 		if topicCfg.NumPartitions > 4 {
-			warmup = dqnWarmupDuration * time.Duration(topicCfg.NumPartitions/4)
+			minWarmup = dqnWarmupDuration * time.Duration(topicCfg.NumPartitions/4)
 		}
 
 		warmupSc := sc
-		warmupSc.Duration = warmup
+		warmupSc.Duration = maxWarmup
 		if warmupSc.RatePerSec == 0 {
 			warmupSc.RatePerSec = 5000 * min(warmupSc.Producers, topicCfg.NumPartitions)
 		}
 
-		log.Printf("  [dqn-warmup] running %v warmup for %s/%s (k=%d, rate=%d, producers=%d) ...",
-			warmup, sc.Name, alg.Name, topicCfg.NumPartitions, warmupSc.RatePerSec, warmupSc.Producers)
-		_ = runScenario(ctx, h, warmupSc, alg.Name, "nyaqueue", mode, topicCfg.NumPartitions, warmup, topic)
+		log.Printf("  [dqn-warmup] running warmup for %s/%s (k=%d, rate=%d, target=%d experiences, max=%v) ...",
+			sc.Name, alg.Name, topicCfg.NumPartitions, warmupSc.RatePerSec, dqnWarmupTargetExp, maxWarmup)
+
+		warmupCtx, cancelWarmup := context.WithCancel(ctx)
+		warmupDone := make(chan struct{})
+		go func() {
+			defer close(warmupDone)
+			_ = runScenario(warmupCtx, h, warmupSc, alg.Name, "nyaqueue", mode, topicCfg.NumPartitions, maxWarmup, topic)
+		}()
+
+		deadline := time.After(maxWarmup)
+		minDeadline := time.After(minWarmup)
+		minElapsed := false
+		ticker := time.NewTicker(dqnWarmupPollInterval)
+		defer ticker.Stop()
+
+	warmupLoop:
+		for {
+			select {
+			case <-minDeadline:
+				minElapsed = true
+			case <-ticker.C:
+				if brk := h.Broker(); brk != nil && minElapsed {
+					seen := brk.BalancerExperiencesSeen()
+					if seen >= dqnWarmupTargetExp {
+						log.Printf("  [dqn-warmup] reached %d experiences, finishing early", seen)
+						break warmupLoop
+					}
+				}
+			case <-deadline:
+				if brk := h.Broker(); brk != nil {
+					log.Printf("  [dqn-warmup] max warmup reached, experiences=%d", brk.BalancerExperiencesSeen())
+				}
+				break warmupLoop
+			case <-warmupDone:
+				break warmupLoop
+			case <-ctx.Done():
+				break warmupLoop
+			}
+		}
+		cancelWarmup()
+		<-warmupDone
 	}
 
 	log.Printf("  running %s / %s / %s for %v (seed=%d) ...", sc.Name, alg.Name, mode, dur, sc.Seed)

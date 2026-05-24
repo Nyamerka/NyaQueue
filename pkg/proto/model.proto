@@ -10,6 +10,13 @@ enum ScheduleMode {
   DQN_ADAPTIVE    = 2;
 }
 
+enum BalancerAlgorithm {
+  ROUND_ROBIN          = 0;
+  POWER_OF_TWO_CHOICES = 1;
+  PSA                  = 2;
+  DQN                  = 3;
+}
+
 message MessageEnvelope {
   int64  offset       = 1;
   bytes  key          = 2;

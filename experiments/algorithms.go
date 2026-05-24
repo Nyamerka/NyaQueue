@@ -3,6 +3,7 @@ package experiments
 import (
 	"github.com/Nyamerka/NyaQueue/pkg/balancer"
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	"github.com/Nyamerka/NyaQueue/pkg/optimizer"
 	"github.com/Nyamerka/NyaQueue/pkg/scheduler"
 )
 
@@ -16,10 +17,12 @@ import (
 // NewBalancer receives the actual partition count k so that partition-aware
 // balancers (PSA, DQN) are initialised with the correct topology.
 type AlgorithmConfig struct {
-	Name         string
-	NewBalancer  func(k int) broker.Balancer
-	NewScheduler func() broker.Scheduler
-	Mode         broker.ScheduleMode
+	Name          string
+	NewBalancer   func(k int) broker.Balancer
+	NewScheduler  func() broker.Scheduler
+	Mode          broker.ScheduleMode
+	UseOptimizer  bool
+	OptimizerOpts func() ([]optimizer.TunableParam, optimizer.OptimizerConfig)
 }
 
 func AllAlgorithms() []AlgorithmConfig {
@@ -53,6 +56,16 @@ func AllAlgorithms() []AlgorithmConfig {
 			NewBalancer:  func(k int) broker.Balancer { return balancer.NewDQNBalancer(k) },
 			NewScheduler: func() broker.Scheduler { return scheduler.NewDQNScheduler() },
 			Mode:         broker.ModeDQNAdaptive,
+		},
+		{
+			Name:         "TD3+Adaptive",
+			NewBalancer:  func(_ int) broker.Balancer { return balancer.NewRoundRobin() },
+			NewScheduler: func() broker.Scheduler { return scheduler.NewFIFO() },
+			Mode:         broker.ModeFIFO,
+			UseOptimizer: true,
+			OptimizerOpts: func() ([]optimizer.TunableParam, optimizer.OptimizerConfig) {
+				return optimizer.DefaultTunableParams(), optimizer.DefaultOptimizerConfig()
+			},
 		},
 	}
 }

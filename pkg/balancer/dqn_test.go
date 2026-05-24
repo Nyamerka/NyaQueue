@@ -1,6 +1,7 @@
 package balancer
 
 import (
+	"fmt"
 	"math"
 	"runtime"
 	"testing"
@@ -512,6 +513,104 @@ func (s *DQNSuite) TestHardTargetSyncCopiesAll() {
 		"after HardSync all main vars should be accessible (sync didn't panic)")
 }
 
+func (s *DQNSuite) TestDQNExplorationUnderTrained() {
+	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
+
+	// Before the first policyLoop tick (100ms), cachedQValues is nil and
+	// SelectPartition uses the P2C fallback which provides exploration.
+	counts := make(map[int]int)
+	const trials = 1000
+	for i := 0; i < trials; i++ {
+		p := dqn.SelectPartition("t", nil, 4)
+		counts[p]++
+		dqn.OnPublishComplete(p)
+	}
+
+	require.GreaterOrEqual(s.T(), len(counts), 2,
+		"P2C fallback should spread across at least 2 partitions")
+
+	// After policyLoop ticks, Q-values are cached with NoisyLinearExternal
+	// noise from that tick. Between ticks, SelectPartition reads the same
+	// cached values, so consecutive calls return the same partition.
+	time.Sleep(200 * time.Millisecond)
+	require.NotNil(s.T(), dqn.cachedQValues.Load(),
+		"policyLoop should have set cached Q-values")
+
+	p1 := dqn.SelectPartition("t", nil, 4)
+	p2 := dqn.SelectPartition("t", nil, 4)
+	require.Equal(s.T(), p1, p2,
+		"cached Q-values should produce consistent selections between policy ticks")
+}
+
+func (s *DQNSuite) TestMaxLoadPenaltyInReward() {
+	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
+
+	noOverload := dqn.computeReward(broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
+	})
+	withOverload := dqn.computeReward(broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 2.0}},
+	})
+	require.Greater(s.T(), noOverload, withOverload,
+		"max-load > 1.0 should penalise reward")
+
+	penalty := noOverload - withOverload
+	require.GreaterOrEqual(s.T(), penalty, dqnMaxLoadWeight*(2.0-1.0)*0.5,
+		"penalty should be at least proportional to dqnMaxLoadWeight * (maxLoad - 1.0)")
+}
+
+func (s *DQNSuite) TestExpChannelBlockingSend() {
+	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
+
+	close(dqn.expCh)
+	dqn.expCh = make(chan nn.Transition, 1)
+	dqn.expCh <- nn.Transition{}
+
+	dqn.cachedQValues.Store(&[]float64{0.1, 0.2, 0.3, 0.4})
+	dqn.prevSnap.Store(&policySnap{state: make([]float64, dqn.stateSize), action: 0})
+	dqn.currSnap.Store(&policySnap{state: make([]float64, dqn.stateSize), action: 1})
+
+	start := time.Now()
+	dqn.OnMetrics(broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000, MsgRate: 10000},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8}},
+	})
+	elapsed := time.Since(start)
+
+	require.Less(s.T(), elapsed, 50*time.Millisecond,
+		"OnMetrics should not block for more than ~1ms on a full channel")
+	dqn.Stop()
+}
+
+func (s *DQNSuite) TestExperienceCountTracking() {
+	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
+	defer dqn.Stop()
+
+	require.Equal(s.T(), int64(0), dqn.ExperiencesSeen())
+
+	dqn.OnMetrics(broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000, MsgRate: 10000},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8}},
+	})
+	time.Sleep(200 * time.Millisecond)
+	for i := 0; i < 30; i++ {
+		dqn.OnMetrics(broker.Metrics{
+			BusinessMetrics: broker.BusinessMetrics{Throughput: 50000, MsgRate: 10000},
+			DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.2, 0.4, 0.6, float64(i) * 0.1}},
+		})
+		time.Sleep(60 * time.Millisecond)
+	}
+
+	require.Eventually(s.T(), func() bool {
+		return dqn.ExperiencesSeen() > 0
+	}, 5*time.Second, 10*time.Millisecond,
+		"ExperiencesSeen() should be monotonically increasing after OnMetrics calls")
+}
+
 func (s *DQNSuite) TestQueueDepthInState() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
@@ -541,4 +640,69 @@ func (s *DQNSuite) TestQueueDepthInState() {
 	require.InDelta(s.T(), 256.0/dqnMsgSizeScale, state[idx+1], 1e-10, "avgMsgSize feature")
 	require.InDelta(s.T(), 40000.0/dqnMsgRateScale, state[idx+2], 1e-10, "consumeRate feature")
 	require.InDelta(s.T(), 50000.0/40000.0, state[idx+3], 1e-10, "produce/consume ratio feature")
+}
+
+func (s *DQNSuite) TestExpChannelTimeoutNotSilent() {
+	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
+	// Stop background goroutines so they don't drain the channel.
+	dqn.Stop()
+
+	// Replace expCh with a full channel (capacity 1, 1 item).
+	dqn.expCh = make(chan nn.Transition, 1)
+	dqn.expCh <- nn.Transition{}
+
+	dqn.cachedQValues.Store(&[]float64{0.1, 0.2, 0.3, 0.4})
+	dqn.prevSnap.Store(&policySnap{state: make([]float64, dqn.stateSize), action: 0})
+	dqn.currSnap.Store(&policySnap{state: make([]float64, dqn.stateSize), action: 1})
+
+	// Reset the nStep buffer so it starts clean.
+	dqn.nStep.Reset()
+
+	metrics := broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000, MsgRate: 10000},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8}},
+	}
+
+	// nStep buffer requires n=3 pushes before emitting.
+	dqn.OnMetrics(metrics)
+	dqn.OnMetrics(metrics)
+	require.Equal(s.T(), int64(0), dqn.DroppedExperience(),
+		"no drops expected before nStep emits")
+
+	// Third OnMetrics triggers the nStep emit → channel send → timeout → drop.
+	start := time.Now()
+	dqn.OnMetrics(metrics)
+	elapsed := time.Since(start)
+
+	require.Less(s.T(), elapsed, 50*time.Millisecond,
+		"OnMetrics must not block longer than ~1ms on a full channel")
+	require.Greater(s.T(), dqn.DroppedExperience(), int64(0),
+		"droppedExperience counter must increment when expCh is full")
+}
+
+func (s *DQNSuite) TestSetBalancerFactoryConsistent() {
+	kinds := []struct {
+		kind broker.BalancerKind
+		typ  string
+	}{
+		{broker.KindRoundRobin, "*balancer.RoundRobin"},
+		{broker.KindPowerOfTwoChoices, "*balancer.PowerOfTwoChoices"},
+		{broker.KindPSA, "*balancer.PSA"},
+		{broker.KindDQN, "*balancer.DQNBalancer"},
+	}
+
+	for _, tc := range kinds {
+		bal, err := broker.BalancerFromKind(tc.kind, 4)
+		require.NoError(s.T(), err, "factory should create %s", tc.typ)
+		require.NotNil(s.T(), bal)
+		actual := fmt.Sprintf("%T", bal)
+		require.Equal(s.T(), tc.typ, actual,
+			"BalancerFromKind(%d) should produce %s", tc.kind, tc.typ)
+		if dqn, ok := bal.(*DQNBalancer); ok {
+			dqn.Stop()
+		}
+	}
+
+	_, err := broker.BalancerFromKind(broker.BalancerKind(999), 4)
+	require.Error(s.T(), err, "unknown kind should return error")
 }

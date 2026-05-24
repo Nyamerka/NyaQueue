@@ -409,6 +409,58 @@ func (*MetricsRequest) Descriptor() ([]byte, []int) {
 	return file_request_proto_rawDescGZIP(), []int{6}
 }
 
+type SetBalancerRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Algorithm     BalancerAlgorithm      `protobuf:"varint,1,opt,name=algorithm,proto3,enum=nyaqueue.BalancerAlgorithm" json:"algorithm,omitempty"`
+	NumPartitions int32                  `protobuf:"varint,2,opt,name=num_partitions,json=numPartitions,proto3" json:"num_partitions,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetBalancerRequest) Reset() {
+	*x = SetBalancerRequest{}
+	mi := &file_request_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetBalancerRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetBalancerRequest) ProtoMessage() {}
+
+func (x *SetBalancerRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_request_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetBalancerRequest.ProtoReflect.Descriptor instead.
+func (*SetBalancerRequest) Descriptor() ([]byte, []int) {
+	return file_request_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *SetBalancerRequest) GetAlgorithm() BalancerAlgorithm {
+	if x != nil {
+		return x.Algorithm
+	}
+	return BalancerAlgorithm_ROUND_ROBIN
+}
+
+func (x *SetBalancerRequest) GetNumPartitions() int32 {
+	if x != nil {
+		return x.NumPartitions
+	}
+	return 0
+}
+
 var File_request_proto protoreflect.FileDescriptor
 
 const file_request_proto_rawDesc = "" +
@@ -437,7 +489,10 @@ const file_request_proto_rawDesc = "" +
 	"\x12DeleteTopicRequest\x12\x14\n" +
 	"\x05topic\x18\x01 \x01(\tR\x05topic\"\x13\n" +
 	"\x11ListTopicsRequest\"\x10\n" +
-	"\x0eMetricsRequestB(Z&github.com/Nyamerka/NyaQueue/pkg/protob\x06proto3"
+	"\x0eMetricsRequest\"v\n" +
+	"\x12SetBalancerRequest\x129\n" +
+	"\talgorithm\x18\x01 \x01(\x0e2\x1b.nyaqueue.BalancerAlgorithmR\talgorithm\x12%\n" +
+	"\x0enum_partitions\x18\x02 \x01(\x05R\rnumPartitionsB(Z&github.com/Nyamerka/NyaQueue/pkg/protob\x06proto3"
 
 var (
 	file_request_proto_rawDescOnce sync.Once
@@ -451,7 +506,7 @@ func file_request_proto_rawDescGZIP() []byte {
 	return file_request_proto_rawDescData
 }
 
-var file_request_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_request_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_request_proto_goTypes = []any{
 	(*ProduceRequest)(nil),      // 0: nyaqueue.ProduceRequest
 	(*ConsumeRequest)(nil),      // 1: nyaqueue.ConsumeRequest
@@ -460,17 +515,20 @@ var file_request_proto_goTypes = []any{
 	(*DeleteTopicRequest)(nil),  // 4: nyaqueue.DeleteTopicRequest
 	(*ListTopicsRequest)(nil),   // 5: nyaqueue.ListTopicsRequest
 	(*MetricsRequest)(nil),      // 6: nyaqueue.MetricsRequest
-	(*ProduceMessage)(nil),      // 7: nyaqueue.ProduceMessage
-	(*TopicScheduleConfig)(nil), // 8: nyaqueue.TopicScheduleConfig
+	(*SetBalancerRequest)(nil),  // 7: nyaqueue.SetBalancerRequest
+	(*ProduceMessage)(nil),      // 8: nyaqueue.ProduceMessage
+	(*TopicScheduleConfig)(nil), // 9: nyaqueue.TopicScheduleConfig
+	(BalancerAlgorithm)(0),      // 10: nyaqueue.BalancerAlgorithm
 }
 var file_request_proto_depIdxs = []int32{
-	7, // 0: nyaqueue.ProduceRequest.messages:type_name -> nyaqueue.ProduceMessage
-	8, // 1: nyaqueue.CreateTopicRequest.schedule_config:type_name -> nyaqueue.TopicScheduleConfig
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	8,  // 0: nyaqueue.ProduceRequest.messages:type_name -> nyaqueue.ProduceMessage
+	9,  // 1: nyaqueue.CreateTopicRequest.schedule_config:type_name -> nyaqueue.TopicScheduleConfig
+	10, // 2: nyaqueue.SetBalancerRequest.algorithm:type_name -> nyaqueue.BalancerAlgorithm
+	3,  // [3:3] is the sub-list for method output_type
+	3,  // [3:3] is the sub-list for method input_type
+	3,  // [3:3] is the sub-list for extension type_name
+	3,  // [3:3] is the sub-list for extension extendee
+	0,  // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_request_proto_init() }
@@ -485,7 +543,7 @@ func file_request_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_request_proto_rawDesc), len(file_request_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

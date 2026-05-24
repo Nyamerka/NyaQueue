@@ -277,6 +277,42 @@ func (x *ListTopicsResponse) GetTopics() []*TopicInfo {
 	return nil
 }
 
+type SetBalancerResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetBalancerResponse) Reset() {
+	*x = SetBalancerResponse{}
+	mi := &file_response_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetBalancerResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetBalancerResponse) ProtoMessage() {}
+
+func (x *SetBalancerResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_response_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetBalancerResponse.ProtoReflect.Descriptor instead.
+func (*SetBalancerResponse) Descriptor() ([]byte, []int) {
+	return file_response_proto_rawDescGZIP(), []int{6}
+}
+
 type MetricsResponse struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Throughput     float64                `protobuf:"fixed64,1,opt,name=throughput,proto3" json:"throughput,omitempty"`
@@ -294,7 +330,7 @@ type MetricsResponse struct {
 
 func (x *MetricsResponse) Reset() {
 	*x = MetricsResponse{}
-	mi := &file_response_proto_msgTypes[6]
+	mi := &file_response_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -306,7 +342,7 @@ func (x *MetricsResponse) String() string {
 func (*MetricsResponse) ProtoMessage() {}
 
 func (x *MetricsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_response_proto_msgTypes[6]
+	mi := &file_response_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -319,7 +355,7 @@ func (x *MetricsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MetricsResponse.ProtoReflect.Descriptor instead.
 func (*MetricsResponse) Descriptor() ([]byte, []int) {
-	return file_response_proto_rawDescGZIP(), []int{6}
+	return file_response_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *MetricsResponse) GetThroughput() float64 {
@@ -400,7 +436,8 @@ const file_response_proto_rawDesc = "" +
 	"\x13CreateTopicResponse\"\x15\n" +
 	"\x13DeleteTopicResponse\"A\n" +
 	"\x12ListTopicsResponse\x12+\n" +
-	"\x06topics\x18\x01 \x03(\v2\x13.nyaqueue.TopicInfoR\x06topics\"\xc6\x02\n" +
+	"\x06topics\x18\x01 \x03(\v2\x13.nyaqueue.TopicInfoR\x06topics\"\x15\n" +
+	"\x13SetBalancerResponse\"\xc6\x02\n" +
 	"\x0fMetricsResponse\x12\x1e\n" +
 	"\n" +
 	"throughput\x18\x01 \x01(\x01R\n" +
@@ -430,7 +467,7 @@ func file_response_proto_rawDescGZIP() []byte {
 	return file_response_proto_rawDescData
 }
 
-var file_response_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_response_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_response_proto_goTypes = []any{
 	(*ProduceResponse)(nil),     // 0: nyaqueue.ProduceResponse
 	(*ConsumeResponse)(nil),     // 1: nyaqueue.ConsumeResponse
@@ -438,20 +475,21 @@ var file_response_proto_goTypes = []any{
 	(*CreateTopicResponse)(nil), // 3: nyaqueue.CreateTopicResponse
 	(*DeleteTopicResponse)(nil), // 4: nyaqueue.DeleteTopicResponse
 	(*ListTopicsResponse)(nil),  // 5: nyaqueue.ListTopicsResponse
-	(*MetricsResponse)(nil),     // 6: nyaqueue.MetricsResponse
-	(*ProduceResult)(nil),       // 7: nyaqueue.ProduceResult
-	(*MessageEnvelope)(nil),     // 8: nyaqueue.MessageEnvelope
-	(*TopicInfo)(nil),           // 9: nyaqueue.TopicInfo
+	(*SetBalancerResponse)(nil), // 6: nyaqueue.SetBalancerResponse
+	(*MetricsResponse)(nil),     // 7: nyaqueue.MetricsResponse
+	(*ProduceResult)(nil),       // 8: nyaqueue.ProduceResult
+	(*MessageEnvelope)(nil),     // 9: nyaqueue.MessageEnvelope
+	(*TopicInfo)(nil),           // 10: nyaqueue.TopicInfo
 }
 var file_response_proto_depIdxs = []int32{
-	7, // 0: nyaqueue.ProduceResponse.results:type_name -> nyaqueue.ProduceResult
-	8, // 1: nyaqueue.ConsumeResponse.messages:type_name -> nyaqueue.MessageEnvelope
-	9, // 2: nyaqueue.ListTopicsResponse.topics:type_name -> nyaqueue.TopicInfo
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	8,  // 0: nyaqueue.ProduceResponse.results:type_name -> nyaqueue.ProduceResult
+	9,  // 1: nyaqueue.ConsumeResponse.messages:type_name -> nyaqueue.MessageEnvelope
+	10, // 2: nyaqueue.ListTopicsResponse.topics:type_name -> nyaqueue.TopicInfo
+	3,  // [3:3] is the sub-list for method output_type
+	3,  // [3:3] is the sub-list for method input_type
+	3,  // [3:3] is the sub-list for extension type_name
+	3,  // [3:3] is the sub-list for extension extendee
+	0,  // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_response_proto_init() }
@@ -466,7 +504,7 @@ func file_response_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_response_proto_rawDesc), len(file_response_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

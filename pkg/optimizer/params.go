@@ -8,7 +8,7 @@ type TunableParam struct {
 	Name   string
 	Min    float64
 	Max    float64
-	Weight float64 // Lasso-derived importance (0 = excluded from DDPG action space)
+	Weight float64 // Lasso-derived importance (0 = excluded from TD3 action space)
 }
 
 func DefaultTunableParams() []TunableParam {
@@ -28,7 +28,7 @@ func DefaultTunableParams() []TunableParam {
 
 // CalibrateWeights runs Lasso regression on pilot run data to determine which
 // parameters actually affect throughput. Params with zero Lasso weight are
-// excluded from the DDPG action space, reducing dimensionality.
+// excluded from the TD3 action space, reducing dimensionality.
 //
 // configs: matrix of pilot configurations (each row = one run, len(row) == len(params))
 // throughputs: observed throughput for each pilot config

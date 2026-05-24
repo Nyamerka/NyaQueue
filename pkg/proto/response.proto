@@ -26,6 +26,8 @@ message ListTopicsResponse {
   repeated TopicInfo topics = 1;
 }
 
+message SetBalancerResponse {}
+
 message MetricsResponse {
   double          throughput      = 1;
   double          avg_latency     = 2;

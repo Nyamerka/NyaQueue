@@ -9,20 +9,21 @@ require (
 	github.com/dgraph-io/badger/v4 v4.9.1
 	github.com/gomlx/gomlx v0.27.3
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/klauspost/compress v1.18.0
+	github.com/klauspost/compress v1.18.6
 	github.com/knadh/koanf/parsers/yaml v1.1.0
 	github.com/knadh/koanf/providers/basicflag v1.1.0
 	github.com/knadh/koanf/providers/env v1.1.0
 	github.com/knadh/koanf/providers/file v1.2.1
 	github.com/knadh/koanf/v2 v2.3.4
 	github.com/nobl9/govy v0.24.0
-	github.com/pierrec/lz4/v4 v4.1.15
+	github.com/pierrec/lz4/v4 v4.1.26
 	github.com/prometheus/client_golang v1.23.2
 	github.com/puzpuzpuz/xsync/v3 v3.5.1
 	github.com/samber/oops v1.21.0
-	github.com/segmentio/kafka-go v0.4.50
 	github.com/stretchr/testify v1.11.1
 	github.com/tidwall/wal v1.2.1
+	github.com/twmb/franz-go v1.21.2
+	github.com/twmb/franz-go/pkg/kmsg v1.13.1
 	golang.org/x/net v0.53.0
 	golang.org/x/sync v0.20.0
 	gonum.org/v1/gonum v0.17.0

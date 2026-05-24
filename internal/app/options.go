@@ -101,7 +101,7 @@ func WithBackpressure(threshold float64, horizon int) Option {
 	}
 }
 
-// WithOptimizer enables the DDPG auto-configuration loop that tunes
+// WithOptimizer enables the TD3 auto-configuration loop that tunes
 // broker parameters online based on live metrics.
 func WithOptimizer(params []optimizer.TunableParam, optCfg ...optimizer.OptimizerConfig) Option {
 	return func(a *BrokerApp) {

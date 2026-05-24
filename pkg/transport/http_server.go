@@ -42,6 +42,7 @@ func NewHTTPServer(b *broker.Broker) *HTTPServer {
 	mux.HandleFunc("GET /topics/{topic}/messages", s.handleConsume)
 	mux.HandleFunc("POST /topics/{topic}/offsets", s.handleCommit)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
+	mux.HandleFunc("POST /admin/balancer", s.handleSetBalancer)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -380,6 +381,43 @@ func (s *HTTPServer) handleListTopics(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, infos)
+}
+
+type HTTPSetBalancerRequest struct {
+	Algorithm     string `json:"algorithm"`
+	NumPartitions int    `json:"num_partitions"`
+}
+
+func (s *HTTPServer) handleSetBalancer(w http.ResponseWriter, r *http.Request) {
+	var req HTTPSetBalancerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	kind := stringToBalancerKind(req.Algorithm)
+	bal, err := broker.BalancerFromKind(kind, req.NumPartitions)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err)
+		return
+	}
+	s.broker.SetBalancer(bal)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func stringToBalancerKind(algo string) broker.BalancerKind {
+	switch algo {
+	case "round_robin", "RR":
+		return broker.KindRoundRobin
+	case "power_of_two_choices", "P2C":
+		return broker.KindPowerOfTwoChoices
+	case "psa", "PSA":
+		return broker.KindPSA
+	case "dqn", "DQN":
+		return broker.KindDQN
+	default:
+		return broker.KindRoundRobin
+	}
 }
 
 func (s *HTTPServer) handleMetrics(w http.ResponseWriter, _ *http.Request) {

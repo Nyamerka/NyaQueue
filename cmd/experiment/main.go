@@ -31,6 +31,7 @@ func main() {
 	fs.String("experiment.http_broker_addr", "", "external NyaQueue HTTP broker address (e.g. broker:8080)")
 	fs.String("experiment.output", "experiments/results", "output directory for results")
 	fs.String("experiment.duration", "", "per-scenario duration (e.g. 30s)")
+	fs.Bool("experiment.skip_warmup", false, "skip initial 10s discard warmup (use for CI smoke runs)")
 	_ = fs.Parse(os.Args[1:])
 
 	k := koanf.New(".")
@@ -46,6 +47,7 @@ func main() {
 	httpBrokerAddr := k.String("experiment.http_broker_addr")
 	outputDir := k.String("experiment.output")
 	durationStr := k.String("experiment.duration")
+	skipWarmup := k.Bool("experiment.skip_warmup")
 	duration := 10 * time.Second
 	if durationStr != "" {
 		if d, err := time.ParseDuration(durationStr); err == nil {
@@ -76,6 +78,7 @@ func main() {
 		BrokerAddr:     brokerAddr,
 		HTTPBrokerAddr: httpBrokerAddr,
 		Duration:       duration,
+		SkipWarmup:     skipWarmup,
 	}
 	runner.OnScenarioComplete = func(results []experiments.ExperimentResult) {
 		if err := experiments.ExportCSV(results, outputDir); err != nil {

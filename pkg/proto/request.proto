@@ -41,3 +41,8 @@ message DeleteTopicRequest {
 message ListTopicsRequest {}
 
 message MetricsRequest {}
+
+message SetBalancerRequest {
+  BalancerAlgorithm algorithm      = 1;
+  int32             num_partitions = 2;
+}

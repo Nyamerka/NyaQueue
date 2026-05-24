@@ -24,7 +24,7 @@ type OptimizerConfig struct {
 	WarmupTicks  int
 	LearningRate float64
 	Hysteresis   float64
-	NoiseDecay   float64 // per-step multiplicative decay for OUNoise sigma (default 0.999)
+	NoiseDecay   float64 // per-step multiplicative decay for Gaussian sigma (default 0.999)
 	NoiseFloor   float64 // minimum sigma value (default 0.05)
 }
 
@@ -40,11 +40,11 @@ func DefaultOptimizerConfig() OptimizerConfig {
 	}
 }
 
-// Optimizer runs the DDPG training loop on Lasso-selected broker parameters.
+// Optimizer runs the TD3 training loop on Lasso-selected broker parameters.
 type Optimizer struct {
 	mu xsync.RBMutex
 
-	ddpg       *DDPG
+	td3        *TD3
 	params     []TunableParam
 	broker     *broker.Broker
 	interval   time.Duration
@@ -107,8 +107,8 @@ func NewOptimizer(b *broker.Broker, params []TunableParam, optCfg OptimizerConfi
 		optCfg.NoiseFloor = 0.05
 	}
 
-	ddpg := NewDDPG(stateSize, actionSize, optCfg.LearningRate, optCfg.BatchSize)
-	ddpg.SetNoiseDecay(optCfg.NoiseDecay, optCfg.NoiseFloor)
+	td3 := NewTD3(stateSize, actionSize, optCfg.LearningRate, optCfg.BatchSize)
+	td3.SetNoiseDecay(optCfg.NoiseDecay, optCfg.NoiseFloor)
 
 	var startConfig broker.Config
 	if b != nil {
@@ -116,7 +116,7 @@ func NewOptimizer(b *broker.Broker, params []TunableParam, optCfg OptimizerConfi
 	}
 
 	return &Optimizer{
-		ddpg:             ddpg,
+		td3:              td3,
 		params:           active,
 		broker:           b,
 		interval:         optCfg.Interval,
@@ -179,7 +179,7 @@ func (o *Optimizer) step() {
 	o.checkEmergencyRollback(&metrics)
 
 	state := o.buildState(&metrics)
-	action := o.ddpg.Act(state)
+	action := o.td3.Act(state)
 
 	if o.ticks > o.warmup && !o.rolledBack {
 		safe := true
@@ -198,8 +198,9 @@ func (o *Optimizer) step() {
 		reward := o.computeReward(&metrics)
 		prevState := o.buildState(o.prevMetrics)
 
-		o.ddpg.Store(prevState, action, reward, state, false)
-		o.ddpg.Train(o.batchSize)
+		o.td3.Store(prevState, action, reward, state, false)
+		o.td3.Train(o.batchSize)
+		o.td3.DecayNoise()
 	}
 
 	o.prevMetrics = &metrics

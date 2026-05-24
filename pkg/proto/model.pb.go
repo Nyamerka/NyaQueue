@@ -70,6 +70,58 @@ func (ScheduleMode) EnumDescriptor() ([]byte, []int) {
 	return file_model_proto_rawDescGZIP(), []int{0}
 }
 
+type BalancerAlgorithm int32
+
+const (
+	BalancerAlgorithm_ROUND_ROBIN          BalancerAlgorithm = 0
+	BalancerAlgorithm_POWER_OF_TWO_CHOICES BalancerAlgorithm = 1
+	BalancerAlgorithm_PSA                  BalancerAlgorithm = 2
+	BalancerAlgorithm_DQN                  BalancerAlgorithm = 3
+)
+
+// Enum value maps for BalancerAlgorithm.
+var (
+	BalancerAlgorithm_name = map[int32]string{
+		0: "ROUND_ROBIN",
+		1: "POWER_OF_TWO_CHOICES",
+		2: "PSA",
+		3: "DQN",
+	}
+	BalancerAlgorithm_value = map[string]int32{
+		"ROUND_ROBIN":          0,
+		"POWER_OF_TWO_CHOICES": 1,
+		"PSA":                  2,
+		"DQN":                  3,
+	}
+)
+
+func (x BalancerAlgorithm) Enum() *BalancerAlgorithm {
+	p := new(BalancerAlgorithm)
+	*p = x
+	return p
+}
+
+func (x BalancerAlgorithm) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (BalancerAlgorithm) Descriptor() protoreflect.EnumDescriptor {
+	return file_model_proto_enumTypes[1].Descriptor()
+}
+
+func (BalancerAlgorithm) Type() protoreflect.EnumType {
+	return &file_model_proto_enumTypes[1]
+}
+
+func (x BalancerAlgorithm) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use BalancerAlgorithm.Descriptor instead.
+func (BalancerAlgorithm) EnumDescriptor() ([]byte, []int) {
+	return file_model_proto_rawDescGZIP(), []int{1}
+}
+
 type MessageEnvelope struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Offset        int64                  `protobuf:"varint,1,opt,name=offset,proto3" json:"offset,omitempty"`
@@ -437,7 +489,12 @@ const file_model_proto_rawDesc = "" +
 	"\fScheduleMode\x12\b\n" +
 	"\x04FIFO\x10\x00\x12\x13\n" +
 	"\x0fSTRICT_PRIORITY\x10\x01\x12\x10\n" +
-	"\fDQN_ADAPTIVE\x10\x02B(Z&github.com/Nyamerka/NyaQueue/pkg/protob\x06proto3"
+	"\fDQN_ADAPTIVE\x10\x02*P\n" +
+	"\x11BalancerAlgorithm\x12\x0f\n" +
+	"\vROUND_ROBIN\x10\x00\x12\x18\n" +
+	"\x14POWER_OF_TWO_CHOICES\x10\x01\x12\a\n" +
+	"\x03PSA\x10\x02\x12\a\n" +
+	"\x03DQN\x10\x03B(Z&github.com/Nyamerka/NyaQueue/pkg/protob\x06proto3"
 
 var (
 	file_model_proto_rawDescOnce sync.Once
@@ -451,15 +508,16 @@ func file_model_proto_rawDescGZIP() []byte {
 	return file_model_proto_rawDescData
 }
 
-var file_model_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_model_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
 var file_model_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
 var file_model_proto_goTypes = []any{
 	(ScheduleMode)(0),           // 0: nyaqueue.ScheduleMode
-	(*MessageEnvelope)(nil),     // 1: nyaqueue.MessageEnvelope
-	(*TopicInfo)(nil),           // 2: nyaqueue.TopicInfo
-	(*TopicScheduleConfig)(nil), // 3: nyaqueue.TopicScheduleConfig
-	(*ProduceMessage)(nil),      // 4: nyaqueue.ProduceMessage
-	(*ProduceResult)(nil),       // 5: nyaqueue.ProduceResult
+	(BalancerAlgorithm)(0),      // 1: nyaqueue.BalancerAlgorithm
+	(*MessageEnvelope)(nil),     // 2: nyaqueue.MessageEnvelope
+	(*TopicInfo)(nil),           // 3: nyaqueue.TopicInfo
+	(*TopicScheduleConfig)(nil), // 4: nyaqueue.TopicScheduleConfig
+	(*ProduceMessage)(nil),      // 5: nyaqueue.ProduceMessage
+	(*ProduceResult)(nil),       // 6: nyaqueue.ProduceResult
 }
 var file_model_proto_depIdxs = []int32{
 	0, // 0: nyaqueue.TopicInfo.mode:type_name -> nyaqueue.ScheduleMode
@@ -481,7 +539,7 @@ func file_model_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_model_proto_rawDesc), len(file_model_proto_rawDesc)),
-			NumEnums:      1,
+			NumEnums:      2,
 			NumMessages:   5,
 			NumExtensions: 0,
 			NumServices:   0,

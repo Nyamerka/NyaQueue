@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"math/bits"
 	"sync/atomic"
 	"time"
 
@@ -109,6 +110,7 @@ type priorityLevel struct {
 type PriorityIndex struct {
 	levels      [MaxPriority]priorityLevel
 	total       atomic.Int64
+	nonEmpty    atomic.Uint64 // bitmask: bit i set iff levels[i].count > 0
 	maxPerLevel int
 }
 
@@ -154,68 +156,70 @@ func (pi *PriorityIndex) Add(priority int, offset int64, arrivedAt time.Time) bo
 	}
 	lv.count.Add(1)
 	lv.mu.Unlock()
+	pi.nonEmpty.Or(1 << uint(priority))
 	pi.total.Add(1)
 	return true
 }
 
 func (pi *PriorityIndex) PopHighest() (PendingEntry, bool) {
+	mask := pi.nonEmpty.Load()
+	if mask == 0 {
+		return PendingEntry{}, false
+	}
 	for p := MaxPriority - 1; p >= 0; p-- {
-		lv := &pi.levels[p]
-		lv.mu.Lock()
-		entry, ok := lv.ring.popFront()
-		if ok {
-			lv.count.Add(-1)
-			lv.mu.Unlock()
-			pi.total.Add(-1)
+		if mask&(1<<uint(p)) == 0 {
+			continue
+		}
+		if entry, ok := pi.popFromLevel(p); ok {
 			return entry, true
 		}
-		lv.mu.Unlock()
 	}
 	return PendingEntry{}, false
 }
 
 func (pi *PriorityIndex) PopWithThreshold(threshold int) (PendingEntry, bool) {
-	for p := MaxPriority - 1; p >= threshold; p-- {
-		lv := &pi.levels[p]
-		lv.mu.Lock()
-		entry, ok := lv.ring.popFront()
-		if ok {
-			lv.count.Add(-1)
-			lv.mu.Unlock()
-			pi.total.Add(-1)
-			return entry, true
-		}
-		lv.mu.Unlock()
+	mask := pi.nonEmpty.Load()
+	if mask == 0 {
+		return PendingEntry{}, false
 	}
 
-	bestPriority := -1
-	var bestTime time.Time
-	for p := 0; p < threshold && p < MaxPriority; p++ {
-		lv := &pi.levels[p]
-		lv.mu.Lock()
-		e, ok := lv.ring.peekFront()
-		if ok {
-			if bestPriority == -1 || e.ArrivedAt.Before(bestTime) {
-				if bestPriority >= 0 {
-					pi.levels[bestPriority].mu.Unlock()
-				}
-				bestPriority = p
-				bestTime = e.ArrivedAt
-			} else {
-				lv.mu.Unlock()
-			}
-		} else {
-			lv.mu.Unlock()
+	// Fast path: check levels at or above threshold (preferred).
+	aboveMask := mask & (^uint64(0) << uint(threshold))
+	if aboveMask != 0 {
+		top := bits.Len64(aboveMask) - 1
+		if entry, ok := pi.popFromLevel(top); ok {
+			return entry, true
+		}
+		// Rare: bitmask was stale. Fall through to full scan.
+	}
+
+	// Below-threshold fallback: pop from the highest occupied level below threshold.
+	belowMask := mask & ((1 << uint(threshold)) - 1)
+	if belowMask != 0 {
+		top := bits.Len64(belowMask) - 1
+		if entry, ok := pi.popFromLevel(top); ok {
+			return entry, true
 		}
 	}
-	if bestPriority >= 0 {
-		lv := &pi.levels[bestPriority]
-		entry, _ := lv.ring.popFront()
-		lv.count.Add(-1)
+
+	return PendingEntry{}, false
+}
+
+func (pi *PriorityIndex) popFromLevel(p int) (PendingEntry, bool) {
+	lv := &pi.levels[p]
+	lv.mu.Lock()
+	entry, ok := lv.ring.popFront()
+	if ok {
+		cnt := lv.count.Add(-1)
 		lv.mu.Unlock()
+		if cnt <= 0 {
+			pi.nonEmpty.And(^(1 << uint(p)))
+		}
 		pi.total.Add(-1)
 		return entry, true
 	}
+	lv.mu.Unlock()
+	pi.nonEmpty.And(^(1 << uint(p)))
 	return PendingEntry{}, false
 }
 
@@ -248,6 +252,9 @@ func (pi *PriorityIndex) PromoteStale(ttl time.Duration) {
 		}
 		lv.ring.resetFrom(fresh)
 		lv.count.Store(int32(len(fresh)))
+		if len(fresh) == 0 {
+			pi.nonEmpty.And(^(1 << uint(p)))
+		}
 		lv.mu.Unlock()
 
 		if len(stale) > 0 {
@@ -260,6 +267,9 @@ func (pi *PriorityIndex) PromoteStale(ttl time.Duration) {
 				}
 			}
 			up.count.Store(int32(up.ring.size))
+			if up.ring.size > 0 {
+				pi.nonEmpty.Or(1 << uint(p+1))
+			}
 			up.mu.Unlock()
 		}
 	}

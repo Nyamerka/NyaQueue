@@ -15,7 +15,7 @@ const (
 	DefaultDQNMinReplay      = 64
 	DefaultDQNTrainEvery     = 1
 	DefaultDQNUpdatesPerStep = 4
-	DefaultDQNExpChannelSize = 4096
+	DefaultDQNExpChannelSize = 16384
 	DefaultDQNWeightDecay    = 1e-4
 )
 
@@ -51,6 +51,11 @@ const (
 	dqnDepthSoftCap = 100_000.0
 	dqnDepthWeight  = 0.3
 )
+
+// DQN max-load penalty: explicitly punishes the hottest partition when it
+// exceeds capacity (load > 1.0), preventing the DQN from funneling traffic
+// into a single partition under overload.
+const dqnMaxLoadWeight = 1.0
 
 // Policy tick interval and adaptive slow-tick for low-rate scenarios.
 const (
