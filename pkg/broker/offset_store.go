@@ -119,7 +119,6 @@ func (s *OffsetStore) Commit(group, topic string, partition int, offset int64) e
 	return s.writeOne(key, offset)
 }
 
-// Load returns the last committed offset for a consumer group.
 func (s *OffsetStore) Load(group, topic string, partition int) (int64, error) {
 	key := s.bucketKey(topic, partition, group)
 	if v, ok := s.cache.Load(key); ok {

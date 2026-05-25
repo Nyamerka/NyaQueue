@@ -85,7 +85,6 @@ func (p *Partition) Append(msg *Message) (uint64, error) {
 	return offsets[0], nil
 }
 
-// LastFlushLatency returns the duration of the most recent WAL write batch.
 func (p *Partition) LastFlushLatency() time.Duration {
 	return time.Duration(p.lastFlushNs.Load())
 }
@@ -362,7 +361,6 @@ func (p *Partition) Rebuild(startOffset uint64, isCommitted func(offset uint64) 
 	return nil
 }
 
-// TruncateFront removes WAL entries before the given offset.
 func (p *Partition) TruncateFront(offset uint64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

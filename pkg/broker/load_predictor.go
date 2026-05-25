@@ -297,80 +297,83 @@ func (lp *LoadPredictor) yuleWalker(vals []float64, mean float64, p int) []float
 }
 
 // RingBuffer is a circular buffer for time-series data.
-// Push is lockless via atomic increment; Values/ValuesInto use RLock for consistency.
+// Push is lockless via atomic increment + atomic store;
+// Values/ValuesInto use RLock for snapshot consistency.
 type RingBuffer struct {
 	mu       xsync.RBMutex
-	data     []float64
+	data     []atomic.Uint64
 	writeIdx atomic.Int64
 }
 
 func NewRingBuffer(size int) *RingBuffer {
-	return &RingBuffer{data: make([]float64, size)}
+	return &RingBuffer{data: make([]atomic.Uint64, size)}
 }
 
 func (rb *RingBuffer) Push(v float64) {
-	rb.mu.Lock()
 	idx := rb.writeIdx.Add(1) - 1
 	slot := idx % int64(len(rb.data))
-	rb.data[slot] = v
-	rb.mu.Unlock()
+	rb.data[slot].Store(math.Float64bits(v))
 }
 
-// Values allocates and returns a copy of the buffer contents in chronological order.
+func (rb *RingBuffer) validCount() (writePos, ringSize int64, count int) {
+	w := rb.writeIdx.Load()
+	sz := int64(len(rb.data))
+	if w == 0 {
+		return 0, sz, 0
+	}
+	n := w
+	if n > sz {
+		n = sz
+	}
+	return w, sz, int(n)
+}
+
+// Values allocates and returns a chronological copy of the buffer.
 func (rb *RingBuffer) Values() []float64 {
 	t := rb.mu.RLock()
 	defer rb.mu.RUnlock(t)
 
-	w := rb.writeIdx.Load()
-	size := int64(len(rb.data))
-	if w == 0 {
+	w, sz, n := rb.validCount()
+	if n == 0 {
 		return nil
 	}
-
-	n := w
-	if n > size {
-		n = size
-	}
 	out := make([]float64, n)
-	rb.copyInto(out, w, size, int(n))
+	rb.copyInto(out, w, sz, n)
 	return out
 }
 
-// ValuesInto copies buffer contents into dst without allocating. Returns the
-// number of values written. dst must be at least as large as the ring size.
+// ValuesInto copies into dst without allocating; returns the number of values written.
 func (rb *RingBuffer) ValuesInto(dst []float64) int {
 	t := rb.mu.RLock()
 	defer rb.mu.RUnlock(t)
 
-	w := rb.writeIdx.Load()
-	size := int64(len(rb.data))
-	if w == 0 {
+	w, sz, n := rb.validCount()
+	if n == 0 || len(dst) == 0 {
 		return 0
-	}
-
-	n := int(w)
-	if int64(n) > size {
-		n = int(size)
 	}
 	if n > len(dst) {
 		n = len(dst)
 	}
-	rb.copyInto(dst[:n], w, size, n)
+	rb.copyInto(dst[:n], w, sz, n)
 	return n
 }
 
 func (rb *RingBuffer) copyInto(dst []float64, w, size int64, n int) {
 	if w <= size {
-		copy(dst, rb.data[:n])
+		for i := 0; i < n; i++ {
+			dst[i] = math.Float64frombits(rb.data[i].Load())
+		}
 	} else {
 		start := w % size
 		tail := int(size - start)
 		if tail > n {
 			tail = n
 		}
-		copy(dst, rb.data[start:start+int64(tail)])
-		if tail < n {
-			copy(dst[tail:], rb.data[:n-tail])
+		for i := 0; i < tail; i++ {
+			dst[i] = math.Float64frombits(rb.data[start+int64(i)].Load())
+		}
+		for i := 0; i < n-tail; i++ {
+			dst[tail+i] = math.Float64frombits(rb.data[i].Load())
 		}
 	}
 }

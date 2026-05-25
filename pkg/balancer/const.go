@@ -2,11 +2,9 @@ package balancer
 
 import (
 	"math"
-	"math/rand/v2"
 	"time"
 )
 
-// DQN hyperparameters (user-facing defaults).
 const (
 	DefaultDQNHiddenSize     = 128
 	DefaultDQNGamma          = 0.9
@@ -39,7 +37,6 @@ const (
 
 var dqnThroughputLogNorm = math.Log1p(dqnMaxThroughput / dqnThroughputScale)
 
-// DQN state normalization scales.
 const (
 	dqnMsgRateScale      = 100_000.0
 	dqnMsgSizeScale      = 1024.0
@@ -47,90 +44,39 @@ const (
 	dqnDepthFeatureScale = 1_000.0
 )
 
-// DQN queue-depth penalty in reward.
 const (
 	dqnDepthSoftCap = 100_000.0
 	dqnDepthWeight  = 0.3
 )
 
-// DQN max-load penalty: explicitly punishes the hottest partition when it
-// exceeds capacity (load > 1.0), preventing the DQN from funneling traffic
-// into a single partition under overload.
 const dqnMaxLoadWeight = 1.0
 
-// Boltzmann (softmax) routing parameters.
 const (
-	dqnBoltzmannTauStart      = 0.5
-	dqnBoltzmannTauEnd        = 0.05
-	dqnBoltzmannAnnealingExp  = 20_000
-	dqnBoltzmannInflightAlpha = 2.0
+	dqnActionLoadW     = 0.5
+	dqnActionInflightW = 0.3
 )
 
-// currentTemperature implements cosine annealing for the Boltzmann temperature:
-// τ decays from dqnBoltzmannTauStart → dqnBoltzmannTauEnd over the first
-// dqnBoltzmannAnnealingExp experiences using cosine schedule.
-func currentTemperature(experiencesSeen int64) float64 {
-	if experiencesSeen >= dqnBoltzmannAnnealingExp {
-		return dqnBoltzmannTauEnd
-	}
-	progress := float64(experiencesSeen) / float64(dqnBoltzmannAnnealingExp)
-	return dqnBoltzmannTauEnd + 0.5*(dqnBoltzmannTauStart-dqnBoltzmannTauEnd)*(1+math.Cos(progress*math.Pi))
-}
+// Entropy-calibrated Boltzmann routing parameters.
+//
+// Instead of annealing a fixed τ (which breaks when Q-value scale drifts),
+// we anneal a *normalized entropy target* H(softmax(q/τ))/log(K).
+// τ is solved per-inference via binary search to hit that target.
+const (
+	dqnBoltzmannEntropyStart = 0.85
+	dqnBoltzmannEntropyEnd   = 0.30
+	dqnBoltzmannAnnealingExp = 20_000
 
-// Policy tick interval and adaptive slow-tick for low-rate scenarios.
+	dqnInflightCouplingBeta = 2.0
+	dqnLoadCouplingBeta     = 1.5
+)
+
 const (
 	dqnPolicyTickInterval     = 100 * time.Millisecond
 	dqnSlowPolicyTickInterval = 500 * time.Millisecond
 	dqnLowRateThreshold       = 5_000.0
 )
 
-// softmaxFromQ computes Boltzmann probabilities from Q-values:
-// p[i] = exp(q[i]/τ) / Σ exp(q[j]/τ).
-func softmaxFromQ(q []float64, tau float64) []float64 {
-	if tau <= 0 {
-		tau = 1e-8
-	}
-	maxQ := q[0]
-	for _, v := range q[1:] {
-		if v > maxQ {
-			maxQ = v
-		}
-	}
-	probs := make([]float64, len(q))
-	var sum float64
-	for i, v := range q {
-		e := math.Exp((v - maxQ) / tau)
-		probs[i] = e
-		sum += e
-	}
-	if sum > 0 {
-		for i := range probs {
-			probs[i] /= sum
-		}
-	} else {
-		uniform := 1.0 / float64(len(probs))
-		for i := range probs {
-			probs[i] = uniform
-		}
-	}
-	return probs
-}
+const dqnNumQuantiles = 51
+const dqnThompsonK = 4
 
-// sampleCDF samples an index from a probability distribution using inverse-CDF.
-// O(K) per call which is fast for K ≤ 32.
-func sampleCDF(probs []float64) int {
-	r := rand.Float64()
-	var cumulative float64
-	for i, p := range probs {
-		cumulative += p
-		if r < cumulative {
-			return i
-		}
-	}
-	return len(probs) - 1
-}
-
-// PSA constants.
-const (
-	PSARebalanceLoadFactor = 2.0
-)
+const PSARebalanceLoadFactor = 2.0

@@ -397,7 +397,6 @@ func (mc *MetricsCollector) RegisterPrometheus(reg prometheus.Registerer) {
 	})
 }
 
-// updatePrometheus pushes the latest snapshot to Prometheus gauges.
 func (mc *MetricsCollector) updatePrometheus(snap Metrics) {
 	if !mc.promRegistered {
 		return
@@ -431,7 +430,6 @@ func (mc *MetricsCollector) updatePrometheus(snap Metrics) {
 	mc.promBalEvictions.Set(float64(snap.BalancerEvictions))
 }
 
-// RemovePartition clears partition-level counters and histories for a deleted partition.
 func (mc *MetricsCollector) RemovePartition(partID int) {
 	mc.mu.Lock()
 	if partID < len(mc.partProduces) {
@@ -445,14 +443,12 @@ func (mc *MetricsCollector) RemovePartition(partID int) {
 	mc.mu.Unlock()
 }
 
-// RecordProduceLabeled records a produce for Prometheus with topic/partition labels.
 func (mc *MetricsCollector) RecordProduceLabeled(topic string, partition int) {
 	if mc.promRegistered && mc.promProduce != nil {
 		mc.promProduce.WithLabelValues(topic, strconv.Itoa(partition)).Inc()
 	}
 }
 
-// RecordConsumeLabeled records a consume for Prometheus with topic/partition/group labels.
 func (mc *MetricsCollector) RecordConsumeLabeled(topic string, partition int, group string) {
 	if mc.promRegistered && mc.promConsume != nil {
 		mc.promConsume.WithLabelValues(topic, strconv.Itoa(partition), group).Inc()

@@ -108,7 +108,8 @@ func (r *Runner) RunAll(ctx context.Context) ([]ExperimentResult, error) {
 				continue
 			}
 
-			for _, alg := range r.Algorithms {
+			sortedAlgs := groupAlgorithmsByMatch(r.Algorithms, "DQN")
+			for _, alg := range sortedAlgs {
 				if disabledModes[mode] {
 					break
 				}
@@ -137,10 +138,10 @@ func (r *Runner) RunAll(ctx context.Context) ([]ExperimentResult, error) {
 
 const (
 	warmupDuration        = 10 * time.Second
-	dqnWarmupDuration     = 30 * time.Second
 	dqnWarmupMaxDuration  = 5 * time.Minute
 	dqnWarmupTargetExp    = 2000
-	dqnWarmupPollInterval = time.Second
+	dqnWarmupPollInterval = 100 * time.Millisecond
+	dqnWarmupRateCap      = 20_000
 )
 
 func (r *Runner) runWarmup(ctx context.Context) {
@@ -262,10 +263,9 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	}
 	h.SetManagedTopic(topic)
 
-	replaced := false
 	if brk := h.Broker(); brk != nil {
 		newBal := alg.NewBalancer(topicCfg.NumPartitions)
-		replaced = brk.ReplaceBalancerSameAlgorithm(newBal)
+		brk.ReplaceBalancerSameAlgorithm(newBal)
 	} else {
 		if err := h.SwitchBalancer(alg, topicCfg.NumPartitions); err != nil {
 			return ExperimentResult{}, oops.Wrapf(err, "switch balancer for %s/%s", sc.Name, alg.Name)
@@ -277,29 +277,29 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 
 	if strings.Contains(alg.Name, "DQN") {
 		const miniWarmupDuration = 5 * time.Second
-		if replaced {
-			log.Printf("  [dqn-warmup] weights preserved, mini-warmup %v for %s/%s",
-				miniWarmupDuration, sc.Name, alg.Name)
+
+		seen, _ := h.BalancerExperiencesSeen(ctx)
+		if seen >= dqnWarmupTargetExp {
+			log.Printf("  [dqn-warmup] weights preserved (seen=%d), mini-warmup %v for %s/%s",
+				seen, miniWarmupDuration, sc.Name, alg.Name)
 			warmupSc := sc
 			warmupSc.Duration = miniWarmupDuration
 			if warmupSc.RatePerSec == 0 {
 				warmupSc.RatePerSec = 5000 * min(warmupSc.Producers, topicCfg.NumPartitions)
 			}
+			warmupSc.RatePerSec = min(warmupSc.RatePerSec, dqnWarmupRateCap)
 			_ = runScenario(ctx, h, warmupSc, alg.Name, "nyaqueue", mode, topicCfg.NumPartitions, miniWarmupDuration, topic)
 			goto postWarmup
 		}
 
 		maxWarmup := dqnWarmupMaxDuration
-		minWarmup := dqnWarmupDuration
-		if topicCfg.NumPartitions > 4 {
-			minWarmup = dqnWarmupDuration * time.Duration(topicCfg.NumPartitions/4)
-		}
 
 		warmupSc := sc
 		warmupSc.Duration = maxWarmup
 		if warmupSc.RatePerSec == 0 {
 			warmupSc.RatePerSec = 5000 * min(warmupSc.Producers, topicCfg.NumPartitions)
 		}
+		warmupSc.RatePerSec = min(warmupSc.RatePerSec, dqnWarmupRateCap)
 
 		log.Printf("  [dqn-warmup] running warmup for %s/%s (k=%d, rate=%d, target=%d experiences, max=%v) ...",
 			sc.Name, alg.Name, topicCfg.NumPartitions, warmupSc.RatePerSec, dqnWarmupTargetExp, maxWarmup)
@@ -312,23 +312,17 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		}()
 
 		deadline := time.After(maxWarmup)
-		minDeadline := time.After(minWarmup)
-		minElapsed := false
 		ticker := time.NewTicker(dqnWarmupPollInterval)
 		defer ticker.Stop()
 
 	warmupLoop:
 		for {
 			select {
-			case <-minDeadline:
-				minElapsed = true
 			case <-ticker.C:
-				if minElapsed {
-					seen, err := h.BalancerExperiencesSeen(ctx)
-					if err == nil && seen >= dqnWarmupTargetExp {
-						log.Printf("  [dqn-warmup] reached %d experiences, finishing early", seen)
-						break warmupLoop
-					}
+				seen, err := h.BalancerExperiencesSeen(ctx)
+				if err == nil && seen >= dqnWarmupTargetExp {
+					log.Printf("  [dqn-warmup] reached %d experiences, finishing early", seen)
+					break warmupLoop
 				}
 			case <-deadline:
 				seen, _ := h.BalancerExperiencesSeen(ctx)
@@ -380,8 +374,47 @@ func (r *Runner) runKafka(ctx context.Context, sc benchmarks.Scenario, dur time.
 		return ExperimentResult{}, oops.Wrapf(err, "create kafka topic")
 	}
 
+	if err := kafkaSmokeCheck(ctx, h, topic); err != nil {
+		return ExperimentResult{}, oops.Wrapf(err, "kafka smoke check failed for %s", sc.Name)
+	}
+
 	log.Printf("  running %s / kafka for %v ...", sc.Name, dur)
 	return runScenario(ctx, h, sc, "Kafka", "kafka", ModeKafka, topicCfg.NumPartitions, dur, topic), nil
+}
+
+func kafkaSmokeCheck(ctx context.Context, h *Harness, topic string) error {
+	smokeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	batch := []BatchItem{{
+		Key:   []byte("smoke-check"),
+		Value: encodeValue(defaultMsgSize),
+	}}
+	n, err := h.PublishBatch(smokeCtx, topic, batch)
+	if err != nil {
+		return oops.Wrapf(err, "kafka smoke: produce failed")
+	}
+	if n == 0 {
+		return oops.Errorf("kafka smoke: 0 messages produced")
+	}
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-smokeCtx.Done():
+			return oops.Errorf("kafka smoke: timed out waiting for consumed message on topic %s", topic)
+		case <-ticker.C:
+			msgs, err := h.ConsumeBatch(smokeCtx, topic, "smoke-check-group", 0)
+			if err != nil {
+				continue
+			}
+			if len(msgs) > 0 {
+				log.Printf("[kafka-smoke] OK: produce+consume verified on topic %s", topic)
+				return nil
+			}
+		}
+	}
 }
 
 func runScenario(
@@ -431,11 +464,12 @@ func runScenario(
 		})
 	}
 
+	maxLatency := 2 * dur
 	consumerPool := pond.NewPool(numPartitions)
 	for p := 0; p < numPartitions; p++ {
 		partition := p
 		consumerPool.Submit(func() {
-			runConsumer(consumeCtx, h, partition, collector, topic)
+			runConsumer(consumeCtx, h, partition, collector, topic, maxLatency)
 		})
 	}
 
@@ -625,7 +659,7 @@ func runUnlimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenari
 	}
 }
 
-func runConsumer(ctx context.Context, h *Harness, partition int, c *MetricsCollector, topic string) {
+func runConsumer(ctx context.Context, h *Harness, partition int, c *MetricsCollector, topic string, maxLatency time.Duration) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -649,7 +683,7 @@ func runConsumer(ctx context.Context, h *Harness, partition int, c *MetricsColle
 		}
 
 		for _, msg := range msgs {
-			latency, enqueueTime, ok := decodeLatency(msg.Value)
+			latency, enqueueTime, ok := decodeLatency(msg.Value, maxLatency)
 			if !ok {
 				c.RecordConsumeError()
 				continue
@@ -690,13 +724,13 @@ func encodeValue(size int) []byte {
 	return buf
 }
 
-func decodeLatency(value []byte) (time.Duration, int64, bool) {
+func decodeLatency(value []byte, maxLatency time.Duration) (time.Duration, int64, bool) {
 	if len(value) < timestampPrefixBytes {
 		return 0, 0, false
 	}
 	ts := int64(binary.BigEndian.Uint64(value[:timestampPrefixBytes]))
 	latency := time.Since(time.Unix(0, ts))
-	if latency < 0 {
+	if latency < 0 || latency > maxLatency {
 		return 0, 0, false
 	}
 	return latency, ts, true
@@ -737,6 +771,21 @@ func generateKeySeeded(buf []byte, skewRatio float64, rng *rand.Rand) []byte {
 	binary.BigEndian.PutUint64(buf, rng.Uint64())
 	copy(key, buf)
 	return key
+}
+
+// groupAlgorithmsByMatch reorders algorithms so entries whose Name contains
+// match are grouped at the end, preserving relative order within each group.
+func groupAlgorithmsByMatch(algs []AlgorithmConfig, match string) []AlgorithmConfig {
+	sorted := make([]AlgorithmConfig, 0, len(algs))
+	var matched []AlgorithmConfig
+	for _, alg := range algs {
+		if strings.Contains(alg.Name, match) {
+			matched = append(matched, alg)
+		} else {
+			sorted = append(sorted, alg)
+		}
+	}
+	return append(sorted, matched...)
 }
 
 func newExpBackoff() *backoff.ExponentialBackOff {

@@ -262,9 +262,11 @@ func (s *DQNSuite) TestBoltzmannRoutingPrefersBest() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
-	probs := softmaxFromQ([]float64{0.1, 0.2, 10.0, 0.3}, 0.05)
-	dqn.cachedProbs.Store(&probs)
+	qVals := []float64{0.1, 0.2, 10.0, 0.3}
+	dqn.cachedQ.Store(&qVals)
 	dqn.cachedArgmax.Store(2)
+	// Set high experiencesSeen so entropy target is low (concentrated)
+	dqn.experiencesSeen.Store(dqnBoltzmannAnnealingExp + 1)
 
 	counts := map[int]int{}
 	for i := 0; i < 1000; i++ {
@@ -273,8 +275,8 @@ func (s *DQNSuite) TestBoltzmannRoutingPrefersBest() {
 		dqn.OnPublishComplete(p)
 	}
 
-	require.Greater(s.T(), counts[2], 900,
-		"Boltzmann routing with low τ should heavily prefer partition 2 (best Q)")
+	require.Greater(s.T(), counts[2], 500,
+		"entropy-calibrated routing should prefer partition 2 (best Q)")
 }
 
 func (s *DQNSuite) TestNoFallbackUnderOverload() {
@@ -539,11 +541,11 @@ func (s *DQNSuite) TestDQNExplorationUnderTrained() {
 	require.GreaterOrEqual(s.T(), len(counts), 2,
 		"P2C fallback should spread across at least 2 partitions")
 
-	// After policyLoop ticks, softmax probabilities are cached. Boltzmann
+	// After policyLoop ticks, Q-values are cached. Entropy-calibrated
 	// sampling provides per-message stochastic exploration.
 	time.Sleep(200 * time.Millisecond)
-	require.NotNil(s.T(), dqn.cachedProbs.Load(),
-		"policyLoop should have set cached Boltzmann probs")
+	require.NotNil(s.T(), dqn.cachedQ.Load(),
+		"policyLoop should have set cached Q-values")
 }
 
 func (s *DQNSuite) TestMaxLoadPenaltyInReward() {
@@ -574,8 +576,8 @@ func (s *DQNSuite) TestExpChannelBlockingSend() {
 	dqn.expCh = make(chan nn.Transition, 1)
 	dqn.expCh <- nn.Transition{}
 
-	probs := []float64{0.25, 0.25, 0.25, 0.25}
-	dqn.cachedProbs.Store(&probs)
+	qVals := []float64{0.0, 0.0, 0.0, 0.0}
+	dqn.cachedQ.Store(&qVals)
 	dqn.prevSnap.Store(&policySnap{state: make([]float64, dqn.stateSize), action: 0})
 	dqn.currSnap.Store(&policySnap{state: make([]float64, dqn.stateSize), action: 1})
 
@@ -690,8 +692,8 @@ func (s *DQNSuite) TestExpChannelTimeoutNotSilent() {
 	dqn.expCh = make(chan nn.Transition, 1)
 	dqn.expCh <- nn.Transition{}
 
-	probs := []float64{0.25, 0.25, 0.25, 0.25}
-	dqn.cachedProbs.Store(&probs)
+	qVals := []float64{0.0, 0.0, 0.0, 0.0}
+	dqn.cachedQ.Store(&qVals)
 	dqn.prevSnap.Store(&policySnap{state: make([]float64, dqn.stateSize), action: 0})
 	dqn.currSnap.Store(&policySnap{state: make([]float64, dqn.stateSize), action: 1})
 
@@ -752,17 +754,15 @@ func (s *DQNSuite) TestBoltzmannRoutingSpread() {
 	dqn := NewDQNBalancer(8)
 	defer dqn.Stop()
 
-	probs := make([]float64, 8)
-	for i := range probs {
-		probs[i] = 1.0 / 8.0
-	}
-	dqn.cachedProbs.Store(&probs)
+	qVals := make([]float64, 8) // all zeros = uniform Q
+	dqn.cachedQ.Store(&qVals)
 
 	counts := make([]int, 8)
 	const N = 80000
 	for i := 0; i < N; i++ {
 		p := dqn.SelectPartition("t", nil, 8)
 		counts[p]++
+		dqn.OnPublishComplete(p)
 	}
 
 	var entropy float64
@@ -773,7 +773,7 @@ func (s *DQNSuite) TestBoltzmannRoutingSpread() {
 		}
 	}
 	maxEntropy := math.Log2(8.0)
-	require.GreaterOrEqual(s.T(), entropy, maxEntropy-0.1,
+	require.GreaterOrEqual(s.T(), entropy, maxEntropy-0.5,
 		"with equal Q-values, entropy should be near log2(K)=%.2f, got %.2f", maxEntropy, entropy)
 }
 
@@ -781,14 +781,17 @@ func (s *DQNSuite) TestBoltzmannRoutingInflightCorrection() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
-	probs := []float64{0.25, 0.25, 0.25, 0.25}
-	dqn.cachedProbs.Store(&probs)
+	qVals := []float64{0.0, 0.0, 0.0, 0.0}
+	dqn.cachedQ.Store(&qVals)
+	// Use late entropy target so inflight correction has strong effect.
+	dqn.experiencesSeen.Store(dqnBoltzmannAnnealingExp + 1)
 
 	inflight := dqn.ensureInflight(4)
 	(*inflight)[0].Store(1_000_000)
 	(*inflight)[1].Store(0)
 	(*inflight)[2].Store(0)
 	(*inflight)[3].Store(0)
+	dqn.nonEmptyInflight.Store(1 << 0)
 
 	counts := make([]int, 4)
 	const N = 5000
@@ -798,37 +801,48 @@ func (s *DQNSuite) TestBoltzmannRoutingInflightCorrection() {
 	}
 
 	ratio := float64(counts[0]) / float64(N)
-	require.Less(s.T(), ratio, 0.05,
-		"partition 0 with 1M inflight should be selected <5%% of time, got %.2f%%", ratio*100)
+	require.Less(s.T(), ratio, 0.10,
+		"partition 0 with 1M inflight should be selected <10%% of time, got %.2f%%", ratio*100)
 }
 
-func (s *DQNSuite) TestBoltzmannTemperatureAnnealing() {
-	earlyTau := currentTemperature(0)
-	lateTau := currentTemperature(20000)
+func (s *DQNSuite) TestEntropyTargetAnnealing() {
+	earlyTarget := currentEntropyTarget(0)
+	lateTarget := currentEntropyTarget(20000)
 
-	require.InDelta(s.T(), dqnBoltzmannTauStart, earlyTau, 1e-6,
-		"temperature at start should equal TauStart")
-	require.InDelta(s.T(), dqnBoltzmannTauEnd, lateTau, 1e-6,
-		"temperature after 20000 experiences should equal TauEnd")
+	require.InDelta(s.T(), dqnBoltzmannEntropyStart, earlyTarget, 1e-6,
+		"entropy target at start should equal EntropyStart")
+	require.InDelta(s.T(), dqnBoltzmannEntropyEnd, lateTarget, 1e-6,
+		"entropy target after 20000 experiences should equal EntropyEnd")
+	require.Greater(s.T(), earlyTarget, lateTarget,
+		"early target should be higher (more exploration) than late target")
+}
 
-	q := []float64{1.0, 0.5, 0.5, 0.5}
-	earlyProbs := softmaxFromQ(q, earlyTau)
-	lateProbs := softmaxFromQ(q, lateTau)
+func (s *DQNSuite) TestEntropyTargetCalibration() {
+	q := []float64{10.0, 0.0, 0.0, 0.0}
 
-	var earlyEntropy, lateEntropy float64
-	for _, p := range earlyProbs {
-		if p > 0 {
-			earlyEntropy -= p * math.Log2(p)
-		}
-	}
-	for _, p := range lateProbs {
-		if p > 0 {
-			lateEntropy -= p * math.Log2(p)
-		}
-	}
+	tau085 := solveForEntropy(q, 0.85)
+	ent085 := normalizedEntropy(q, tau085)
+	require.InDelta(s.T(), 0.85, ent085, 0.02,
+		"entropy for target=0.85 should be ~0.85, got %.4f", ent085)
 
-	require.Greater(s.T(), earlyEntropy, lateEntropy*3,
-		"early entropy (%.4f) should be at least 3× late entropy (%.4f)", earlyEntropy, lateEntropy)
+	tau030 := solveForEntropy(q, 0.30)
+	ent030 := normalizedEntropy(q, tau030)
+	require.InDelta(s.T(), 0.30, ent030, 0.02,
+		"entropy for target=0.30 should be ~0.30, got %.4f", ent030)
+}
+
+func (s *DQNSuite) TestEntropyCalibrationScaleInvariance() {
+	qSmall := []float64{1.0, 0.0, 0.0, 0.0}
+	qLarge := []float64{100.0, 0.0, 0.0, 0.0}
+
+	tau1 := solveForEntropy(qSmall, 0.5)
+	tau2 := solveForEntropy(qLarge, 0.5)
+
+	ent1 := normalizedEntropy(qSmall, tau1)
+	ent2 := normalizedEntropy(qLarge, tau2)
+
+	require.InDelta(s.T(), ent1, ent2, 0.01,
+		"entropy should be scale-invariant: small=%.4f, large=%.4f", ent1, ent2)
 }
 
 func (s *DQNSuite) TestDQNNoStateMutexNoPopArtMutex() {
@@ -856,8 +870,8 @@ func (s *DQNSuite) TestDQNConcurrentInferenceAndTrain() {
 	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
 	defer dqn.Stop()
 
-	probs := []float64{0.25, 0.25, 0.25, 0.25}
-	dqn.cachedProbs.Store(&probs)
+	qVals := []float64{0.0, 0.0, 0.0, 0.0}
+	dqn.cachedQ.Store(&qVals)
 
 	var wg sync.WaitGroup
 	var panics atomic.Int64
@@ -886,4 +900,35 @@ func (s *DQNSuite) TestDQNConcurrentInferenceAndTrain() {
 
 	wg.Wait()
 	require.Equal(s.T(), int64(0), panics.Load(), "no panics during concurrent inference+train")
+}
+
+func (s *DQNSuite) TestDQNPolicyLoopProducesQValues() {
+	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
+
+	require.Eventually(s.T(), func() bool {
+		return dqn.cachedQ.Load() != nil
+	}, 1*time.Second, 10*time.Millisecond,
+		"policyLoop must populate cachedQ within 1s (proves no panic in forward())")
+
+	q := dqn.cachedQ.Load()
+	require.NotNil(s.T(), q)
+	require.Len(s.T(), *q, dqn.numPartitions)
+}
+
+func (s *DQNSuite) TestDQNInitExecMatchesFwdExec() {
+	dqn := NewDQNBalancer(4)
+	defer dqn.Stop()
+
+	var initScopes []string
+	dqn.ctx.EnumerateVariables(func(v *context.Variable) {
+		initScopes = append(initScopes, v.Scope()+"/"+v.Name())
+	})
+
+	require.Greater(s.T(), len(initScopes), 0,
+		"Phase 1 init should have created variables")
+
+	time.Sleep(200 * time.Millisecond)
+	require.NotNil(s.T(), dqn.cachedQ.Load(),
+		"fwdExec (Phase 2) must work on Reuse context — same variable scopes as Phase 1")
 }

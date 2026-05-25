@@ -30,7 +30,6 @@ func NewRunningNormalizer(size int) *RunningNormalizer {
 	return rn
 }
 
-// Observe updates the running statistics with a new observation.
 // Must be called from the single-writer goroutine only.
 func (rn *RunningNormalizer) Observe(x []float64) {
 	if len(x) != rn.size {
@@ -108,7 +107,6 @@ func (rn *RunningNormalizer) NormalizeBatch(buf []float64, batchSize int) {
 	}
 }
 
-// Reset clears all accumulated statistics.
 // Must be called from the single-writer goroutine only.
 func (rn *RunningNormalizer) Reset() {
 	rn.snap.Store(&normSnapshot{

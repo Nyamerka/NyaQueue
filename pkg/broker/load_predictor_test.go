@@ -63,7 +63,6 @@ func (s *LoadPredictorSuite) TestEmptyPredictions() {
 	require.Empty(s.T(), preds)
 }
 
-// testArPredict is a helper that creates a temporary LoadPredictor to call arPredictInto.
 func testArPredict(vals []float64, horizon int) []float64 {
 	lp := NewLoadPredictor(len(vals)+horizon, horizon, time.Second)
 	return lp.arPredictInto(vals, horizon)

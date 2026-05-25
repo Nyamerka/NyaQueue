@@ -402,7 +402,7 @@ func (s *HTTPServer) handleSetBalancer(w http.ResponseWriter, r *http.Request) {
 		writeHTTPError(w, http.StatusBadRequest, err)
 		return
 	}
-	s.broker.SetBalancer(bal)
+	s.broker.ReplaceBalancerSameAlgorithm(bal)
 	w.WriteHeader(http.StatusNoContent)
 }
 

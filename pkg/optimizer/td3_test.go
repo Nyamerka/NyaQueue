@@ -1,6 +1,7 @@
 package optimizer
 
 import (
+	"math"
 	"sync"
 	"testing"
 
@@ -365,7 +366,7 @@ func (s *TD3Suite) TestOptimizer_EmergencyRollback() {
 	}
 	opt.checkEmergencyRollback(healthy)
 	require.Equal(s.T(), 0, opt.lowDeliveryTicksInARow)
-	require.False(s.T(), opt.rolledBack)
+	require.Equal(s.T(), 0, opt.cooldownTicksLeft)
 
 	bad := &broker.Metrics{
 		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.3, MsgRate: 100},
@@ -373,15 +374,16 @@ func (s *TD3Suite) TestOptimizer_EmergencyRollback() {
 
 	opt.checkEmergencyRollback(bad)
 	require.Equal(s.T(), 1, opt.lowDeliveryTicksInARow)
-	require.False(s.T(), opt.rolledBack, "single bad tick should not rollback")
+	require.Equal(s.T(), 0, opt.cooldownTicksLeft, "single bad tick should not trigger cooldown")
 
 	opt.checkEmergencyRollback(bad)
-	require.Equal(s.T(), 2, opt.lowDeliveryTicksInARow)
-	require.True(s.T(), opt.rolledBack, "two consecutive bad ticks should trigger rollback")
+	require.Equal(s.T(), DefaultEmergencyRollbackCooldown, opt.cooldownTicksLeft,
+		"two consecutive bad ticks should trigger cooldown")
+	require.Equal(s.T(), 0, opt.lowDeliveryTicksInARow, "counter resets after triggering")
 
 	opt.checkEmergencyRollback(bad)
-	require.True(s.T(), opt.rolledBack, "should stay rolled back")
-	require.Equal(s.T(), 2, opt.lowDeliveryTicksInARow, "counter frozen after rollback")
+	require.Equal(s.T(), DefaultEmergencyRollbackCooldown, opt.cooldownTicksLeft,
+		"during cooldown, no further checks should run")
 }
 
 func (s *TD3Suite) TestOptimizer_EmergencyRollback_Recovery() {
@@ -400,7 +402,7 @@ func (s *TD3Suite) TestOptimizer_EmergencyRollback_Recovery() {
 	}
 	opt.checkEmergencyRollback(healthy)
 	require.Equal(s.T(), 0, opt.lowDeliveryTicksInARow, "good tick should reset counter")
-	require.False(s.T(), opt.rolledBack)
+	require.Equal(s.T(), 0, opt.cooldownTicksLeft)
 }
 
 func flattenTensorValue(v interface{}) []float64 {
@@ -416,6 +418,170 @@ func flattenTensorValue(v interface{}) []float64 {
 	default:
 		return nil
 	}
+}
+
+func (s *TD3Suite) TestTD3NoRollbackDuringWarmup() {
+	opt := &Optimizer{
+		warmup:           80,
+		minApplyInterval: DefaultMinApplyInterval,
+	}
+
+	bad := &broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.0, MsgRate: 200},
+	}
+
+	for i := 0; i < 80; i++ {
+		opt.ticks++
+		if opt.ticks > opt.warmup {
+			opt.checkEmergencyRollback(bad)
+		}
+	}
+
+	require.Equal(s.T(), 0, opt.cooldownTicksLeft,
+		"no rollback should trigger during warmup period")
+	require.Equal(s.T(), 0, opt.lowDeliveryTicksInARow,
+		"lowDeliveryTicksInARow should stay 0 during warmup")
+}
+
+func (s *TD3Suite) TestTD3RollbackAfterWarmup() {
+	opt := &Optimizer{
+		warmup:           80,
+		minApplyInterval: DefaultMinApplyInterval,
+	}
+	opt.ticks = 80
+
+	bad := &broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.0, MsgRate: 200},
+	}
+
+	opt.ticks++
+	if opt.ticks > opt.warmup {
+		opt.checkEmergencyRollback(bad)
+	}
+	require.Equal(s.T(), 1, opt.lowDeliveryTicksInARow,
+		"first bad tick after warmup should increment counter")
+	require.Equal(s.T(), 0, opt.cooldownTicksLeft)
+
+	opt.ticks++
+	if opt.ticks > opt.warmup {
+		opt.checkEmergencyRollback(bad)
+	}
+	require.Equal(s.T(), DefaultEmergencyRollbackCooldown, opt.cooldownTicksLeft,
+		"second consecutive bad tick after warmup should trigger rollback")
+}
+
+func (s *TD3Suite) TestEmergencyRollbackIgnoresLowMsgRate() {
+	opt := &Optimizer{
+		minApplyInterval: DefaultMinApplyInterval,
+	}
+	opt.ticks = 100
+	opt.warmup = 0
+
+	lowRate := &broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.0, MsgRate: 50},
+	}
+
+	opt.checkEmergencyRollback(lowRate)
+	opt.checkEmergencyRollback(lowRate)
+	require.Equal(s.T(), 0, opt.cooldownTicksLeft,
+		"rollback should not trigger when MsgRate < DefaultEmergencyMinMsgRate")
+}
+
+func (s *TD3Suite) TestTD3RewardNormalization() {
+	opt := &Optimizer{
+		windowCap:        DefaultOptimizerWindowCap,
+		throughputWindow: make([]float64, 0, DefaultOptimizerWindowCap),
+	}
+
+	for i := 0; i < 100; i++ {
+		tp := 30000 + float64(i)*500
+		m := &broker.Metrics{
+			BusinessMetrics: broker.BusinessMetrics{
+				Throughput:    tp,
+				MsgRate:       tp,
+				DeliveryRatio: 0.99,
+				AvgLatency:    float64(i) * 0.5,
+			},
+			DerivedMetrics: broker.DerivedMetrics{
+				QueueDepth: []int{i * 10, i * 5},
+			},
+		}
+		opt.computeReward(m)
+	}
+
+	require.Greater(s.T(), opt.rewardCount, int64(50))
+
+	sigma := math.Sqrt(opt.rewardM2/float64(opt.rewardCount-1)) + 1e-8
+	require.Greater(s.T(), sigma, 0.001,
+		"reward sigma should be positive after varied observations")
+
+	m := &broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{
+			Throughput:    50000,
+			MsgRate:       50000,
+			DeliveryRatio: 0.99,
+			AvgLatency:    25,
+		},
+		DerivedMetrics: broker.DerivedMetrics{
+			QueueDepth: []int{500, 250},
+		},
+	}
+	normalized := opt.computeReward(m)
+	require.Less(s.T(), math.Abs(normalized), 10.0,
+		"normalized reward should be bounded near zero")
+}
+
+func (s *TD3Suite) TestTD3StateNormalized() {
+	b := setupMinimalBroker(s.T())
+	defer b.Stop()
+
+	params := []TunableParam{{Name: "MaxBatchSize", Min: 1, Max: 1000, Weight: 1.0}}
+	opt := NewOptimizer(b, params, DefaultOptimizerConfig())
+
+	for i := 0; i < 100; i++ {
+		state := opt.buildState(&broker.Metrics{
+			BusinessMetrics: broker.BusinessMetrics{
+				Throughput:    float64(50000 + i*100),
+				AvgLatency:    float64(i),
+				MsgRate:       float64(50000 + i*50),
+				ConsumeRate:   float64(50000 + i*40),
+				DeliveryRatio: 0.99,
+			},
+			DerivedMetrics: broker.DerivedMetrics{
+				PartitionLoads: []float64{0.3, 0.4, 0.5, 0.6},
+				QueueDepth:     []int{100, 200, 300, 400},
+			},
+		})
+		opt.normalizer.Observe(state)
+	}
+
+	raw := opt.buildState(&broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{
+			Throughput:    55000,
+			AvgLatency:    50,
+			MsgRate:       52000,
+			ConsumeRate:   52000,
+			DeliveryRatio: 0.99,
+		},
+		DerivedMetrics: broker.DerivedMetrics{
+			PartitionLoads: []float64{0.3, 0.4, 0.5, 0.6},
+			QueueDepth:     []int{100, 200, 300, 400},
+		},
+	})
+	normalized := opt.normalizer.Normalize(raw)
+	for i, v := range normalized {
+		require.Less(s.T(), math.Abs(v), 5.0,
+			"normalized state[%d]=%.4f should be within [-5, 5]", i, v)
+	}
+}
+
+func setupMinimalBroker(t *testing.T) *broker.Broker {
+	t.Helper()
+	dir := t.TempDir()
+	store, err := broker.NewOffsetStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+	return broker.New(broker.DefaultConfig(), dir, noopBal{}, store)
 }
 
 func (s *TD3Suite) TestGaussianExplorationNoise() {

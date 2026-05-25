@@ -4,7 +4,6 @@ import (
 	"github.com/samber/oops"
 )
 
-// BalancerKind enumerates the supported balancer algorithms for the factory.
 type BalancerKind int
 
 const (
@@ -28,7 +27,6 @@ func RegisterBalancerFactory(kind BalancerKind, f BalancerFactory) {
 	factories[kind] = f
 }
 
-// BalancerFromKind creates a new Balancer of the given kind for k partitions.
 func BalancerFromKind(kind BalancerKind, k int) (Balancer, error) {
 	f, ok := factories[kind]
 	if !ok {

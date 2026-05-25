@@ -11,7 +11,6 @@ import (
 	"github.com/samber/oops"
 )
 
-// ExportCSV writes results as a flat CSV table.
 func ExportCSV(results []ExperimentResult, dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return oops.Wrapf(err, "mkdir %q", dir)
@@ -95,7 +94,6 @@ func prioGroupStats(stats []PriorityStats, from, to int) (p50us, p99us float64) 
 	return sumP50 / float64(count), sumP99 / float64(count)
 }
 
-// ExportJSON writes results as a structured JSON file.
 func ExportJSON(results []ExperimentResult, dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return oops.Wrapf(err, "mkdir %q", dir)

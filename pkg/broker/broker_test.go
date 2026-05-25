@@ -340,7 +340,6 @@ func (s *BrokerSuite) TestIOPoolConcurrentBatchWrites() {
 	}
 }
 
-// fifoScheduler is a minimal in-package scheduler for testing.
 type fifoScheduler struct{}
 
 func (fifoScheduler) Next(p *Partition, offset uint64) (*Message, uint64, error) {

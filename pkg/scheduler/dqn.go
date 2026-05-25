@@ -6,7 +6,6 @@ import (
 	"math"
 	"math/rand/v2"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,8 +60,6 @@ type DQNScheduler struct {
 	expCh  chan nn.Transition
 	eg     *errgroup.Group
 	cancel stdctx.CancelFunc
-
-	weightsMu sync.RWMutex
 
 	lastPI atomic.Pointer[broker.PriorityIndex]
 
@@ -284,9 +281,7 @@ func (d *DQNScheduler) forward(state []float64) []float64 {
 	epsAI := sampleNoiseSched(d.noiseAdvIn)
 	epsAO := sampleNoiseSched(d.noiseAdvOut)
 
-	d.weightsMu.RLock()
 	result := d.fwdExec.MustExec1(state, epsVI, epsVO, epsAI, epsAO)
-	d.weightsMu.RUnlock()
 
 	return tensorToFloat64Sched(result)
 }
@@ -564,8 +559,6 @@ func (d *DQNScheduler) trainStep() float64 {
 	statesT := tensors.FromFlatDataAndDimensions(statesBuf, bs, d.stateSize)
 	nextStatesT := tensors.FromFlatDataAndDimensions(nextStatesBuf, bs, d.stateSize)
 
-	d.weightsMu.Lock()
-
 	bestActionsT := d.bestActionsExec.MustExec1(nextStatesT)
 	nextQT := d.targetQForActionsExec.MustExec1(nextStatesT, bestActionsT)
 	actionsT := tensors.FromFlatDataAndDimensions(actions, bs)
@@ -588,8 +581,6 @@ func (d *DQNScheduler) trainStep() float64 {
 	lossT := d.trainExec.MustExec1(statesT, targetsT, actionsT, isWeightsT)
 
 	d.targetNet.Step()
-
-	d.weightsMu.Unlock()
 
 	lossVals := tensorToFloat64Sched(lossT)
 	if len(lossVals) > 0 {

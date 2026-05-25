@@ -321,7 +321,7 @@ func (s *Server) SetBalancer(_ context.Context, req *pb.SetBalancerRequest) (*pb
 	if err != nil {
 		return nil, oops.Wrapf(err, "set-balancer algorithm=%s k=%d", req.Algorithm, req.NumPartitions)
 	}
-	s.broker.SetBalancer(bal)
+	s.broker.ReplaceBalancerSameAlgorithm(bal)
 	return &pb.SetBalancerResponse{}, nil
 }
 

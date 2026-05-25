@@ -299,7 +299,6 @@ func (p *BufferedProducer) Send(ctx context.Context, key, value []byte, priority
 	return nil
 }
 
-// Flush sends any buffered messages immediately.
 func (p *BufferedProducer) Flush(ctx context.Context) error {
 	p.mu.Lock()
 	if len(p.buf) == 0 {

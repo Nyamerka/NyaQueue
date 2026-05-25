@@ -154,7 +154,6 @@ func OverloadK16() Scenario {
 
 type Scenarios []Scenario
 
-// AllScenarios returns the full set of benchmark scenarios.
 func AllScenarios() Scenarios {
 	return Scenarios{
 		Uniform(),
@@ -177,14 +176,12 @@ func (ss Scenarios) FindByName(name string) (bool, Scenario) {
 	return false, Scenario{}
 }
 
-// GenerateMessage creates a random message payload of the given size.
 func GenerateMessage(size int) []byte {
 	buf := make([]byte, size)
 	_, _ = rand.Read(buf)
 	return buf
 }
 
-// SamplePriority returns a priority level sampled from the scenario's distribution.
 func (s *Scenario) SamplePriority() uint8 {
 	n, _ := rand.Int(rand.Reader, big.NewInt(1_000_000))
 	r := float64(n.Int64()) / 1_000_000.0
@@ -198,7 +195,6 @@ func (s *Scenario) SamplePriority() uint8 {
 	return 0
 }
 
-// SamplePrioritySeeded uses the provided RNG (seeded per-producer) for deterministic priority sampling.
 func (s *Scenario) SamplePrioritySeeded(rng *mrand.Rand) uint8 {
 	r := rng.Float64()
 	cumulative := 0.0

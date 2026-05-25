@@ -49,7 +49,6 @@ func NewTargetNetwork(mainCtx *context.Context, opts ...TargetNetworkOption) *Ta
 	return tn
 }
 
-// TargetCtx returns the target context for building target network exec-s.
 func (tn *TargetNetwork) TargetCtx() *context.Context {
 	return tn.targetCtx
 }
@@ -62,7 +61,6 @@ func (tn *TargetNetwork) Step() {
 	}
 }
 
-// HardSync copies all trainable variables from main to target network.
 func (tn *TargetNetwork) HardSync() {
 	tn.mu.Lock()
 	defer tn.mu.Unlock()

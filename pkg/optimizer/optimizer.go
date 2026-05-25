@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	"github.com/Nyamerka/NyaQueue/pkg/nn"
 	"github.com/puzpuzpuz/xsync/v3"
 	"golang.org/x/sync/errgroup"
 )
@@ -65,7 +66,13 @@ type Optimizer struct {
 	minApplyInterval       time.Duration
 	startConfig            broker.Config
 	lowDeliveryTicksInARow int
-	rolledBack             bool
+	cooldownTicksLeft      int
+
+	rewardMean  float64
+	rewardM2    float64
+	rewardCount int64
+
+	normalizer *nn.RunningNormalizer
 }
 
 func NewOptimizer(b *broker.Broker, params []TunableParam, optCfg OptimizerConfig, pilot ...PilotData) *Optimizer {
@@ -77,7 +84,7 @@ func NewOptimizer(b *broker.Broker, params []TunableParam, optCfg OptimizerConfi
 	}
 
 	active := ActiveParams(calibrated)
-	stateSize := len(active) + 3 // params + throughput + latency + success_rate
+	stateSize := len(active) + 10 // params + throughput + latency + dr + max_load + load_stddev + max_depth + avg_depth + msg_rate + consume_rate + rate_ratio
 	actionSize := len(active)
 
 	currentVals := make([]float64, len(active))
@@ -128,6 +135,7 @@ func NewOptimizer(b *broker.Broker, params []TunableParam, optCfg OptimizerConfi
 		throughputWindow: make([]float64, 0, DefaultOptimizerWindowCap),
 		minApplyInterval: time.Duration(DefaultMinApplyInterval),
 		startConfig:      startConfig,
+		normalizer:       nn.NewRunningNormalizer(stateSize),
 	}
 }
 
@@ -176,12 +184,20 @@ func (o *Optimizer) step() {
 	o.ticks++
 	metrics := o.broker.Metrics()
 
-	o.checkEmergencyRollback(&metrics)
+	if o.ticks > o.warmup {
+		o.checkEmergencyRollback(&metrics)
+	}
 
-	state := o.buildState(&metrics)
+	if o.cooldownTicksLeft > 0 {
+		o.cooldownTicksLeft--
+	}
+
+	rawState := o.buildState(&metrics)
+	o.normalizer.Observe(rawState)
+	state := o.normalizer.Normalize(rawState)
 	action := o.td3.Act(state)
 
-	if o.ticks > o.warmup && !o.rolledBack {
+	if o.ticks > o.warmup && o.cooldownTicksLeft == 0 {
 		safe := true
 		if metrics.MsgRate > 0 {
 			ratio := metrics.ConsumeRate / metrics.MsgRate
@@ -196,7 +212,7 @@ func (o *Optimizer) step() {
 
 	if o.prevMetrics != nil {
 		reward := o.computeReward(&metrics)
-		prevState := o.buildState(o.prevMetrics)
+		prevState := o.normalizer.Normalize(o.buildState(o.prevMetrics))
 
 		o.td3.Store(prevState, action, reward, state, false)
 		o.td3.Train(o.batchSize)
@@ -206,8 +222,9 @@ func (o *Optimizer) step() {
 	o.prevMetrics = &metrics
 
 	if o.ticks%DefaultLogEveryTicks == 0 {
-		log.Printf("[optimizer] tick=%d throughput=%.1f latency=%.2fms params_snapshot=%v",
-			o.ticks, metrics.Throughput, metrics.AvgLatency, o.currentVals[:min(3, len(o.currentVals))])
+		log.Printf("[optimizer] tick=%d throughput=%.1f latency=%.2fms cooldown=%d params_snapshot=%v",
+			o.ticks, metrics.Throughput, metrics.AvgLatency, o.cooldownTicksLeft,
+			o.currentVals[:min(3, len(o.currentVals))])
 	}
 }
 
@@ -307,35 +324,84 @@ func (o *Optimizer) computeReward(m *broker.Metrics) float64 {
 		reward = DefaultRewardClamp
 	}
 
+	o.rewardCount++
+	delta := reward - o.rewardMean
+	o.rewardMean += delta / float64(o.rewardCount)
+	o.rewardM2 += delta * (reward - o.rewardMean)
+	if o.rewardCount > 1 {
+		sigma := math.Sqrt(o.rewardM2/float64(o.rewardCount-1)) + 1e-8
+		reward = (reward - o.rewardMean) / sigma
+	}
+
 	return reward
 }
 
 func (o *Optimizer) checkEmergencyRollback(m *broker.Metrics) {
-	if o.rolledBack {
+	if o.cooldownTicksLeft > 0 {
 		return
 	}
-	if m.DeliveryRatio < DefaultEmergencyRollbackDR && m.MsgRate > 0 {
+	if m.DeliveryRatio < DefaultEmergencyRollbackDR && m.MsgRate >= DefaultEmergencyMinMsgRate {
 		o.lowDeliveryTicksInARow++
 	} else {
 		o.lowDeliveryTicksInARow = 0
 	}
 	if o.lowDeliveryTicksInARow >= DefaultEmergencyRollbackN {
-		log.Printf("[optimizer] emergency rollback: DeliveryRatio %.2f < %.2f for %d ticks",
-			m.DeliveryRatio, DefaultEmergencyRollbackDR, o.lowDeliveryTicksInARow)
+		log.Printf("[optimizer] emergency rollback: DeliveryRatio %.2f < %.2f for %d ticks → cooldown %d",
+			m.DeliveryRatio, DefaultEmergencyRollbackDR, o.lowDeliveryTicksInARow,
+			DefaultEmergencyRollbackCooldown)
 		if o.broker != nil {
 			if err := o.broker.ApplyConfig(o.startConfig); err != nil {
 				log.Printf("[optimizer] emergency rollback ApplyConfig failed: %v", err)
 			}
 		}
-		o.rolledBack = true
+		o.cooldownTicksLeft = DefaultEmergencyRollbackCooldown
+		o.lowDeliveryTicksInARow = 0
+		if o.td3 != nil {
+			o.td3.BoostNoise(3.0)
+		}
 	}
 }
 
 func (o *Optimizer) buildState(m *broker.Metrics) []float64 {
-	state := make([]float64, 0, len(o.currentVals)+3)
+	state := make([]float64, 0, len(o.currentVals)+10)
 	state = append(state, o.currentVals...)
 	state = append(state, m.Throughput/optimizerThroughputScale)
 	state = append(state, m.AvgLatency/optimizerLatencyScale)
 	state = append(state, m.DeliveryRatio)
+
+	var maxLoad, sumLoad, sumLoadSq float64
+	for _, l := range m.PartitionLoads {
+		sumLoad += l
+		sumLoadSq += l * l
+		if l > maxLoad {
+			maxLoad = l
+		}
+	}
+	nLoads := float64(max(len(m.PartitionLoads), 1))
+	meanLoad := sumLoad / nLoads
+	loadStddev := math.Sqrt(sumLoadSq/nLoads - meanLoad*meanLoad)
+	state = append(state, maxLoad)
+	state = append(state, loadStddev)
+
+	var maxDepth, sumDepth float64
+	for _, d := range m.QueueDepth {
+		df := float64(d)
+		sumDepth += df
+		if df > maxDepth {
+			maxDepth = df
+		}
+	}
+	nDepth := float64(max(len(m.QueueDepth), 1))
+	state = append(state, maxDepth/optimizerDepthScale)
+	state = append(state, (sumDepth/nDepth)/optimizerDepthScale)
+
+	state = append(state, m.MsgRate/optimizerThroughputScale)
+	state = append(state, m.ConsumeRate/optimizerThroughputScale)
+	if m.ConsumeRate > 0 {
+		state = append(state, m.MsgRate/m.ConsumeRate)
+	} else {
+		state = append(state, 0)
+	}
+
 	return state
 }

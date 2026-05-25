@@ -4,6 +4,7 @@ import (
 	"log"
 	"math"
 	"math/rand/v2"
+	"strings"
 
 	"github.com/Nyamerka/NyaQueue/pkg/nn"
 	"github.com/gomlx/gomlx/backends"
@@ -332,7 +333,9 @@ func (d *TD3) Train(batchSize int) {
 
 	// Delayed policy update: actor + target soft-update every td3PolicyDelay critic steps
 	if d.criticStep%td3PolicyDelay == 0 {
+		d.freezeCritic()
 		d.actorTrainExec.MustExec(statesT)
+		d.unfreezeCritic()
 		d.softUpdate()
 	}
 }
@@ -377,8 +380,33 @@ func (d *TD3) ensureBuffers(bs int) {
 	}
 }
 
+// freezeCritic marks all critic variables as non-trainable so that
+// the actor's UpdateGraph does not shift critic weights.
+func (d *TD3) freezeCritic() {
+	d.mainCtx.EnumerateVariables(func(v *context.Variable) {
+		scope := v.Scope()
+		if strings.Contains(scope, "critic1") || strings.Contains(scope, "critic2") {
+			v.Trainable = false
+		}
+	})
+}
+
+func (d *TD3) unfreezeCritic() {
+	d.mainCtx.EnumerateVariables(func(v *context.Variable) {
+		scope := v.Scope()
+		if strings.Contains(scope, "critic1") || strings.Contains(scope, "critic2") {
+			v.Trainable = true
+		}
+	})
+}
+
 func (d *TD3) ResetNoise() {
 	d.sigma = td3ExploreNoiseInit
+}
+
+func (d *TD3) BoostNoise(factor float64) {
+	d.ResetNoise()
+	d.sigma *= factor
 }
 
 func (d *TD3) SetNoiseDecay(decay, floor float64) {

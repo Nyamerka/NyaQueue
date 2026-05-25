@@ -25,12 +25,10 @@ func WithBalancerFactory(fn func() broker.Balancer) Option {
 	}
 }
 
-// WithDefaultBalancer uses PowerOfTwoChoices with default settings.
 func WithDefaultBalancer() Option {
 	return WithP2CBalancer()
 }
 
-// WithP2CBalancer uses PowerOfTwoChoices with the given options.
 func WithP2CBalancer(opts ...balancer.P2COption) Option {
 	return func(a *BrokerApp) {
 		a.balancerFactory = func() broker.Balancer {
@@ -39,7 +37,6 @@ func WithP2CBalancer(opts ...balancer.P2COption) Option {
 	}
 }
 
-// WithRoundRobinBalancer uses RoundRobin with the given options.
 func WithRoundRobinBalancer(opts ...balancer.RROption) Option {
 	return func(a *BrokerApp) {
 		a.balancerFactory = func() broker.Balancer {
@@ -48,21 +45,18 @@ func WithRoundRobinBalancer(opts ...balancer.RROption) Option {
 	}
 }
 
-// WithScheduler attaches a scheduler for a specific topic.
 func WithScheduler(topic string, s broker.Scheduler) Option {
 	return func(a *BrokerApp) {
 		a.schedulers[topic] = s
 	}
 }
 
-// WithGRPC enables gRPC transport on the given address.
 func WithGRPC(addr string) Option {
 	return func(a *BrokerApp) {
 		a.grpcAddr = addr
 	}
 }
 
-// WithHTTP enables HTTP REST transport on the given address.
 func WithHTTP(addr string) Option {
 	return func(a *BrokerApp) {
 		a.httpAddr = addr

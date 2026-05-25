@@ -84,7 +84,6 @@ type HarnessConfig struct {
 	HTTPBrokerAddr string // HTTP address; falls back to BrokerAddr when empty
 }
 
-// NewHarness creates and starts the target system.
 func NewHarness(ctx context.Context, cfg HarnessConfig) (*Harness, error) {
 	h := &Harness{
 		mode:            cfg.Mode,
@@ -196,7 +195,6 @@ func (h *Harness) IsExternal() bool {
 	return h.external || h.mode == ModeKafka
 }
 
-// SwitchBalancer sets the balancer on the broker for the current run.
 // For in-process and local gRPC/HTTP modes, directly sets via the broker API.
 // For external modes, calls the admin RPC to switch the balancer.
 func (h *Harness) SwitchBalancer(alg AlgorithmConfig, k int) error {

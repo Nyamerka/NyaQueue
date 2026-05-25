@@ -30,6 +30,10 @@ type KafkaHarness struct {
 	consumers      *xsync.MapOf[readerKey, *kgo.Client]
 	mu             sync.Mutex
 	loggedFirstErr atomic.Bool
+
+	inflightProduces atomic.Int64
+	successCount     atomic.Int64
+	failureCount     atomic.Int64
 }
 
 type readerKey struct {
@@ -59,15 +63,17 @@ func (h *KafkaHarness) ensureProducer() (*kgo.Client, error) {
 		kgo.ProducerBatchCompression(kgo.Lz4Compression()),
 		kgo.RetryBackoffFn(func(attempt int) time.Duration {
 			d := time.Duration(attempt) * 250 * time.Millisecond
-			if d > 5*time.Second {
-				d = 5 * time.Second
+			if d > 2*time.Second {
+				d = 2 * time.Second
 			}
 			return d
 		}),
-		kgo.RequestRetries(20),
-		kgo.RetryTimeout(30*time.Second),
+		kgo.RequestRetries(3),
+		kgo.RetryTimeout(2*time.Second),
+		kgo.RecordDeliveryTimeout(5*time.Second),
 	)
 	if err != nil {
+		log.Printf("[kafka-producer] ensureProducer failed: %+v (brokers=%v)", err, h.brokers)
 		return nil, oops.Wrapf(err, "create franz-go producer")
 	}
 	h.producer = cl
@@ -147,37 +153,65 @@ func (h *KafkaHarness) DeleteTopic(ctx context.Context, name string) error {
 	return nil
 }
 
-const produceMaxAttempts = 3
-
 func (h *KafkaHarness) Produce(ctx context.Context, topic string, key, value []byte) error {
+	cl, err := h.ensureProducer()
+	if err != nil {
+		return oops.Wrapf(err, "produce topic=%q ensure producer", topic)
+	}
 	rec := &kgo.Record{
 		Topic: topic,
 		Key:   key,
 		Value: value,
 	}
-	var lastErr error
-	for attempt := 0; attempt < produceMaxAttempts; attempt++ {
-		cl, err := h.ensureProducer()
+
+	errCh := make(chan error, 1)
+	cl.Produce(ctx, rec, func(_ *kgo.Record, err error) {
 		if err != nil {
-			lastErr = err
-			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
-			continue
-		}
-		result := cl.ProduceSync(ctx, rec)
-		if err := result.FirstErr(); err != nil {
 			if !h.loggedFirstErr.Swap(true) {
-				log.Printf("[kafka-produce] first error: %v", err)
+				log.Printf("[kafka-produce] first error: %+v", err)
 			}
-			lastErr = err
-			h.resetProducer()
-			continue
+			h.failureCount.Add(1)
+		} else {
+			h.successCount.Add(1)
 		}
-		return nil
+		errCh <- err
+	})
+	return <-errCh
+}
+
+func (h *KafkaHarness) ProduceAsync(ctx context.Context, topic string, key, value []byte) {
+	cl, err := h.ensureProducer()
+	if err != nil {
+		if !h.loggedFirstErr.Swap(true) {
+			log.Printf("[kafka-produce-async] ensure producer: %+v", err)
+		}
+		h.failureCount.Add(1)
+		return
 	}
-	return oops.Wrapf(lastErr, "produce topic=%q exhausted %d attempts", topic, produceMaxAttempts)
+	rec := &kgo.Record{
+		Topic: topic,
+		Key:   key,
+		Value: value,
+	}
+	h.inflightProduces.Add(1)
+	cl.Produce(ctx, rec, func(_ *kgo.Record, err error) {
+		h.inflightProduces.Add(-1)
+		if err != nil {
+			if !h.loggedFirstErr.Swap(true) {
+				log.Printf("[kafka-produce-async] first error: %+v", err)
+			}
+			h.failureCount.Add(1)
+		} else {
+			h.successCount.Add(1)
+		}
+	})
 }
 
 func (h *KafkaHarness) ProduceBatch(ctx context.Context, topic string, msgs []kgo.Record) error {
+	cl, err := h.ensureProducer()
+	if err != nil {
+		return oops.Wrapf(err, "produce-batch topic=%q ensure producer", topic)
+	}
 	recs := make([]*kgo.Record, len(msgs))
 	for i := range msgs {
 		recs[i] = &kgo.Record{
@@ -186,27 +220,31 @@ func (h *KafkaHarness) ProduceBatch(ctx context.Context, topic string, msgs []kg
 			Value: msgs[i].Value,
 		}
 	}
-	var lastErr error
-	for attempt := 0; attempt < produceMaxAttempts; attempt++ {
-		cl, err := h.ensureProducer()
-		if err != nil {
-			lastErr = err
-			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
-			continue
+	results := cl.ProduceSync(ctx, recs...)
+	if err := results.FirstErr(); err != nil {
+		if !h.loggedFirstErr.Swap(true) {
+			log.Printf("[kafka-produce-batch] first error: %+v", err)
 		}
-		results := cl.ProduceSync(ctx, recs...)
-		if err := results.FirstErr(); err != nil {
-			if !h.loggedFirstErr.Swap(true) {
-				log.Printf("[kafka-produce-batch] first error: %v", err)
-			}
-			lastErr = err
-			h.resetProducer()
-			continue
-		}
+		return oops.Wrapf(err, "produce-batch topic=%q", topic)
+	}
+	h.successCount.Add(int64(len(msgs)))
+	return nil
+}
+
+// Flush blocks until all in-flight produce requests complete.
+func (h *KafkaHarness) Flush(ctx context.Context) error {
+	h.mu.Lock()
+	cl := h.producer
+	h.mu.Unlock()
+	if cl == nil {
 		return nil
 	}
-	return oops.Wrapf(lastErr, "produce-batch topic=%q exhausted %d attempts", topic, produceMaxAttempts)
+	return cl.Flush(ctx)
 }
+
+func (h *KafkaHarness) SuccessCount() int64  { return h.successCount.Load() }
+func (h *KafkaHarness) FailureCount() int64  { return h.failureCount.Load() }
+func (h *KafkaHarness) InflightCount() int64 { return h.inflightProduces.Load() }
 
 func (h *KafkaHarness) Consume(ctx context.Context, topic, group string, partition int, maxBytes int) ([]Message, error) {
 	cl := h.consumerFor(topic, group, partition)
