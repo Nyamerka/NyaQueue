@@ -15,15 +15,14 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
 	"github.com/gomlx/gomlx/pkg/ml/train/optimizers"
 
-	_ "github.com/gomlx/gomlx/backends/simplego"
-	"github.com/puzpuzpuz/xsync/v3"
+	_ "github.com/gomlx/gomlx/backends/default"
 )
 
 const (
 	td3HiddenSize        = 128
 	td3Tau               = 0.005
 	td3DefaultGamma      = 0.99
-	td3DefaultBatchSize  = 32
+	td3DefaultBatchSize  = 64
 	td3ReplayBufSize     = 50_000
 	td3PolicyDelay       = 2
 	td3TargetNoiseStddev = 0.2
@@ -40,8 +39,6 @@ const (
 //   - Gaussian exploration noise instead of OU (no temporal correlation needed
 //     for broker parameter tuning).
 type TD3 struct {
-	mu xsync.RBMutex
-
 	stateSize  int
 	actionSize int
 	hiddenSize int
@@ -117,6 +114,7 @@ func NewTD3(stateSize, actionSize int, lr float64, batchSize int) *TD3 {
 
 	d.targetCtx = d.cloneContext(d.mainCtx)
 	d.initTargetExecs()
+	d.warmupStaticShapes()
 
 	return d
 }
@@ -222,6 +220,22 @@ func (d *TD3) initTargetExecs() {
 	})
 }
 
+func (d *TD3) warmupStaticShapes() {
+	dummyState := make([]float64, d.stateSize)
+	d.actorFwdExec.MustExec(dummyState)
+
+	bs := d.batchSize
+	dummyBatchStates := make([]float64, bs*d.stateSize)
+	dummyBatchActions := make([]float64, bs*d.actionSize)
+
+	statesT := tensors.FromFlatDataAndDimensions(dummyBatchStates, bs, d.stateSize)
+	actionsT := tensors.FromFlatDataAndDimensions(dummyBatchActions, bs, d.actionSize)
+
+	d.targetActorFwdExec.MustExec1(statesT)
+	d.targetCritic1Exec.MustExec1(statesT, actionsT)
+	d.targetCritic2Exec.MustExec1(statesT, actionsT)
+}
+
 func (d *TD3) actorGraphBatched(ctx *context.Context, states *Node) *Node {
 	actorCtx := ctx.In("actor")
 	h := layers.Dense(actorCtx.In("l1"), states, true, d.hiddenSize)
@@ -247,9 +261,6 @@ func (d *TD3) criticGraphBatched(ctx *context.Context, states, actions *Node) *N
 }
 
 func (d *TD3) Act(state []float64) []float64 {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
 	result := d.actorFwdExec.MustExec1(state)
 	action := tensorToFloat64(result)
 
@@ -271,9 +282,6 @@ func (d *TD3) Store(state, action []float64, reward float64, nextState []float64
 }
 
 func (d *TD3) Train(batchSize int) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
 	if d.replayBuffer.Len() < batchSize {
 		return
 	}

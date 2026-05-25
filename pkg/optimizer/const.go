@@ -2,7 +2,7 @@ package optimizer
 
 const (
 	DefaultOptimizerWindowCap   = 10
-	DefaultOptimizerWarmupTicks = 80
+	DefaultOptimizerWarmupTicks = 300
 	DefaultQueueSoftThreshold   = 1000.0
 	DefaultQueuePenaltyWeight   = 1.5
 	DefaultLatencyPenaltyWeight = 0.3
@@ -15,8 +15,8 @@ const (
 	DefaultErrorPenaltyWeight        = 2.0
 	DefaultErrorPenaltyThresh        = 0.01
 	DefaultEmergencyRollbackDR       = 0.5
-	DefaultEmergencyRollbackN        = 2
-	DefaultEmergencyRollbackCooldown = 20
+	DefaultEmergencyRollbackN        = 5
+	DefaultEmergencyRollbackCooldown = 60
 	DefaultEmergencyMinMsgRate       = 100.0
 )
 

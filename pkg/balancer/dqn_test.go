@@ -216,7 +216,7 @@ func (s *DQNSuite) TestDroppedExperienceCounter() {
 	require.Equal(s.T(), int64(0), dqn.DroppedExperience())
 }
 
-func (s *DQNSuite) TestDQNBalancer_SmoothedCV() {
+func (s *DQNSuite) TestDQNBalancer_RewardStateless() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
@@ -225,18 +225,18 @@ func (s *DQNSuite) TestDQNBalancer_SmoothedCV() {
 		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.9, 0.1, 0.9}},
 	})
 
-	rBalanced := dqn.computeReward(broker.Metrics{
+	rAfterImbalance := dqn.computeReward(broker.Metrics{
 		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
 		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
 	})
-	rFreshBalanced := NewDQNBalancer(4)
-	defer rFreshBalanced.Stop()
-	rPure := rFreshBalanced.computeReward(broker.Metrics{
+	freshDQN := NewDQNBalancer(4)
+	defer freshDQN.Stop()
+	rFresh := freshDQN.computeReward(broker.Metrics{
 		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
 		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
 	})
-	require.Less(s.T(), rBalanced, rPure,
-		"EWMA should retain past imbalance, yielding lower reward than a fresh balancer with same balanced loads")
+	require.InDelta(s.T(), rFresh, rAfterImbalance, 1e-9,
+		"reward should be stateless — same inputs produce same output regardless of history")
 }
 
 func (s *DQNSuite) TestDQNBalancer_InflightInState() {
@@ -548,24 +548,20 @@ func (s *DQNSuite) TestDQNExplorationUnderTrained() {
 		"policyLoop should have set cached Q-values")
 }
 
-func (s *DQNSuite) TestMaxLoadPenaltyInReward() {
+func (s *DQNSuite) TestImbalancedLoadsPenaliseReward() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
-	noOverload := dqn.computeReward(broker.Metrics{
+	balanced := dqn.computeReward(broker.Metrics{
 		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
 		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 0.5}},
 	})
-	withOverload := dqn.computeReward(broker.Metrics{
+	imbalanced := dqn.computeReward(broker.Metrics{
 		BusinessMetrics: broker.BusinessMetrics{Throughput: 50000},
-		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.5, 0.5, 0.5, 2.0}},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.1, 0.1, 2.0}},
 	})
-	require.Greater(s.T(), noOverload, withOverload,
-		"max-load > 1.0 should penalise reward")
-
-	penalty := noOverload - withOverload
-	require.GreaterOrEqual(s.T(), penalty, dqnMaxLoadWeight*(2.0-1.0)*(2.0-1.0)*0.5,
-		"penalty should be at least proportional to dqnMaxLoadWeight * (maxLoad - 1.0)^2")
+	require.Greater(s.T(), balanced, imbalanced,
+		"imbalanced loads (high CV) should produce lower reward")
 }
 
 func (s *DQNSuite) TestExpChannelBlockingSend() {

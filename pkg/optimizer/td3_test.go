@@ -77,9 +77,7 @@ func (s *TD3Suite) TestActorForwardOutputInRange() {
 	d := NewTD3(5, 3, 0.001, 32)
 	state := []float64{0.1, 0.2, 0.3, 0.4, 0.5}
 
-	d.mu.Lock()
 	result := d.actorFwdExec.MustExec1(state)
-	d.mu.Unlock()
 
 	out := tensorToFloat64(result)
 	require.Len(s.T(), out, 3)
@@ -97,10 +95,8 @@ func (s *TD3Suite) TestTwinCriticsBothReturnCorrectShape() {
 	actions := tensors.FromFlatDataAndDimensions(
 		[]float64{0.1, 0.2, 0.3, 0.3, 0.2, 0.1}, 2, 3)
 
-	d.mu.Lock()
 	q1 := tensorToFloat64(d.targetCritic1Exec.MustExec1(states, actions))
 	q2 := tensorToFloat64(d.targetCritic2Exec.MustExec1(states, actions))
-	d.mu.Unlock()
 
 	require.Len(s.T(), q1, 2, "critic1 should return one Q per sample")
 	require.Len(s.T(), q2, 2, "critic2 should return one Q per sample")
@@ -127,10 +123,8 @@ func (s *TD3Suite) TestTwinCriticsAreDifferent() {
 	actions := tensors.FromFlatDataAndDimensions(
 		[]float64{0.1, 0.2, 0.3}, 1, 3)
 
-	d.mu.Lock()
 	q1 := tensorToFloat64(d.targetCritic1Exec.MustExec1(states, actions))
 	q2 := tensorToFloat64(d.targetCritic2Exec.MustExec1(states, actions))
-	d.mu.Unlock()
 
 	require.NotEqual(s.T(), q1[0], q2[0],
 		"twin critics should have different Q-values after independent training")
@@ -245,18 +239,13 @@ func (s *TD3Suite) TestBatchedTrainMultipleSteps() {
 func (s *TD3Suite) TestSoftUpdateDtypeRobust() {
 	d := NewTD3(5, 3, 0.001, 32)
 	require.NotPanics(s.T(), func() {
-		d.mu.Lock()
 		d.softUpdate()
-		d.mu.Unlock()
 	})
 	require.Greater(s.T(), len(d.varPairs), 0, "varPairs should be populated")
 }
 
 func (s *TD3Suite) TestSoftUpdateBlendedWeights() {
 	d := NewTD3(5, 3, 0.001, 32)
-
-	d.mu.Lock()
-	defer d.mu.Unlock()
 
 	require.Greater(s.T(), len(d.varPairs), 0, "should have variable pairs")
 
@@ -372,13 +361,16 @@ func (s *TD3Suite) TestOptimizer_EmergencyRollback() {
 		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.3, MsgRate: 100},
 	}
 
-	opt.checkEmergencyRollback(bad)
-	require.Equal(s.T(), 1, opt.lowDeliveryTicksInARow)
-	require.Equal(s.T(), 0, opt.cooldownTicksLeft, "single bad tick should not trigger cooldown")
+	// Need DefaultEmergencyRollbackN (5) consecutive bad ticks to trigger rollback.
+	for i := 1; i < DefaultEmergencyRollbackN; i++ {
+		opt.checkEmergencyRollback(bad)
+		require.Equal(s.T(), i, opt.lowDeliveryTicksInARow)
+		require.Equal(s.T(), 0, opt.cooldownTicksLeft, "should not trigger before N bad ticks")
+	}
 
 	opt.checkEmergencyRollback(bad)
 	require.Equal(s.T(), DefaultEmergencyRollbackCooldown, opt.cooldownTicksLeft,
-		"two consecutive bad ticks should trigger cooldown")
+		"N consecutive bad ticks should trigger cooldown")
 	require.Equal(s.T(), 0, opt.lowDeliveryTicksInARow, "counter resets after triggering")
 
 	opt.checkEmergencyRollback(bad)
@@ -422,7 +414,7 @@ func flattenTensorValue(v interface{}) []float64 {
 
 func (s *TD3Suite) TestTD3NoRollbackDuringWarmup() {
 	opt := &Optimizer{
-		warmup:           80,
+		warmup:           DefaultOptimizerWarmupTicks,
 		minApplyInterval: DefaultMinApplyInterval,
 	}
 
@@ -430,7 +422,7 @@ func (s *TD3Suite) TestTD3NoRollbackDuringWarmup() {
 		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.0, MsgRate: 200},
 	}
 
-	for i := 0; i < 80; i++ {
+	for i := 0; i < DefaultOptimizerWarmupTicks; i++ {
 		opt.ticks++
 		if opt.ticks > opt.warmup {
 			opt.checkEmergencyRollback(bad)
@@ -445,29 +437,31 @@ func (s *TD3Suite) TestTD3NoRollbackDuringWarmup() {
 
 func (s *TD3Suite) TestTD3RollbackAfterWarmup() {
 	opt := &Optimizer{
-		warmup:           80,
+		warmup:           DefaultOptimizerWarmupTicks,
 		minApplyInterval: DefaultMinApplyInterval,
 	}
-	opt.ticks = 80
+	opt.ticks = DefaultOptimizerWarmupTicks
 
 	bad := &broker.Metrics{
 		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.0, MsgRate: 200},
 	}
 
-	opt.ticks++
-	if opt.ticks > opt.warmup {
-		opt.checkEmergencyRollback(bad)
+	// Need DefaultEmergencyRollbackN consecutive bad ticks after warmup to trigger.
+	for i := 1; i < DefaultEmergencyRollbackN; i++ {
+		opt.ticks++
+		if opt.ticks > opt.warmup {
+			opt.checkEmergencyRollback(bad)
+		}
+		require.Equal(s.T(), i, opt.lowDeliveryTicksInARow)
+		require.Equal(s.T(), 0, opt.cooldownTicksLeft)
 	}
-	require.Equal(s.T(), 1, opt.lowDeliveryTicksInARow,
-		"first bad tick after warmup should increment counter")
-	require.Equal(s.T(), 0, opt.cooldownTicksLeft)
 
 	opt.ticks++
 	if opt.ticks > opt.warmup {
 		opt.checkEmergencyRollback(bad)
 	}
 	require.Equal(s.T(), DefaultEmergencyRollbackCooldown, opt.cooldownTicksLeft,
-		"second consecutive bad tick after warmup should trigger rollback")
+		"N consecutive bad ticks after warmup should trigger rollback")
 }
 
 func (s *TD3Suite) TestEmergencyRollbackIgnoresLowMsgRate() {
@@ -488,10 +482,7 @@ func (s *TD3Suite) TestEmergencyRollbackIgnoresLowMsgRate() {
 }
 
 func (s *TD3Suite) TestTD3RewardNormalization() {
-	opt := &Optimizer{
-		windowCap:        DefaultOptimizerWindowCap,
-		throughputWindow: make([]float64, 0, DefaultOptimizerWindowCap),
-	}
+	opt := &Optimizer{}
 
 	for i := 0; i < 100; i++ {
 		tp := 30000 + float64(i)*500

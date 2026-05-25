@@ -10,10 +10,10 @@ const (
 	DefaultDQNGamma          = 0.9
 	DefaultDQNLearningRate   = 0.001
 	DefaultDQNReplayBufSize  = 50_000
-	DefaultDQNBatchSize      = 32
+	DefaultDQNBatchSize      = 64
 	DefaultDQNMinReplay      = 64
 	DefaultDQNTrainEvery     = 1
-	DefaultDQNUpdatesPerStep = 4
+	DefaultDQNUpdatesPerStep = 1
 	DefaultDQNExpChannelSize = 16384
 	DefaultDQNWeightDecay    = 1e-4
 )
@@ -44,18 +44,6 @@ const (
 	dqnDepthFeatureScale = 1_000.0
 )
 
-const (
-	dqnDepthSoftCap = 100_000.0
-	dqnDepthWeight  = 0.3
-)
-
-const dqnMaxLoadWeight = 1.0
-
-const (
-	dqnActionLoadW     = 0.5
-	dqnActionInflightW = 0.3
-)
-
 // Entropy-calibrated Boltzmann routing parameters.
 //
 // Instead of annealing a fixed τ (which breaks when Q-value scale drifts),
@@ -76,7 +64,7 @@ const (
 	dqnLowRateThreshold       = 5_000.0
 )
 
-const dqnNumQuantiles = 51
-const dqnThompsonK = 4
+const dqnNumQuantiles = 21
+const dqnThompsonK = 2
 
 const PSARebalanceLoadFactor = 2.0

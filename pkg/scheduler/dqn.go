@@ -23,7 +23,7 @@ import (
 	"github.com/samber/oops"
 	"golang.org/x/sync/errgroup"
 
-	_ "github.com/gomlx/gomlx/backends/simplego"
+	_ "github.com/gomlx/gomlx/backends/default"
 )
 
 type schedPolicySnap struct {

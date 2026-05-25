@@ -57,6 +57,7 @@ func (h *KafkaHarness) ensureProducer() (*kgo.Client, error) {
 	}
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(h.brokers...),
+		kgo.DisableIdempotentWrite(),
 		kgo.RequiredAcks(kgo.LeaderAck()),
 		kgo.ProducerLinger(5*time.Millisecond),
 		kgo.ProducerBatchMaxBytes(1<<20),

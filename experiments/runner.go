@@ -17,6 +17,7 @@ import (
 
 	"github.com/Nyamerka/NyaQueue/benchmarks"
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	"github.com/Nyamerka/NyaQueue/pkg/optimizer"
 	"github.com/Nyamerka/NyaQueue/pkg/transport"
 	"github.com/alitto/pond/v2"
 	"github.com/cenkalti/backoff/v4"
@@ -141,7 +142,6 @@ const (
 	dqnWarmupMaxDuration  = 5 * time.Minute
 	dqnWarmupTargetExp    = 2000
 	dqnWarmupPollInterval = 100 * time.Millisecond
-	dqnWarmupRateCap      = 20_000
 )
 
 func (r *Runner) runWarmup(ctx context.Context) {
@@ -195,6 +195,17 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	}
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return ExperimentResult{}, oops.Wrapf(err, "create data dir")
+	}
+
+	// For short experiments, force EvalOnly to prevent TD3 from applying
+	// destructive actions before the model has enough data to converge.
+	if dur <= 60*time.Second && alg.UseOptimizer && alg.OptimizerOpts != nil {
+		origOpts := alg.OptimizerOpts
+		alg.OptimizerOpts = func() ([]optimizer.TunableParam, optimizer.OptimizerConfig) {
+			params, cfg := origOpts()
+			cfg.EvalOnly = true
+			return params, cfg
+		}
 	}
 
 	// Determine partition count before creating the harness so that
@@ -287,7 +298,6 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 			if warmupSc.RatePerSec == 0 {
 				warmupSc.RatePerSec = 5000 * min(warmupSc.Producers, topicCfg.NumPartitions)
 			}
-			warmupSc.RatePerSec = min(warmupSc.RatePerSec, dqnWarmupRateCap)
 			_ = runScenario(ctx, h, warmupSc, alg.Name, "nyaqueue", mode, topicCfg.NumPartitions, miniWarmupDuration, topic)
 			goto postWarmup
 		}
@@ -299,7 +309,6 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		if warmupSc.RatePerSec == 0 {
 			warmupSc.RatePerSec = 5000 * min(warmupSc.Producers, topicCfg.NumPartitions)
 		}
-		warmupSc.RatePerSec = min(warmupSc.RatePerSec, dqnWarmupRateCap)
 
 		log.Printf("  [dqn-warmup] running warmup for %s/%s (k=%d, rate=%d, target=%d experiences, max=%v) ...",
 			sc.Name, alg.Name, topicCfg.NumPartitions, warmupSc.RatePerSec, dqnWarmupTargetExp, maxWarmup)
@@ -338,6 +347,9 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		<-warmupDone
 	}
 postWarmup:
+	if brk := h.Broker(); brk != nil {
+		brk.ResetBalancerForScenario()
+	}
 
 	log.Printf("  running %s / %s / %s for %v (seed=%d) ...", sc.Name, alg.Name, mode, dur, sc.Seed)
 	result := runScenario(ctx, h, sc, alg.Name, "nyaqueue", mode, topicCfg.NumPartitions, dur, topic)

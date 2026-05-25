@@ -25,7 +25,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"gonum.org/v1/gonum/stat"
 
-	_ "github.com/gomlx/gomlx/backends/simplego"
+	_ "github.com/gomlx/gomlx/backends/default"
 )
 
 var float64BufPool = sync.Pool{New: func() any {
@@ -48,6 +48,7 @@ type stateSnapshot struct {
 }
 
 type nStepBuffer struct {
+	mu    sync.Mutex
 	queue []nn.Transition
 	n     int
 	gamma float64
@@ -62,6 +63,8 @@ func newNStepBuffer(n int, gamma float64) *nStepBuffer {
 }
 
 func (b *nStepBuffer) Push(t nn.Transition) (nn.Transition, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.queue = append(b.queue, t)
 	if len(b.queue) < b.n {
 		return nn.Transition{}, false
@@ -85,7 +88,9 @@ func (b *nStepBuffer) Push(t nn.Transition) (nn.Transition, bool) {
 }
 
 func (b *nStepBuffer) Reset() {
+	b.mu.Lock()
 	b.queue = b.queue[:0]
+	b.mu.Unlock()
 }
 
 // DQNBalancer selects partitions via a DQN with softmax (Boltzmann) routing.
@@ -104,11 +109,14 @@ type DQNBalancer struct {
 	backend               backends.Backend
 	ctx                   *context.Context
 	targetNet             *nn.TargetNetwork
-	fwdExec               *context.Exec
+	inferExec             atomic.Pointer[context.Exec]
+	inferCtx              *context.Context
+	inferVarMap           map[string]*context.Variable
 	bestActionsExec       *context.Exec
 	targetQForActionsExec *context.Exec
 	batchQExec            *context.Exec
 	trainExec             *context.Exec
+	trainExecMu           sync.Mutex
 	stateSize             int
 
 	replayBuffer *nn.PrioritizedReplayBuffer
@@ -120,7 +128,6 @@ type DQNBalancer struct {
 	cancel stdctx.CancelFunc
 
 	fallbackP2C *PowerOfTwoChoices
-	execMu      sync.Mutex
 
 	atomicState atomic.Pointer[stateSnapshot]
 
@@ -158,7 +165,6 @@ type DQNBalancer struct {
 
 	policyStateBuf []float64
 	prevLoads      atomic.Pointer[[]float64]
-	smoothedCV     atomic.Uint64 // float64 stored as bits
 
 	// Noise dimensions for NoisyLinearExternal inference.
 	// Computed once during initGoMLX from hiddenSize/numPartitions.
@@ -166,6 +172,12 @@ type DQNBalancer struct {
 	noiseValueOut int // 1               (output features of value NoisyLinear)
 	noiseAdvIn    int // hiddenSize / 4  (input features of advantage NoisyLinear)
 	noiseAdvOut   int // numPartitions   (output features of advantage NoisyLinear)
+
+	noiseBufs struct {
+		valueIn, valueOut, advIn, advOut []float64
+	}
+
+	qResultBuf []float64
 }
 
 type DQNOption func(*DQNBalancer)
@@ -211,8 +223,9 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 	}
 
 	d.stateSize = numPartitions*5 + 4
-	d.hiddenSize = max(DefaultDQNHiddenSize, d.stateSize*2)
+	d.hiddenSize = max(DefaultDQNHiddenSize, d.stateSize+64)
 	d.policyStateBuf = make([]float64, d.stateSize)
+	d.qResultBuf = make([]float64, numPartitions)
 	d.betaSchedule = nn.NewBetaSchedule(0.4, 1.0, DefaultDQNReplayBufSize/d.batchSize)
 	d.normalizer = nn.NewRunningNormalizer(d.stateSize)
 	d.nStep = newNStepBuffer(5, d.gamma)
@@ -259,6 +272,11 @@ func (d *DQNBalancer) initGoMLX() {
 	d.noiseAdvIn = d.hiddenSize / 4
 	d.noiseAdvOut = d.numPartitions * dqnNumQuantiles
 
+	d.noiseBufs.valueIn = make([]float64, d.noiseValueIn)
+	d.noiseBufs.valueOut = make([]float64, d.noiseValueOut)
+	d.noiseBufs.advIn = make([]float64, d.noiseAdvIn)
+	d.noiseBufs.advOut = make([]float64, d.noiseAdvOut)
+
 	// Phase 1: create ALL variables using the same ExternalNoise graph that
 	// Phase 2 will Reuse(). This guarantees identical variable scopes and
 	// avoids the "variable failed to initialize" panic caused by NoisyLinear's
@@ -277,13 +295,19 @@ func (d *DQNBalancer) initGoMLX() {
 	)
 	initExec.Finalize()
 
-	// Phase 2: inference exec uses NoisyLinearExternal — noise is sampled in
-	// Go (rand/v2.NormFloat64) and passed as graph inputs. This preserves
-	// NoisyNet exploration while avoiding the shared #rngState concurrency bug.
-	d.fwdExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
-		func(ctx *context.Context, state, epsValueIn, epsValueOut, epsAdvIn, epsAdvOut *Node) *Node {
-			return d.qNetworkGraphExternalNoise(ctx, state, epsValueIn, epsValueOut, epsAdvIn, epsAdvOut)
+	// Phase 2: inference exec uses a CLONED context so policyLoop can run
+	// lock-free while trainLoop modifies d.ctx. Weights are periodically
+	// synced from d.ctx → inferCtx every 25 training steps via memcpy.
+	d.inferCtx = d.cloneContext(d.ctx)
+	d.inferVarMap = make(map[string]*context.Variable)
+	d.inferCtx.EnumerateVariables(func(v *context.Variable) {
+		d.inferVarMap[v.ScopeAndName()] = v
+	})
+	fwdExec := context.MustNewExec(d.backend, d.inferCtx.Reuse(),
+		func(ctx *context.Context, state, evi, evo, eai, eao *Node) *Node {
+			return d.qNetworkGraphExternalNoise(ctx, state, evi, evo, eai, eao)
 		})
+	d.inferExec.Store(fwdExec)
 
 	d.targetNet = nn.NewTargetNetwork(d.ctx)
 
@@ -309,6 +333,8 @@ func (d *DQNBalancer) initGoMLX() {
 			return ReduceSum(Mul(qAll, oneHot), -1)
 		})
 
+	d.warmupStaticShapes()
+
 	huber := losses.MakeHuberLoss(d.huberDelta)
 	d.trainExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
 		func(ctx *context.Context, states, targetQ, actionIdx, isWeights *Node) *Node {
@@ -321,6 +347,58 @@ func (d *DQNBalancer) initGoMLX() {
 			opt.UpdateGraph(ctx, g, loss)
 			return loss
 		})
+}
+
+func (d *DQNBalancer) warmupStaticShapes() {
+	dummyState := make([]float64, d.stateSize)
+	dummyNoise := make([]float64, max(d.noiseValueIn, d.noiseValueOut, d.noiseAdvIn, d.noiseAdvOut))
+	exec := d.inferExec.Load()
+	exec.MustExec1(dummyState,
+		dummyNoise[:d.noiseValueIn], dummyNoise[:d.noiseValueOut],
+		dummyNoise[:d.noiseAdvIn], dummyNoise[:d.noiseAdvOut])
+
+	dummyBatch := make([]float64, d.batchSize*d.stateSize)
+	batchT := tensors.FromFlatDataAndDimensions(dummyBatch, d.batchSize, d.stateSize)
+	d.bestActionsExec.MustExec1(batchT)
+}
+
+// syncInferWeights copies trained weights from d.ctx into d.inferCtx in-place.
+// No Exec recompilation needed — shapes are identical, only tensor data changes.
+func (d *DQNBalancer) syncInferWeights() {
+	d.ctx.EnumerateVariables(func(mainVar *context.Variable) {
+		if !mainVar.Trainable {
+			return
+		}
+		inferVar, ok := d.inferVarMap[mainVar.ScopeAndName()]
+		if !ok {
+			return
+		}
+		mainVal := mainVar.MustValue()
+		inferVal := inferVar.MustValue()
+		if mainVal == nil || inferVal == nil {
+			return
+		}
+		mainVal.ConstFlatData(func(mainFlat any) {
+			inferVal.MutableFlatData(func(inferFlat any) {
+				switch m := mainFlat.(type) {
+				case []float32:
+					copy(inferFlat.([]float32), m)
+				case []float64:
+					copy(inferFlat.([]float64), m)
+				}
+			})
+		})
+	})
+}
+
+func (d *DQNBalancer) cloneContext(src *context.Context) *context.Context {
+	dst := context.New()
+	src.EnumerateVariables(func(v *context.Variable) {
+		srcT := v.MustValue()
+		cloned, _ := srcT.LocalClone()
+		dst.InAbsPath(v.Scope()).VariableWithValue(v.Name(), cloned.Value())
+	})
+	return dst
 }
 
 // qNetworkBatch returns Q-values of shape [batch, numPartitions].
@@ -398,17 +476,25 @@ func (d *DQNBalancer) forward(state []float64) []float64 {
 	copy(norm, state)
 	d.normalizer.NormalizeInPlace(norm)
 
-	epsVI := sampleNoise(d.noiseValueIn)
-	epsVO := sampleNoise(d.noiseValueOut)
-	epsAI := sampleNoise(d.noiseAdvIn)
-	epsAO := sampleNoise(d.noiseAdvOut)
+	for i := range d.noiseBufs.valueIn {
+		d.noiseBufs.valueIn[i] = rand.NormFloat64()
+	}
+	for i := range d.noiseBufs.valueOut {
+		d.noiseBufs.valueOut[i] = rand.NormFloat64()
+	}
+	for i := range d.noiseBufs.advIn {
+		d.noiseBufs.advIn[i] = rand.NormFloat64()
+	}
+	for i := range d.noiseBufs.advOut {
+		d.noiseBufs.advOut[i] = rand.NormFloat64()
+	}
 
-	d.execMu.Lock()
-	result := d.fwdExec.MustExec1(norm, epsVI, epsVO, epsAI, epsAO)
-	d.execMu.Unlock()
+	exec := d.inferExec.Load()
+	result := exec.MustExec1(norm, d.noiseBufs.valueIn, d.noiseBufs.valueOut, d.noiseBufs.advIn, d.noiseBufs.advOut)
 
 	float64BufPool.Put(buf)
-	return tensorToFloat64Slice(result)
+	tensorToFloat64Into(result, d.qResultBuf)
+	return d.qResultBuf
 }
 
 func (d *DQNBalancer) shouldRecordExperience() bool {
@@ -723,14 +809,12 @@ func (d *DQNBalancer) buildStateInto(dst []float64) {
 
 // computeReward produces a direct shaped reward signal for the DQN.
 //
-// Base reward combines two orthogonal signals:
+// Two orthogonal signals:
 //
-//	balance  = -CV(loads) ∈ [-1, 0]
+//	balance  = -CV(loads) ∈ [-1, 0]   (coefficient of variation)
 //	utility  = log1p(throughput/scale) / log1p(max/scale) ∈ [0, 1]
 //
-// No EWMA-diff: raw ∈ [-1.3, 1.0] — already scaled for learning.
-const dqnCVEWMAAlpha = 0.3
-
+// Combined via pressure-weighted interpolation. No EWMA, no per-action credit.
 func (d *DQNBalancer) computeReward(m broker.Metrics) float64 {
 	if len(m.PartitionLoads) == 0 {
 		return 0
@@ -738,59 +822,21 @@ func (d *DQNBalancer) computeReward(m broker.Metrics) float64 {
 
 	meanLoad := stat.Mean(m.PartitionLoads, nil)
 
-	var balancePenalty float64
+	var balance float64
 	if meanLoad > 0 {
-		instantCV := stat.StdDev(m.PartitionLoads, nil) / meanLoad
-		prevBits := d.smoothedCV.Load()
-		prevCV := math.Float64frombits(prevBits)
-		smoothed := dqnCVEWMAAlpha*instantCV + (1-dqnCVEWMAAlpha)*prevCV
-		d.smoothedCV.Store(math.Float64bits(smoothed))
-		balancePenalty = -math.Min(smoothed, 1.0)
+		cv := stat.StdDev(m.PartitionLoads, nil) / meanLoad
+		balance = -math.Min(cv, 1.0)
 	}
 
-	var utilityReward float64
+	var utility float64
 	if m.Throughput > 0 {
-		utilityReward = math.Log1p(m.Throughput/dqnThroughputScale) / dqnThroughputLogNorm
+		utility = math.Log1p(m.Throughput/dqnThroughputScale) / dqnThroughputLogNorm
 	}
 
 	pressure := math.Min(meanLoad/dqnOverloadThreshold, 1.0)
 	balanceW := dqnBaseBalanceWeight + (dqnMaxBalanceWeight-dqnBaseBalanceWeight)*pressure
 
-	raw := balanceW*balancePenalty + (1-balanceW)*utilityReward
-
-	maxLoad := 0.0
-	for _, l := range m.PartitionLoads {
-		if l > maxLoad {
-			maxLoad = l
-		}
-	}
-	if maxLoad > 1.0 {
-		excess := maxLoad - 1.0
-		raw -= dqnMaxLoadWeight * excess * excess
-	}
-
-	// Per-action credit assignment: tie reward to the chosen partition.
-	if prev := d.prevSnap.Load(); prev != nil {
-		a := prev.action
-		if a >= 0 && a < len(m.PartitionLoads) {
-			prevLoads := d.prevLoads.Load()
-			if prevLoads != nil && a < len(*prevLoads) {
-				delta := m.PartitionLoads[a] - (*prevLoads)[a]
-				raw -= dqnActionLoadW * math.Max(0, delta)
-			}
-			if inf := d.inflight.Load(); inf != nil && a < len(*inf) {
-				var totalInf float64
-				for i := 0; i < len(*inf) && i < len(m.PartitionLoads); i++ {
-					totalInf += float64((*inf)[i].Load())
-				}
-				if totalInf > 0 {
-					raw -= dqnActionInflightW * float64((*inf)[a].Load()) / totalInf
-				}
-			}
-		}
-	}
-
-	return raw
+	return balanceW*balance + (1-balanceW)*utility
 }
 
 // ResetForNewScenario resets accumulated statistics for a clean training signal.
@@ -798,9 +844,11 @@ func (d *DQNBalancer) computeReward(m broker.Metrics) float64 {
 func (d *DQNBalancer) ResetForNewScenario() {
 	d.normalizer.Reset()
 	d.nStep.Reset()
+	d.trainExecMu.Lock()
 	d.popArt.mean = 0
 	d.popArt.m2 = 0
 	d.popArt.count = 0
+	d.trainExecMu.Unlock()
 }
 
 func (d *DQNBalancer) trainStep() float64 {
@@ -854,12 +902,12 @@ func (d *DQNBalancer) trainStep() float64 {
 	statesT := tensors.FromFlatDataAndDimensions(statesBuf, bs, d.stateSize)
 	nextStatesT := tensors.FromFlatDataAndDimensions(nextStatesBuf, bs, d.stateSize)
 
-	d.execMu.Lock()
+	d.trainExecMu.Lock()
 	bestActionsT := d.bestActionsExec.MustExec1(nextStatesT)
 	nextQT := d.targetQForActionsExec.MustExec1(nextStatesT, bestActionsT)
 	actionsT := tensors.FromFlatDataAndDimensions(actions, bs)
 	currentQT := d.batchQExec.MustExec1(statesT, actionsT)
-	d.execMu.Unlock()
+	d.trainExecMu.Unlock()
 
 	maxNextQ := tensorToFloat64Slice(nextQT)
 	currentQ := tensorToFloat64Slice(currentQT)
@@ -895,24 +943,22 @@ func (d *DQNBalancer) trainStep() float64 {
 	targetsT := tensors.FromFlatDataAndDimensions(targets, bs)
 	isWeightsT := tensors.FromFlatDataAndDimensions(isWeights, bs)
 
-	d.execMu.Lock()
+	d.trainExecMu.Lock()
 	lossT := d.trainExec.MustExec1(statesT, targetsT, actionsT, isWeightsT)
 	d.targetNet.Step()
-	d.execMu.Unlock()
+	d.trainExecMu.Unlock()
+
+	// Sync inference weights every 25 training steps so policyLoop
+	// observes updated weights without any locking on the hot path.
+	if d.trainingSteps.Load()%25 == 0 {
+		d.syncInferWeights()
+	}
 
 	lossVals := tensorToFloat64Slice(lossT)
 	if len(lossVals) > 0 {
 		return lossVals[0]
 	}
 	return 0
-}
-
-func sampleNoise(n int) []float64 {
-	eps := make([]float64, n)
-	for i := range eps {
-		eps[i] = rand.NormFloat64()
-	}
-	return eps
 }
 
 func padOrTrunc(s []float64, n int) []float64 {
@@ -935,6 +981,26 @@ func argmax(s []float64) int {
 		}
 	}
 	return best
+}
+
+func tensorToFloat64Into(t *tensors.Tensor, dst []float64) {
+	val := t.Value()
+	switch v := val.(type) {
+	case []float64:
+		copy(dst, v)
+	case []float32:
+		for i := range min(len(v), len(dst)) {
+			dst[i] = float64(v[i])
+		}
+	case float64:
+		if len(dst) > 0 {
+			dst[0] = v
+		}
+	case float32:
+		if len(dst) > 0 {
+			dst[0] = float64(v)
+		}
+	}
 }
 
 func tensorToFloat64Slice(t *tensors.Tensor) []float64 {

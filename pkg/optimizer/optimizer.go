@@ -20,24 +20,29 @@ type PilotData struct {
 }
 
 type OptimizerConfig struct {
-	Interval     time.Duration
-	BatchSize    int
-	WarmupTicks  int
-	LearningRate float64
-	Hysteresis   float64
-	NoiseDecay   float64 // per-step multiplicative decay for Gaussian sigma (default 0.999)
-	NoiseFloor   float64 // minimum sigma value (default 0.05)
+	Interval        time.Duration
+	CollectInterval time.Duration // fast tick for state collection (default 50ms)
+	ApplyEvery      int           // apply action every N collect ticks (default 5)
+	BatchSize       int
+	WarmupTicks     int
+	LearningRate    float64
+	Hysteresis      float64
+	NoiseDecay      float64 // per-step multiplicative decay for Gaussian sigma (default 0.999)
+	NoiseFloor      float64 // minimum sigma value (default 0.05)
+	EvalOnly        bool    // collect data but never apply actions (for short experiments)
 }
 
 func DefaultOptimizerConfig() OptimizerConfig {
 	return OptimizerConfig{
-		Interval:     250 * time.Millisecond,
-		BatchSize:    32,
-		WarmupTicks:  DefaultOptimizerWarmupTicks,
-		LearningRate: 0.0003,
-		Hysteresis:   0.10,
-		NoiseDecay:   0.999,
-		NoiseFloor:   0.05,
+		Interval:        250 * time.Millisecond,
+		CollectInterval: 50 * time.Millisecond,
+		ApplyEvery:      5,
+		BatchSize:       32,
+		WarmupTicks:     DefaultOptimizerWarmupTicks,
+		LearningRate:    0.0003,
+		Hysteresis:      0.10,
+		NoiseDecay:      0.999,
+		NoiseFloor:      0.05,
 	}
 }
 
@@ -45,22 +50,21 @@ func DefaultOptimizerConfig() OptimizerConfig {
 type Optimizer struct {
 	mu xsync.RBMutex
 
-	td3        *TD3
-	params     []TunableParam
-	broker     *broker.Broker
-	interval   time.Duration
-	batchSize  int
-	warmup     int
-	ticks      int
-	hysteresis float64
+	td3             *TD3
+	params          []TunableParam
+	broker          *broker.Broker
+	collectInterval time.Duration
+	applyEvery      int
+	batchSize       int
+	warmup          int
+	ticks           int
+	hysteresis      float64
+	evalOnly        bool
 
 	currentVals []float64
 	prevMetrics *broker.Metrics
 	eg          *errgroup.Group
 	cancel      context.CancelFunc
-
-	throughputWindow []float64
-	windowCap        int
 
 	lastApplyTime          time.Time
 	minApplyInterval       time.Duration
@@ -92,8 +96,15 @@ func NewOptimizer(b *broker.Broker, params []TunableParam, optCfg OptimizerConfi
 		currentVals[i] = 0.5
 	}
 
-	if optCfg.Interval == 0 {
-		optCfg.Interval = 250 * time.Millisecond
+	if optCfg.CollectInterval == 0 {
+		if optCfg.Interval > 0 {
+			optCfg.CollectInterval = optCfg.Interval
+		} else {
+			optCfg.CollectInterval = 50 * time.Millisecond
+		}
+	}
+	if optCfg.ApplyEvery == 0 {
+		optCfg.ApplyEvery = 5
 	}
 	if optCfg.BatchSize == 0 {
 		optCfg.BatchSize = 32
@@ -126,13 +137,13 @@ func NewOptimizer(b *broker.Broker, params []TunableParam, optCfg OptimizerConfi
 		td3:              td3,
 		params:           active,
 		broker:           b,
-		interval:         optCfg.Interval,
+		collectInterval:  optCfg.CollectInterval,
+		applyEvery:       optCfg.ApplyEvery,
 		batchSize:        optCfg.BatchSize,
 		warmup:           optCfg.WarmupTicks,
 		hysteresis:       optCfg.Hysteresis,
+		evalOnly:         optCfg.EvalOnly,
 		currentVals:      currentVals,
-		windowCap:        DefaultOptimizerWindowCap,
-		throughputWindow: make([]float64, 0, DefaultOptimizerWindowCap),
 		minApplyInterval: time.Duration(DefaultMinApplyInterval),
 		startConfig:      startConfig,
 		normalizer:       nn.NewRunningNormalizer(stateSize),
@@ -164,20 +175,23 @@ func (o *Optimizer) Stop() {
 }
 
 func (o *Optimizer) loop(ctx context.Context) {
-	ticker := time.NewTicker(o.interval)
+	ticker := time.NewTicker(o.collectInterval)
 	defer ticker.Stop()
 
+	collectN := 0
 	for {
 		select {
 		case <-ticker.C:
-			o.step()
+			collectN++
+			shouldApply := collectN%o.applyEvery == 0
+			o.step(shouldApply)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (o *Optimizer) step() {
+func (o *Optimizer) step(shouldApply bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -197,7 +211,7 @@ func (o *Optimizer) step() {
 	state := o.normalizer.Normalize(rawState)
 	action := o.td3.Act(state)
 
-	if o.ticks > o.warmup && o.cooldownTicksLeft == 0 {
+	if shouldApply && o.ticks > o.warmup && o.cooldownTicksLeft == 0 && !o.evalOnly {
 		safe := true
 		if metrics.MsgRate > 0 {
 			ratio := metrics.ConsumeRate / metrics.MsgRate
@@ -234,18 +248,15 @@ func (o *Optimizer) applyAction(action []float64) {
 		return
 	}
 
+	const actionFloor, actionCeil = 0.1, 0.9
+
 	changed := false
 	for i, a := range action {
 		if i >= len(o.params) {
 			break
 		}
 		newNorm := (a + 1.0) / 2.0
-		if newNorm < 0 {
-			newNorm = 0
-		}
-		if newNorm > 1 {
-			newNorm = 1
-		}
+		newNorm = max(actionFloor, min(actionCeil, newNorm))
 
 		if math.Abs(newNorm-o.currentVals[i]) < o.hysteresis {
 			continue
@@ -269,29 +280,18 @@ func (o *Optimizer) applyAction(action []float64) {
 	}
 }
 
+const (
+	optimizerRewardThroughputScale = 1000.0
+	optimizerRewardLogNorm         = 5.7038 // log1p(300) ≈ 5.7038
+)
+
 func (o *Optimizer) computeReward(m *broker.Metrics) float64 {
 	delivered := m.ConsumeRate
 	if delivered == 0 {
 		delivered = m.Throughput
 	}
 
-	o.throughputWindow = append(o.throughputWindow, delivered)
-	if len(o.throughputWindow) > o.windowCap {
-		o.throughputWindow = o.throughputWindow[1:]
-	}
-
-	baseline := 0.0
-	for _, t := range o.throughputWindow {
-		baseline += t
-	}
-	if len(o.throughputWindow) > 0 {
-		baseline /= float64(len(o.throughputWindow))
-	}
-
-	var throughputReward float64
-	if baseline > 1 {
-		throughputReward = (delivered - baseline) / baseline
-	}
+	throughputReward := math.Log1p(delivered/optimizerRewardThroughputScale) / optimizerRewardLogNorm
 
 	latencyPenalty := 0.0
 	if m.AvgLatency > 0 {
@@ -357,7 +357,7 @@ func (o *Optimizer) checkEmergencyRollback(m *broker.Metrics) {
 		o.cooldownTicksLeft = DefaultEmergencyRollbackCooldown
 		o.lowDeliveryTicksInARow = 0
 		if o.td3 != nil {
-			o.td3.BoostNoise(3.0)
+			o.td3.ResetNoise()
 		}
 	}
 }

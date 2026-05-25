@@ -9,9 +9,11 @@ services:
       - "9090:9090"
       - "8080:8080"
     environment:
-      GOGC: "50"
+      GOGC: "200"
       GOMEMLIMIT: "3500MiB"
       GOMAXPROCS: "3"
+      GOMLX_BACKEND: "xla:cpu"
+      OMP_NUM_THREADS: "1"
     volumes:
       - nyaqueue-data:/data
     cpus: "3.0"
@@ -129,8 +131,10 @@ services:
       dockerfile: deploy/Dockerfile
       target: experiment
     environment:
-      GOGC: "50"
+      GOGC: "200"
       GOMEMLIMIT: "1800MiB"
+      GOMLX_BACKEND: "xla:cpu"
+      OMP_NUM_THREADS: "1"
     command:
       - "--experiment.mode=inprocess,grpc,http,kafka"
       - "--experiment.scenarios=all"
