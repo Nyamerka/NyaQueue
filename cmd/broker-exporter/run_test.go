@@ -34,6 +34,7 @@ func (s *ExporterSuite) SetupTest() {
 	require.NoError(s.T(), err)
 
 	s.broker = broker.New(broker.DefaultConfig(), s.dir, balancer.NewRoundRobin(), offsetStore)
+	s.broker.SetBackpressure(broker.NewBackpressureController(2.0)) // disable for test — no consumer drains the queue
 	s.broker.Start()
 
 	s.server = transport.NewServer(s.broker)

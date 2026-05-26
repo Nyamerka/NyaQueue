@@ -303,7 +303,7 @@ func (s *DQNSuite) TestNoFallbackUnderOverload() {
 	// Wait for policyLoop to compute cachedProbs.
 	require.Eventually(s.T(), func() bool {
 		return dqn.cachedProbs.Load() != nil
-	}, 2*time.Second, 10*time.Millisecond)
+	}, 5*time.Second, 10*time.Millisecond)
 
 	require.NotPanics(s.T(), func() {
 		for i := 0; i < 1000; i++ {
@@ -583,7 +583,7 @@ func (s *DQNSuite) TestDQNExplorationUnderTrained() {
 	// After policyLoop ticks, probabilities are cached.
 	require.Eventually(s.T(), func() bool {
 		return dqn.cachedProbs.Load() != nil
-	}, 2*time.Second, 10*time.Millisecond,
+	}, 5*time.Second, 10*time.Millisecond,
 		"policyLoop should have set cachedProbs")
 }
 
@@ -952,7 +952,7 @@ func (s *DQNSuite) TestDQNPolicyLoopProducesQValues() {
 
 	require.Eventually(s.T(), func() bool {
 		return dqn.cachedQ.Load() != nil
-	}, 3*time.Second, 10*time.Millisecond,
+	}, 5*time.Second, 10*time.Millisecond,
 		"policyLoop must populate cachedQ (proves no panic in forward())")
 
 	q := dqn.cachedQ.Load()

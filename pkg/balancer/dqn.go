@@ -135,9 +135,10 @@ type DQNBalancer struct {
 	betaSchedule *nn.BetaSchedule
 	normalizer   *nn.RunningNormalizer
 
-	expCh  chan nn.Transition
-	eg     *errgroup.Group
-	cancel stdctx.CancelFunc
+	expCh      chan nn.Transition
+	snapshotCh chan chan []nn.Transition
+	eg         *errgroup.Group
+	cancel     stdctx.CancelFunc
 
 	fallbackP2C *PowerOfTwoChoices
 
@@ -226,6 +227,7 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 		replayBuffer:   nn.NewPrioritizedReplayBuffer(DefaultDQNReplayBufSize, 0.6),
 		fallbackP2C:    NewPowerOfTwoChoices(),
 		expCh:          make(chan nn.Transition, DefaultDQNExpChannelSize),
+		snapshotCh:     make(chan chan []nn.Transition, 1),
 	}
 	d.atomicState.Store(&stateSnapshot{
 		loads:          make([]float64, numPartitions),
@@ -692,6 +694,8 @@ func (d *DQNBalancer) trainLoop(ctx stdctx.Context) {
 					steps, lastLoss, d.replayBuffer.Len(), d.replayBuffer.Cap(),
 					d.droppedExperience.Load())
 			}
+		case respCh := <-d.snapshotCh:
+			respCh <- d.replayBuffer.ToBuffer()
 		case <-ctx.Done():
 			for {
 				select {
@@ -702,6 +706,24 @@ func (d *DQNBalancer) trainLoop(ctx stdctx.Context) {
 				}
 			}
 		}
+	}
+}
+
+// ExportReplayBuffer safely snapshots the replay buffer by delegating the read
+// to the trainLoop goroutine, which is the sole writer. This avoids a data race
+// between ToBuffer (caller goroutine) and Push (trainLoop goroutine).
+func (d *DQNBalancer) ExportReplayBuffer(ctx stdctx.Context) []nn.Transition {
+	respCh := make(chan []nn.Transition, 1)
+	select {
+	case d.snapshotCh <- respCh:
+	case <-ctx.Done():
+		return nil
+	}
+	select {
+	case buf := <-respCh:
+		return buf
+	case <-ctx.Done():
+		return nil
 	}
 }
 

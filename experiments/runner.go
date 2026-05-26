@@ -391,8 +391,10 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		// Save warmup buffer to cache for subsequent experiments.
 		if brk := h.Broker(); brk != nil {
 			if bal, ok := brk.Balancer().(*balancer.DQNBalancer); ok {
-				buf := bal.ReplayBuffer().ToBuffer()
-				r.dqnWarmupCache.Store(warmupKey, buf)
+				buf := bal.ExportReplayBuffer(ctx)
+				if buf != nil {
+					r.dqnWarmupCache.Store(warmupKey, buf)
+				}
 				log.Printf("  [dqn-warmup] saved %d experiences for %s to cache",
 					len(buf), warmupKey)
 			}
