@@ -16,10 +16,13 @@ import (
 	"time"
 
 	"github.com/Nyamerka/NyaQueue/benchmarks"
+	"github.com/Nyamerka/NyaQueue/pkg/balancer"
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	"github.com/Nyamerka/NyaQueue/pkg/nn"
 	"github.com/Nyamerka/NyaQueue/pkg/optimizer"
 	"github.com/Nyamerka/NyaQueue/pkg/transport"
 	"github.com/alitto/pond/v2"
+	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/samber/oops"
 	"google.golang.org/grpc/codes"
@@ -54,10 +57,15 @@ type Runner struct {
 
 	sharedGRPC *transport.Client
 	sharedHTTP *transport.HTTPClient
+
+	dqnWarmupCache *xsync.MapOf[string, []nn.Transition]
 }
 
 // RunAll executes every (scenario, algorithm, mode) combination and returns results.
 func (r *Runner) RunAll(ctx context.Context) ([]ExperimentResult, error) {
+	if r.dqnWarmupCache == nil {
+		r.dqnWarmupCache = xsync.NewMapOf[string, []nn.Transition]()
+	}
 	if r.BrokerAddr != "" && r.sharedGRPC == nil {
 		client, err := transport.NewClient(r.BrokerAddr)
 		if err == nil {
@@ -143,6 +151,10 @@ const (
 	dqnWarmupTargetExp    = 2000
 	dqnWarmupPollInterval = 100 * time.Millisecond
 )
+
+func dqnWarmupKey(mode Mode, scenario string) string {
+	return fmt.Sprintf("%s|%s", mode, scenario)
+}
 
 func (r *Runner) runWarmup(ctx context.Context) {
 	log.Printf("[warmup] running %v warmup run (results discarded)...", warmupDuration)
@@ -287,7 +299,32 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	}
 
 	if strings.Contains(alg.Name, "DQN") {
+		if brk := h.Broker(); brk != nil {
+			readyCtx, readyCancel := context.WithTimeout(ctx, 30*time.Second)
+			if err := brk.WaitBalancerReady(readyCtx); err != nil {
+				readyCancel()
+				return ExperimentResult{}, oops.Wrapf(err, "wait DQN XLA ready")
+			}
+			readyCancel()
+			log.Printf("  [dqn-setup] XLA ready for %s/%s/%s", sc.Name, alg.Name, mode)
+		}
+
 		const miniWarmupDuration = 5 * time.Second
+		warmupKey := dqnWarmupKey(mode, sc.Name)
+
+		// Try loading from warmup cache.
+		cachedBuffer, hasCache := r.dqnWarmupCache.Load(warmupKey)
+
+		if hasCache {
+			if brk := h.Broker(); brk != nil {
+				if bal, ok := brk.Balancer().(*balancer.DQNBalancer); ok {
+					bal.ReplayBuffer().LoadFromBuffer(cachedBuffer)
+					log.Printf("  [dqn-warmup] loaded %d cached experiences for %s",
+						len(cachedBuffer), warmupKey)
+				}
+			}
+			goto postWarmup
+		}
 
 		seen, _ := h.BalancerExperiencesSeen(ctx)
 		if seen >= dqnWarmupTargetExp {
@@ -307,7 +344,12 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		warmupSc := sc
 		warmupSc.Duration = maxWarmup
 		if warmupSc.RatePerSec == 0 {
-			warmupSc.RatePerSec = 5000 * min(warmupSc.Producers, topicCfg.NumPartitions)
+			baseRate := 5000 * min(warmupSc.Producers, topicCfg.NumPartitions)
+			if mode != ModeInProcess {
+				warmupSc.RatePerSec = baseRate * 3
+			} else {
+				warmupSc.RatePerSec = baseRate * 2
+			}
 		}
 
 		log.Printf("  [dqn-warmup] running warmup for %s/%s (k=%d, rate=%d, target=%d experiences, max=%v) ...",
@@ -345,6 +387,16 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		}
 		cancelWarmup()
 		<-warmupDone
+
+		// Save warmup buffer to cache for subsequent experiments.
+		if brk := h.Broker(); brk != nil {
+			if bal, ok := brk.Balancer().(*balancer.DQNBalancer); ok {
+				buf := bal.ReplayBuffer().ToBuffer()
+				r.dqnWarmupCache.Store(warmupKey, buf)
+				log.Printf("  [dqn-warmup] saved %d experiences for %s to cache",
+					len(buf), warmupKey)
+			}
+		}
 	}
 postWarmup:
 	if brk := h.Broker(); brk != nil {

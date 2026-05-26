@@ -33,6 +33,18 @@ var float64BufPool = sync.Pool{New: func() any {
 	return &buf
 }}
 
+// xlaBackendPool serializes backends.MustNew() calls across all DQNBalancer instances
+// because the XLA plugin registry is not goroutine-safe.
+type xlaBackendPool struct{ mu sync.Mutex }
+
+func (p *xlaBackendPool) New() backends.Backend {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return backends.MustNew()
+}
+
+var xlaPool xlaBackendPool
+
 type policySnap struct {
 	state  []float64
 	action int
@@ -137,6 +149,7 @@ type DQNBalancer struct {
 
 	cachedQ         atomic.Pointer[[]float64]
 	cachedQEnsemble atomic.Pointer[[dqnThompsonK][]float64]
+	cachedProbs     atomic.Pointer[[]float64]
 	cachedArgmax    atomic.Int32
 	deterministic   bool
 
@@ -146,7 +159,8 @@ type DQNBalancer struct {
 	experiencesSeen atomic.Int64
 	trainingSteps   atomic.Int64
 
-	nStep *nStepBuffer
+	nStep    *nStepBuffer
+	xlaReady chan struct{}
 
 	popArt struct {
 		mean  float64
@@ -229,17 +243,33 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 	d.betaSchedule = nn.NewBetaSchedule(0.4, 1.0, DefaultDQNReplayBufSize/d.batchSize)
 	d.normalizer = nn.NewRunningNormalizer(d.stateSize)
 	d.nStep = newNStepBuffer(5, d.gamma)
-	d.initGoMLX()
+	d.xlaReady = make(chan struct{})
 
 	ctx, cancel := stdctx.WithCancel(stdctx.Background())
 	d.cancel = cancel
 	d.eg, _ = errgroup.WithContext(ctx)
+
+	d.eg.Go(func() error {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[dqn-balancer] initGoMLX panic: %v", r)
+			}
+		}()
+		d.initGoMLX()
+		close(d.xlaReady)
+		return nil
+	})
 	d.eg.Go(func() error {
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("[dqn-balancer] trainLoop panic: %v", r)
 			}
 		}()
+		select {
+		case <-d.xlaReady:
+		case <-ctx.Done():
+			return nil
+		}
 		d.trainLoop(ctx)
 		return nil
 	})
@@ -249,6 +279,11 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 				log.Printf("[dqn-balancer] policyLoop panic: %v", r)
 			}
 		}()
+		select {
+		case <-d.xlaReady:
+		case <-ctx.Done():
+			return nil
+		}
 		d.policyLoop(ctx)
 		return nil
 	})
@@ -257,7 +292,7 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 }
 
 func (d *DQNBalancer) initGoMLX() {
-	d.backend = backends.MustNew()
+	d.backend = xlaPool.New()
 	d.ctx = context.New()
 	d.ctx.SetParams(map[string]any{
 		optimizers.ParamOptimizer:       "adam",
@@ -498,7 +533,7 @@ func (d *DQNBalancer) forward(state []float64) []float64 {
 }
 
 func (d *DQNBalancer) shouldRecordExperience() bool {
-	return d.cachedQ.Load() != nil
+	return d.cachedProbs.Load() != nil
 }
 
 func (d *DQNBalancer) ensureInflight(n int) *[]atomic.Int64 {
@@ -517,8 +552,8 @@ func (d *DQNBalancer) ensureInflight(n int) *[]atomic.Int64 {
 func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions int) int {
 	inf := d.ensureInflight(numPartitions)
 
-	cached := d.cachedQ.Load()
-	if cached == nil || len(*cached) < numPartitions {
+	probs := d.cachedProbs.Load()
+	if probs == nil || len(*probs) < numPartitions {
 		idx := d.fallbackP2C.SelectPartition(topic, key, numPartitions)
 		if (*inf)[idx].Add(1) == 1 {
 			d.nonEmptyInflight.Or(1 << uint(idx))
@@ -526,51 +561,16 @@ func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions in
 		return idx
 	}
 
+	var idx int
 	if d.deterministic {
-		idx := int(d.cachedArgmax.Load())
+		idx = int(d.cachedArgmax.Load())
 		if idx >= numPartitions {
 			idx = 0
 		}
-		if (*inf)[idx].Add(1) == 1 {
-			d.nonEmptyInflight.Or(1 << uint(idx))
-		}
-		return idx
+	} else {
+		idx = sampleCDF((*probs)[:numPartitions])
 	}
 
-	// Thompson sampling: pick a random Q-vector from the ensemble.
-	qRaw := (*cached)[:numPartitions]
-	if ens := d.cachedQEnsemble.Load(); ens != nil {
-		qRaw = ens[rand.IntN(dqnThompsonK)][:numPartitions]
-	}
-
-	adjustedQ := make([]float64, numPartitions)
-	copy(adjustedQ, qRaw)
-
-	mask := d.nonEmptyInflight.Load()
-	if mask != 0 {
-		var totalInflight float64
-		for bits := mask; bits != 0; bits &= bits - 1 {
-			i := bits2.TrailingZeros64(bits)
-			totalInflight += float64((*inf)[i].Load())
-		}
-		if totalInflight > 0 {
-			for bits := mask; bits != 0; bits &= bits - 1 {
-				i := bits2.TrailingZeros64(bits)
-				adjustedQ[i] -= dqnInflightCouplingBeta * float64((*inf)[i].Load()) / totalInflight
-			}
-		}
-	}
-
-	if snap := d.atomicState.Load(); snap != nil && len(snap.loads) >= numPartitions {
-		for i := range adjustedQ {
-			adjustedQ[i] -= dqnLoadCouplingBeta * snap.loads[i]
-		}
-	}
-
-	entTarget := currentEntropyTarget(d.experiencesSeen.Load())
-	probs := softmaxWithEntropy(adjustedQ, entTarget)
-
-	idx := sampleCDF(probs)
 	if (*inf)[idx].Add(1) == 1 {
 		d.nonEmptyInflight.Or(1 << uint(idx))
 	}
@@ -623,8 +623,11 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 	}
 }
 
-func (d *DQNBalancer) BalancerType() string { return "DQN" }
-func (d *DQNBalancer) NumPartitions() int   { return d.numPartitions }
+func (d *DQNBalancer) BalancerType() string                      { return "DQN" }
+func (d *DQNBalancer) NumPartitions() int                        { return d.numPartitions }
+func (d *DQNBalancer) ReplayBuffer() *nn.PrioritizedReplayBuffer { return d.replayBuffer }
+func (d *DQNBalancer) XLAReady() <-chan struct{}                 { return d.xlaReady }
+func (d *DQNBalancer) Ctx() *context.Context                     { return d.ctx }
 
 func (d *DQNBalancer) DroppedExperience() int64 {
 	return d.droppedExperience.Load()
@@ -647,6 +650,17 @@ func (d *DQNBalancer) OnPublishComplete(partition int) {
 		if (*ptr)[partition].Add(-1) == 0 {
 			d.nonEmptyInflight.And(^(1 << uint(partition)))
 		}
+	}
+}
+
+// WaitReady blocks until XLA JIT compilation finishes (or ctx is cancelled).
+// SelectPartition falls back to P2C while XLA is initializing.
+func (d *DQNBalancer) WaitReady(ctx stdctx.Context) error {
+	select {
+	case <-d.xlaReady:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -730,6 +744,34 @@ func (d *DQNBalancer) policyLoop(ctx stdctx.Context) {
 			d.cachedQ.Store(&meanQ)
 			d.cachedQEnsemble.Store(&ensemble)
 			d.cachedArgmax.Store(int32(argmax(meanQ)))
+
+			// Compute routing probabilities once per tick (not per-message).
+			adjustedQ := make([]float64, d.numPartitions)
+			copy(adjustedQ, meanQ)
+			if inf := d.inflight.Load(); inf != nil {
+				mask := d.nonEmptyInflight.Load()
+				if mask != 0 {
+					var totalInflight float64
+					for bits := mask; bits != 0; bits &= bits - 1 {
+						i := bits2.TrailingZeros64(bits)
+						totalInflight += float64((*inf)[i].Load())
+					}
+					if totalInflight > 0 {
+						for bits := mask; bits != 0; bits &= bits - 1 {
+							i := bits2.TrailingZeros64(bits)
+							adjustedQ[i] -= dqnInflightCouplingBeta * float64((*inf)[i].Load()) / totalInflight
+						}
+					}
+				}
+			}
+			if snap := d.atomicState.Load(); snap != nil && len(snap.loads) >= d.numPartitions {
+				for i := range adjustedQ {
+					adjustedQ[i] -= dqnLoadCouplingBeta * snap.loads[i]
+				}
+			}
+			entTarget := currentEntropyTarget(d.experiencesSeen.Load())
+			probs := softmaxWithEntropy(adjustedQ, entTarget)
+			d.cachedProbs.Store(&probs)
 
 			stateCopy := make([]float64, len(d.policyStateBuf))
 			copy(stateCopy, d.policyStateBuf)

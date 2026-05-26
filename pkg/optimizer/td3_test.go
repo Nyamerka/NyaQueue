@@ -4,6 +4,7 @@ import (
 	"math"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
@@ -599,4 +600,42 @@ func (s *TD3Suite) TestGaussianExplorationNoise() {
 	}
 	require.True(s.T(), differ,
 		"Gaussian noise should produce variation in actions across calls")
+}
+
+func (s *TD3Suite) TestTD3EvalOnlyNoStore() {
+	brk := setupMinimalBroker(s.T())
+	defer brk.Stop()
+
+	params, cfg := DefaultTunableParams(), DefaultOptimizerConfig()
+	cfg.EvalOnly = true
+	cfg.CollectInterval = 10 * time.Millisecond
+	cfg.WarmupTicks = 0
+	cfg.ApplyEvery = 1
+
+	opt := NewOptimizer(brk, params, cfg)
+	opt.Start()
+	time.Sleep(200 * time.Millisecond)
+	opt.Stop()
+
+	require.Equal(s.T(), 0, opt.td3.replayBuffer.Len(),
+		"EvalOnly optimizer must not Store() experiences")
+}
+
+func (s *TD3Suite) TestTD3NonEvalStores() {
+	brk := setupMinimalBroker(s.T())
+	defer brk.Stop()
+
+	params, cfg := DefaultTunableParams(), DefaultOptimizerConfig()
+	cfg.EvalOnly = false
+	cfg.CollectInterval = 10 * time.Millisecond
+	cfg.WarmupTicks = 0
+	cfg.ApplyEvery = 100
+
+	opt := NewOptimizer(brk, params, cfg)
+	opt.Start()
+	time.Sleep(200 * time.Millisecond)
+	opt.Stop()
+
+	require.Greater(s.T(), opt.td3.replayBuffer.Len(), 0,
+		"non-EvalOnly optimizer must Store() experiences")
 }

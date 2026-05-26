@@ -61,6 +61,12 @@ type ExperienceCounter interface {
 	ExperiencesSeen() int64
 }
 
+// ReadinessWaiter is optionally implemented by balancers that perform
+// asynchronous initialization (e.g. XLA JIT compilation).
+type ReadinessWaiter interface {
+	WaitReady(ctx context.Context) error
+}
+
 type Scheduler interface {
 	Next(partition *Partition, consumerOffset uint64) (*Message, uint64, error)
 	Enqueue(msg *Message, walOffset int64)
@@ -195,6 +201,27 @@ func (b *Broker) ResetBalancerForScenario() {
 			r.ResetForNewScenario()
 		}
 	}
+}
+
+// Balancer returns the currently installed balancer.
+func (b *Broker) Balancer() Balancer {
+	snap := b.runtime.Load()
+	if snap != nil {
+		return snap.balancer
+	}
+	return nil
+}
+
+// WaitBalancerReady blocks until the current balancer finishes async init.
+// Returns immediately if the balancer does not implement ReadinessWaiter.
+func (b *Broker) WaitBalancerReady(ctx context.Context) error {
+	snap := b.runtime.Load()
+	if snap != nil && snap.balancer != nil {
+		if w, ok := snap.balancer.(ReadinessWaiter); ok {
+			return w.WaitReady(ctx)
+		}
+	}
+	return nil
 }
 
 func (b *Broker) BalancerExperiencesSeen() int64 {

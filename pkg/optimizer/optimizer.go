@@ -224,7 +224,7 @@ func (o *Optimizer) step(shouldApply bool) {
 		}
 	}
 
-	if o.prevMetrics != nil {
+	if o.prevMetrics != nil && !o.evalOnly {
 		reward := o.computeReward(&metrics)
 		prevState := o.normalizer.Normalize(o.buildState(o.prevMetrics))
 

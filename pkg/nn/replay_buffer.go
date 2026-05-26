@@ -250,6 +250,33 @@ func (b *PrioritizedReplayBuffer) UpdatePriority(idx int, tdError float64) {
 	b.sumTree.Update(idx, math.Pow(p, b.alpha))
 }
 
+// ToBuffer exports all transitions for warmup caching.
+func (b *PrioritizedReplayBuffer) ToBuffer() []Transition {
+	n := b.sumTree.size
+	if n == 0 {
+		return nil
+	}
+	buf := make([]Transition, n)
+	for i := 0; i < n; i++ {
+		t := b.sumTree.data[i]
+		buf[i] = Transition{
+			State:     append([]float64(nil), t.State...),
+			Action:    append([]float64(nil), t.Action...),
+			Reward:    t.Reward,
+			NextState: append([]float64(nil), t.NextState...),
+			Done:      t.Done,
+		}
+	}
+	return buf
+}
+
+// LoadFromBuffer imports previously cached transitions.
+func (b *PrioritizedReplayBuffer) LoadFromBuffer(buf []Transition) {
+	for _, t := range buf {
+		b.Push(t)
+	}
+}
+
 func (b *PrioritizedReplayBuffer) Cap() int {
 	return b.sumTree.capacity
 }

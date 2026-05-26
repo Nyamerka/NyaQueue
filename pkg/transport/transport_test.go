@@ -443,3 +443,31 @@ func (s *TransportSuite) TestSetBalancerRPCGRPC() {
 	err = s.client.SetBalancer(ctx, pb.BalancerAlgorithm_PSA, 8)
 	require.NoError(s.T(), err, "SetBalancer to PSA should succeed")
 }
+
+func (s *TransportSuite) TestSetBalancerAsync() {
+	ctx := context.Background()
+
+	start := time.Now()
+	err := s.client.SetBalancer(ctx, pb.BalancerAlgorithm_DQN, 4)
+	elapsed := time.Since(start)
+
+	require.NoError(s.T(), err, "SetBalancer to DQN should succeed")
+	require.Less(s.T(), elapsed, 2*time.Second,
+		"SetBalancer(DQN) should return quickly (async XLA init), took %v", elapsed)
+}
+
+func (s *TransportSuite) TestGRPCLiveAfterDQNInit() {
+	ctx := context.Background()
+
+	err := s.client.SetBalancer(ctx, pb.BalancerAlgorithm_DQN, 4)
+	require.NoError(s.T(), err)
+
+	s.createTopicWithScheduler("dqn-live-test", 4, pb.ScheduleMode_FIFO)
+
+	_, _, err = s.client.Produce(ctx, "dqn-live-test", []byte("k"), []byte("v"), 0)
+	require.NoError(s.T(), err, "gRPC produce must work while DQN initializes")
+
+	topics, err := s.client.ListTopics(ctx)
+	require.NoError(s.T(), err, "gRPC list-topics must work while DQN initializes")
+	require.NotEmpty(s.T(), topics)
+}
