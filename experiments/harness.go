@@ -268,6 +268,28 @@ func (h *Harness) BalancerExperiencesSeen(ctx context.Context) (int64, error) {
 	return -1, nil
 }
 
+// WaitExternalBalancerReady polls the external broker until the DQN balancer
+// reports XLA readiness (experiences_seen >= 0) or the context expires.
+func (h *Harness) WaitExternalBalancerReady(ctx context.Context) error {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			seen, err := h.BalancerExperiencesSeen(ctx)
+			if err != nil {
+				continue
+			}
+			if seen >= 0 {
+				return nil
+			}
+			return oops.Errorf("balancer stats returned %d (XLA may have failed)", seen)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
 // Broker returns the in-process broker (nil for Kafka mode).
 func (h *Harness) Broker() *broker.Broker {
 	if h.app != nil {

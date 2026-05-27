@@ -409,6 +409,22 @@ func (d *DQNScheduler) computePerPriorityReward() float64 {
 func (d *DQNScheduler) Stop() {
 	d.cancel()
 	_ = d.eg.Wait()
+
+	if d.fwdExec != nil {
+		d.fwdExec.Finalize()
+	}
+	if d.bestActionsExec != nil {
+		d.bestActionsExec.Finalize()
+	}
+	if d.targetQForActionsExec != nil {
+		d.targetQForActionsExec.Finalize()
+	}
+	if d.batchQExec != nil {
+		d.batchQExec.Finalize()
+	}
+	if d.trainExec != nil {
+		d.trainExec.Finalize()
+	}
 }
 
 func (d *DQNScheduler) policyLoop(ctx stdctx.Context) {

@@ -22,8 +22,8 @@ import (
 	"github.com/Nyamerka/NyaQueue/pkg/optimizer"
 	"github.com/Nyamerka/NyaQueue/pkg/transport"
 	"github.com/alitto/pond/v2"
-	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/cenkalti/backoff/v4"
+	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/samber/oops"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -209,13 +209,14 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 		return ExperimentResult{}, oops.Wrapf(err, "create data dir")
 	}
 
-	// For short experiments, force EvalOnly to prevent TD3 from applying
-	// destructive actions before the model has enough data to converge.
+	// For short experiments, increase warmup and hysteresis so TD3 collects
+	// enough data before first action while still allowing online learning.
 	if dur <= 60*time.Second && alg.UseOptimizer && alg.OptimizerOpts != nil {
 		origOpts := alg.OptimizerOpts
 		alg.OptimizerOpts = func() ([]optimizer.TunableParam, optimizer.OptimizerConfig) {
 			params, cfg := origOpts()
-			cfg.EvalOnly = true
+			cfg.WarmupTicks = 200
+			cfg.Hysteresis = 0.15
 			return params, cfg
 		}
 	}
@@ -239,9 +240,9 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 	}
 	defer func() {
 		h.Close()
-		_ = os.RemoveAll(dataDir)
 		runtime.GC()
 		debug.FreeOSMemory()
+		_ = os.RemoveAll(dataDir)
 	}()
 
 	topic := expTopicName(sc.Name, alg.Name, mode)
@@ -307,6 +308,14 @@ func (r *Runner) runNyaQueue(ctx context.Context, sc benchmarks.Scenario, alg Al
 			}
 			readyCancel()
 			log.Printf("  [dqn-setup] XLA ready for %s/%s/%s", sc.Name, alg.Name, mode)
+		} else if h.IsExternal() {
+			readyCtx, readyCancel := context.WithTimeout(ctx, 30*time.Second)
+			if err := h.WaitExternalBalancerReady(readyCtx); err != nil {
+				readyCancel()
+				return ExperimentResult{}, oops.Wrapf(err, "external DQN XLA init failed for %s/%s", sc.Name, alg.Name)
+			}
+			readyCancel()
+			log.Printf("  [dqn-setup] external XLA ready for %s/%s/%s", sc.Name, alg.Name, mode)
 		}
 
 		const miniWarmupDuration = 5 * time.Second

@@ -29,6 +29,7 @@ experiments/results/*.txt
 
 # Plan (internal, not for repo)
 PLAN.md
+monologue.md
 
 # OS
 .DS_Store

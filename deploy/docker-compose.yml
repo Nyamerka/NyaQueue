@@ -13,6 +13,7 @@ services:
       GOMEMLIMIT: "3500MiB"
       GOMAXPROCS: "3"
       GOMLX_BACKEND: "xla:cpu"
+      PJRT_PLUGIN_LIBRARY_PATH: "/opt/xla/lib/go-xla"
       OMP_NUM_THREADS: "1"
     volumes:
       - nyaqueue-data:/data
@@ -130,10 +131,12 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
       target: experiment
+    user: "${UID:-1000}:${GID:-1000}"
     environment:
       GOGC: "200"
-      GOMEMLIMIT: "1800MiB"
+      GOMEMLIMIT: "3500MiB"
       GOMLX_BACKEND: "xla:cpu"
+      PJRT_PLUGIN_LIBRARY_PATH: "/opt/xla/lib/go-xla"
       OMP_NUM_THREADS: "1"
     command:
       - "--experiment.mode=inprocess,grpc,http,kafka"
@@ -149,8 +152,10 @@ services:
       - kafka
     volumes:
       - ./results:/results
-    cpus: "2.0"
-    mem_limit: "2g"
+    tmpfs:
+      - /tmp:size=512m
+    cpus: "3.0"
+    mem_limit: "4g"
     sysctls:
       net.ipv4.tcp_tw_reuse: 1
       net.ipv4.tcp_fin_timeout: 30

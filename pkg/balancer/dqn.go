@@ -2,6 +2,7 @@ package balancer
 
 import (
 	stdctx "context"
+	"fmt"
 	"log"
 	"math"
 	bits2 "math/bits"
@@ -160,8 +161,9 @@ type DQNBalancer struct {
 	experiencesSeen atomic.Int64
 	trainingSteps   atomic.Int64
 
-	nStep    *nStepBuffer
-	xlaReady chan struct{}
+	nStep     *nStepBuffer
+	xlaReady  chan struct{}
+	xlaFailed atomic.Bool
 
 	popArt struct {
 		mean  float64
@@ -252,13 +254,14 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 	d.eg, _ = errgroup.WithContext(ctx)
 
 	d.eg.Go(func() error {
+		defer close(d.xlaReady)
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("[dqn-balancer] initGoMLX panic: %v", r)
+				d.xlaFailed.Store(true)
 			}
 		}()
 		d.initGoMLX()
-		close(d.xlaReady)
 		return nil
 	})
 	d.eg.Go(func() error {
@@ -269,6 +272,10 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 		}()
 		select {
 		case <-d.xlaReady:
+			if d.xlaFailed.Load() {
+				log.Printf("[dqn-balancer] XLA init failed, trainLoop staying on P2C fallback")
+				return nil
+			}
 		case <-ctx.Done():
 			return nil
 		}
@@ -283,6 +290,10 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 		}()
 		select {
 		case <-d.xlaReady:
+			if d.xlaFailed.Load() {
+				log.Printf("[dqn-balancer] XLA init failed, policyLoop staying on P2C fallback")
+				return nil
+			}
 		case <-ctx.Done():
 			return nil
 		}
@@ -580,8 +591,6 @@ func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions in
 }
 
 func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
-	reward := d.computeReward(m)
-
 	d.fallbackP2C.OnMetrics(m)
 
 	snap := &stateSnapshot{
@@ -599,6 +608,12 @@ func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
 		snap.queueDepth = append([]int(nil), m.QueueDepth...)
 	}
 	d.atomicState.Store(snap)
+
+	if m.MsgRate < 1.0 && m.Throughput < 1.0 {
+		return
+	}
+
+	reward := d.computeReward(m)
 
 	if !d.shouldRecordExperience() {
 		return
@@ -657,18 +672,43 @@ func (d *DQNBalancer) OnPublishComplete(partition int) {
 
 // WaitReady blocks until XLA JIT compilation finishes (or ctx is cancelled).
 // SelectPartition falls back to P2C while XLA is initializing.
+// Returns an error if XLA initialization panicked.
 func (d *DQNBalancer) WaitReady(ctx stdctx.Context) error {
 	select {
 	case <-d.xlaReady:
+		if d.xlaFailed.Load() {
+			return fmt.Errorf("XLA initialization failed")
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
+// XLAFailed reports whether XLA initialization has failed.
+func (d *DQNBalancer) XLAFailed() bool {
+	return d.xlaFailed.Load()
+}
+
 func (d *DQNBalancer) Stop() {
 	d.cancel()
 	_ = d.eg.Wait()
+
+	if d.trainExec != nil {
+		d.trainExec.Finalize()
+	}
+	if d.bestActionsExec != nil {
+		d.bestActionsExec.Finalize()
+	}
+	if d.targetQForActionsExec != nil {
+		d.targetQForActionsExec.Finalize()
+	}
+	if d.batchQExec != nil {
+		d.batchQExec.Finalize()
+	}
+	if exec := d.inferExec.Load(); exec != nil {
+		exec.Finalize()
+	}
 }
 
 func (d *DQNBalancer) trainLoop(ctx stdctx.Context) {
@@ -677,6 +717,8 @@ func (d *DQNBalancer) trainLoop(ctx stdctx.Context) {
 
 	steps := 0
 	var lastLoss float64
+	const minTrainInterval = 20 * time.Millisecond
+	lastTrainTime := time.Now()
 
 	for {
 		select {
@@ -684,6 +726,11 @@ func (d *DQNBalancer) trainLoop(ctx stdctx.Context) {
 			d.replayBuffer.Push(t)
 			steps++
 			if steps%d.trainEvery == 0 {
+				now := time.Now()
+				if now.Sub(lastTrainTime) < minTrainInterval {
+					continue
+				}
+				lastTrainTime = now
 				for u := 0; u < d.updatesPerStep; u++ {
 					lastLoss = d.trainStep()
 					d.trainingSteps.Add(1)
@@ -729,8 +776,14 @@ func (d *DQNBalancer) ExportReplayBuffer(ctx stdctx.Context) []nn.Transition {
 
 func (d *DQNBalancer) policyInterval() time.Duration {
 	snap := d.atomicState.Load()
-	if snap != nil && snap.msgRate > 0 && snap.msgRate < dqnLowRateThreshold {
+	if snap == nil {
+		return dqnPolicyTickInterval
+	}
+	if snap.msgRate > 0 && snap.msgRate < dqnLowRateThreshold {
 		return dqnSlowPolicyTickInterval
+	}
+	if snap.msgRate > dqnOverloadRateThreshold {
+		return dqnFastPolicyTickInterval
 	}
 	return dqnPolicyTickInterval
 }

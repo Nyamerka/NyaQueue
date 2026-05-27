@@ -14,6 +14,12 @@ COPY . .
 RUN CGO_ENABLED=1 go build -ldflags="-s -w" -o /bin/broker     ./cmd/broker
 RUN CGO_ENABLED=1 go build -ldflags="-s -w" -o /bin/experiment  ./cmd/experiment
 
+# Pre-download XLA PJRT plugin so runtime doesn't need network/write access.
+# HOME controls where go-xla installs the plugin (~/.local/lib/go-xla/).
+RUN mkdir -p /opt/xla/.local/lib && \
+    HOME=/opt/xla GOMLX_BACKEND=xla:cpu CGO_ENABLED=1 \
+    go run ./cmd/xla-preinstall
+
 # Others — no CGO, static binaries
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /bin/producer        ./cmd/producer
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /bin/consumer        ./cmd/consumer
@@ -25,21 +31,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libstdc++6 libgomp1 && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd -g 1000 nyaqueue && \
-    useradd -u 1000 -g nyaqueue nyaqueue
+    useradd -u 1000 -g nyaqueue -m nyaqueue && \
+    mkdir -p /opt/xla/lib/go-xla && chown -R nyaqueue:nyaqueue /opt/xla
 
 FROM ml-base AS broker
+COPY --from=builder /opt/xla/.local/lib/go-xla /opt/xla/lib/go-xla
 COPY --from=builder /bin/broker /usr/local/bin/broker
 COPY deploy/configs/broker.yaml /etc/nyaqueue/config.yaml
 RUN mkdir -p /data && chown -R nyaqueue:nyaqueue /data
 USER nyaqueue
+ENV PJRT_PLUGIN_LIBRARY_PATH=/opt/xla/lib/go-xla
 EXPOSE 9090 8080
 ENTRYPOINT ["broker", "-config", "/etc/nyaqueue/config.yaml"]
 
 FROM ml-base AS experiment
+COPY --from=builder /opt/xla/.local/lib/go-xla /opt/xla/lib/go-xla
 COPY --from=builder /bin/broker /usr/local/bin/broker
 COPY --from=builder /bin/experiment /usr/local/bin/experiment
 COPY deploy/configs/broker.yaml /etc/nyaqueue/config.yaml
-RUN mkdir -p /results
+RUN mkdir -p /results && chown -R nyaqueue:nyaqueue /results
+USER nyaqueue
+ENV PJRT_PLUGIN_LIBRARY_PATH=/opt/xla/lib/go-xla
 ENTRYPOINT ["experiment"]
 
 # Others — alpine (no CGO dependencies)

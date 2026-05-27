@@ -12,7 +12,7 @@ const (
 	DefaultDQNReplayBufSize  = 50_000
 	DefaultDQNBatchSize      = 64
 	DefaultDQNMinReplay      = 64
-	DefaultDQNTrainEvery     = 1
+	DefaultDQNTrainEvery     = 4
 	DefaultDQNUpdatesPerStep = 1
 	DefaultDQNExpChannelSize = 16384
 	DefaultDQNWeightDecay    = 1e-4
@@ -51,20 +51,22 @@ const (
 // τ is solved per-inference via binary search to hit that target.
 const (
 	dqnBoltzmannEntropyStart = 0.85
-	dqnBoltzmannEntropyEnd   = 0.30
-	dqnBoltzmannAnnealingExp = 20_000
+	dqnBoltzmannEntropyEnd   = 0.50
+	dqnBoltzmannAnnealingExp = 5_000
 
-	dqnInflightCouplingBeta = 2.0
-	dqnLoadCouplingBeta     = 1.5
+	dqnInflightCouplingBeta = 3.0
+	dqnLoadCouplingBeta     = 2.5
 )
 
 const (
 	dqnPolicyTickInterval     = 100 * time.Millisecond
 	dqnSlowPolicyTickInterval = 500 * time.Millisecond
+	dqnFastPolicyTickInterval = 50 * time.Millisecond
 	dqnLowRateThreshold       = 5_000.0
+	dqnOverloadRateThreshold  = 50_000.0
 )
 
 const dqnNumQuantiles = 21
-const dqnThompsonK = 2
+const dqnThompsonK = 1
 
 const PSARebalanceLoadFactor = 2.0

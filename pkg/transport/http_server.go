@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -390,6 +391,14 @@ type HTTPSetBalancerRequest struct {
 }
 
 func (s *HTTPServer) handleSetBalancer(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if rv := recover(); rv != nil {
+			log.Printf("[http] handleSetBalancer panic: %v", rv)
+			writeHTTPError(w, http.StatusInternalServerError,
+				fmt.Errorf("balancer init failed: %v", rv))
+		}
+	}()
+
 	var req HTTPSetBalancerRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err)

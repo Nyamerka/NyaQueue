@@ -55,14 +55,16 @@ func (s *DQNSuite) TestOnMetricsTrains() {
 	}, 5*time.Second, 10*time.Millisecond, "wait for policyLoop to produce cachedProbs")
 
 	dqn.OnMetrics(broker.Metrics{
-		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8}},
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 5000, MsgRate: 5000},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.2, 0.4, 0.6, 0.8}},
 	})
 
 	time.Sleep(300 * time.Millisecond)
 
 	for i := 0; i < 15; i++ {
 		dqn.OnMetrics(broker.Metrics{
-			DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.3, 0.5, 0.7, 0.9}},
+			BusinessMetrics: broker.BusinessMetrics{Throughput: 5000, MsgRate: 5000},
+			DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.3, 0.5, 0.7, 0.9}},
 		})
 		time.Sleep(60 * time.Millisecond)
 	}
@@ -137,14 +139,16 @@ func (s *DQNSuite) TestTrainStepWithEnoughData() {
 	}, 5*time.Second, 10*time.Millisecond, "wait for policyLoop to produce cachedProbs")
 
 	dqn.OnMetrics(broker.Metrics{
-		DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4}},
+		BusinessMetrics: broker.BusinessMetrics{Throughput: 3000, MsgRate: 3000},
+		DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.2, 0.3, 0.4}},
 	})
 
 	time.Sleep(200 * time.Millisecond)
 
 	for i := 0; i < 10; i++ {
 		dqn.OnMetrics(broker.Metrics{
-			DerivedMetrics: broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.2, 0.3, float64(i) * 0.1}},
+			BusinessMetrics: broker.BusinessMetrics{Throughput: 3000, MsgRate: 3000},
+			DerivedMetrics:  broker.DerivedMetrics{PartitionLoads: []float64{0.1, 0.2, 0.3, float64(i) * 0.1}},
 		})
 		time.Sleep(60 * time.Millisecond)
 	}

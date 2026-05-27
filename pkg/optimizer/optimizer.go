@@ -255,13 +255,16 @@ func (o *Optimizer) applyAction(action []float64) {
 		if i >= len(o.params) {
 			break
 		}
-		newNorm := (a + 1.0) / 2.0
-		newNorm = max(actionFloor, min(actionCeil, newNorm))
+		target := (a + 1.0) / 2.0
+		target = max(actionFloor, min(actionCeil, target))
 
-		if math.Abs(newNorm-o.currentVals[i]) < o.hysteresis {
+		delta := target - o.currentVals[i]
+		if math.Abs(delta) < o.hysteresis {
 			continue
 		}
-		o.currentVals[i] = newNorm
+		delta = max(-DefaultMaxActionDelta, min(DefaultMaxActionDelta, delta))
+		o.currentVals[i] += delta
+		o.currentVals[i] = max(actionFloor, min(actionCeil, o.currentVals[i]))
 		changed = true
 	}
 
@@ -317,19 +320,16 @@ func (o *Optimizer) computeReward(m *broker.Metrics) float64 {
 		}
 	}
 
-	if reward < -DefaultRewardClamp {
-		reward = -DefaultRewardClamp
-	}
-	if reward > DefaultRewardClamp {
-		reward = DefaultRewardClamp
-	}
+	reward = max(-1.0, min(1.0, reward))
 
 	o.rewardCount++
 	delta := reward - o.rewardMean
 	o.rewardMean += delta / float64(o.rewardCount)
-	o.rewardM2 += delta * (reward - o.rewardMean)
-	if o.rewardCount > 1 {
-		sigma := math.Sqrt(o.rewardM2/float64(o.rewardCount-1)) + 1e-8
+	delta2 := reward - o.rewardMean
+	o.rewardM2 += delta * delta2
+
+	if o.rewardCount > 10 {
+		sigma := math.Sqrt(o.rewardM2/float64(o.rewardCount)) + 1e-8
 		reward = (reward - o.rewardMean) / sigma
 	}
 
@@ -349,11 +349,27 @@ func (o *Optimizer) checkEmergencyRollback(m *broker.Metrics) {
 		log.Printf("[optimizer] emergency rollback: DeliveryRatio %.2f < %.2f for %d ticks → cooldown %d",
 			m.DeliveryRatio, DefaultEmergencyRollbackDR, o.lowDeliveryTicksInARow,
 			DefaultEmergencyRollbackCooldown)
+
 		if o.broker != nil {
 			if err := o.broker.ApplyConfig(o.startConfig); err != nil {
 				log.Printf("[optimizer] emergency rollback ApplyConfig failed: %v", err)
 			}
 		}
+
+		if o.prevMetrics != nil && o.td3 != nil {
+			prevState := o.normalizer.Normalize(o.buildState(o.prevMetrics))
+			curState := o.normalizer.Normalize(o.buildState(m))
+			dummyAction := make([]float64, len(o.params))
+			for i := range dummyAction {
+				dummyAction[i] = o.currentVals[i]*2 - 1
+			}
+			o.td3.Store(prevState, dummyAction, -1.0, curState, true)
+		}
+
+		for i := range o.currentVals {
+			o.currentVals[i] = 0.5
+		}
+
 		o.cooldownTicksLeft = DefaultEmergencyRollbackCooldown
 		o.lowDeliveryTicksInARow = 0
 		if o.td3 != nil {
