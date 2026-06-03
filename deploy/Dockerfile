@@ -28,7 +28,7 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /bin/broker-exporter ./cmd/broker
 # Broker/experiment image — needs glibc for XLA .so and PJRT plugin
 FROM debian:bookworm-slim AS ml-base
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libstdc++6 libgomp1 && \
+    ca-certificates libstdc++6 libgomp1 wget && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd -g 1000 nyaqueue && \
     useradd -u 1000 -g nyaqueue -m nyaqueue && \
