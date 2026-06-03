@@ -59,8 +59,9 @@ func (h *KafkaHarness) ensureProducer() (*kgo.Client, error) {
 		kgo.SeedBrokers(h.brokers...),
 		kgo.DisableIdempotentWrite(),
 		kgo.RequiredAcks(kgo.LeaderAck()),
-		kgo.ProducerLinger(5*time.Millisecond),
-		kgo.ProducerBatchMaxBytes(1<<20),
+		kgo.ProducerLinger(0),
+		kgo.ProducerBatchMaxBytes(16<<20),
+		kgo.MaxBufferedRecords(1<<20),
 		kgo.ProducerBatchCompression(kgo.Lz4Compression()),
 		kgo.RetryBackoffFn(func(attempt int) time.Duration {
 			d := time.Duration(attempt) * 250 * time.Millisecond
@@ -81,7 +82,6 @@ func (h *KafkaHarness) ensureProducer() (*kgo.Client, error) {
 	return cl, nil
 }
 
-// resetProducer closes the current producer so the next call recreates it.
 func (h *KafkaHarness) resetProducer() {
 	h.mu.Lock()
 	if h.producer != nil {
@@ -213,26 +213,28 @@ func (h *KafkaHarness) ProduceBatch(ctx context.Context, topic string, msgs []kg
 	if err != nil {
 		return oops.Wrapf(err, "produce-batch topic=%q ensure producer", topic)
 	}
-	recs := make([]*kgo.Record, len(msgs))
 	for i := range msgs {
-		recs[i] = &kgo.Record{
+		rec := &kgo.Record{
 			Topic: topic,
 			Key:   msgs[i].Key,
 			Value: msgs[i].Value,
 		}
+		h.inflightProduces.Add(1)
+		cl.Produce(ctx, rec, func(_ *kgo.Record, err error) {
+			h.inflightProduces.Add(-1)
+			if err != nil {
+				h.failureCount.Add(1)
+				if !h.loggedFirstErr.Swap(true) {
+					log.Printf("[kafka-produce-batch] first error: %+v", err)
+				}
+			} else {
+				h.successCount.Add(1)
+			}
+		})
 	}
-	results := cl.ProduceSync(ctx, recs...)
-	if err := results.FirstErr(); err != nil {
-		if !h.loggedFirstErr.Swap(true) {
-			log.Printf("[kafka-produce-batch] first error: %+v", err)
-		}
-		return oops.Wrapf(err, "produce-batch topic=%q", topic)
-	}
-	h.successCount.Add(int64(len(msgs)))
 	return nil
 }
 
-// Flush blocks until all in-flight produce requests complete.
 func (h *KafkaHarness) Flush(ctx context.Context) error {
 	h.mu.Lock()
 	cl := h.producer
@@ -272,7 +274,8 @@ func (h *KafkaHarness) consumerFor(topic, group string, partition int) *kgo.Clie
 		opts := []kgo.Opt{
 			kgo.SeedBrokers(h.brokers...),
 			kgo.FetchMaxWait(10 * time.Millisecond),
-			kgo.FetchMaxBytes(int32(1 << 20)),
+			kgo.FetchMinBytes(4 << 10),
+			kgo.FetchMaxBytes(int32(50 << 20)),
 			kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
 				topic: {int32(partition): kgo.NewOffset().AtStart()},
 			}),

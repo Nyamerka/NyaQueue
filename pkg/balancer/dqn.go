@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"math"
-	bits2 "math/bits"
 	"math/rand/v2"
 	"runtime"
 	"sync"
@@ -25,8 +24,6 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/train/optimizers"
 	"golang.org/x/sync/errgroup"
 	"gonum.org/v1/gonum/stat"
-
-	_ "github.com/gomlx/gomlx/backends/default"
 )
 
 var float64BufPool = sync.Pool{New: func() any {
@@ -34,17 +31,16 @@ var float64BufPool = sync.Pool{New: func() any {
 	return &buf
 }}
 
-// xlaBackendPool serializes backends.MustNew() calls across all DQNBalancer instances
-// because the XLA plugin registry is not goroutine-safe.
-type xlaBackendPool struct{ mu sync.Mutex }
-
-func (p *xlaBackendPool) New() backends.Backend {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return backends.MustNew()
+type paddedInt64 struct {
+	n atomic.Int64
+	_ [56]byte // pad to 64-byte cache line
 }
 
-var xlaPool xlaBackendPool
+const (
+	dqnBiasWarmup = 200.0
+	dqnBiasScale  = 2.0
+	dqnBiasClip   = 1.0
+)
 
 type policySnap struct {
 	state  []float64
@@ -106,8 +102,6 @@ func (b *nStepBuffer) Reset() {
 	b.mu.Unlock()
 }
 
-// DQNBalancer selects partitions via a DQN with softmax (Boltzmann) routing.
-// State: [partition_loads, predicted_loads, inflight, msg_rate, avg_msg_size]; Action: partition index.
 type DQNBalancer struct {
 	numPartitions  int
 	hiddenSize     int
@@ -141,19 +135,15 @@ type DQNBalancer struct {
 	eg         *errgroup.Group
 	cancel     stdctx.CancelFunc
 
-	fallbackP2C *PowerOfTwoChoices
-
 	atomicState atomic.Pointer[stateSnapshot]
 
 	droppedExperience atomic.Int64
+	liveDepth         atomic.Pointer[[]paddedInt64]
 	inflight          atomic.Pointer[[]atomic.Int64]
-	nonEmptyInflight  atomic.Uint64
 
-	cachedQ         atomic.Pointer[[]float64]
-	cachedQEnsemble atomic.Pointer[[dqnThompsonK][]float64]
-	cachedProbs     atomic.Pointer[[]float64]
-	cachedArgmax    atomic.Int32
-	deterministic   bool
+	cachedQ       atomic.Pointer[[]float64]
+	cachedArgmax  atomic.Int32
+	deterministic bool
 
 	prevSnap atomic.Pointer[policySnap]
 	currSnap atomic.Pointer[policySnap]
@@ -181,14 +171,14 @@ type DQNBalancer struct {
 	}
 
 	policyStateBuf []float64
+	policyQBuf     [2][]float64
+	policyBufIdx   int
 	prevLoads      atomic.Pointer[[]float64]
 
-	// Noise dimensions for NoisyLinearExternal inference.
-	// Computed once during initGoMLX from hiddenSize/numPartitions.
-	noiseValueIn  int // hiddenSize / 4  (input features of value NoisyLinear)
-	noiseValueOut int // 1               (output features of value NoisyLinear)
-	noiseAdvIn    int // hiddenSize / 4  (input features of advantage NoisyLinear)
-	noiseAdvOut   int // numPartitions   (output features of advantage NoisyLinear)
+	noiseValueIn  int
+	noiseValueOut int
+	noiseAdvIn    int
+	noiseAdvOut   int
 
 	noiseBufs struct {
 		valueIn, valueOut, advIn, advOut []float64
@@ -227,7 +217,6 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 		trainEvery:     DefaultDQNTrainEvery,
 		updatesPerStep: DefaultDQNUpdatesPerStep,
 		replayBuffer:   nn.NewPrioritizedReplayBuffer(DefaultDQNReplayBufSize, 0.6),
-		fallbackP2C:    NewPowerOfTwoChoices(),
 		expCh:          make(chan nn.Transition, DefaultDQNExpChannelSize),
 		snapshotCh:     make(chan chan []nn.Transition, 1),
 	}
@@ -243,6 +232,8 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 	d.stateSize = numPartitions*5 + 4
 	d.hiddenSize = max(DefaultDQNHiddenSize, d.stateSize+64)
 	d.policyStateBuf = make([]float64, d.stateSize)
+	d.policyQBuf[0] = make([]float64, numPartitions)
+	d.policyQBuf[1] = make([]float64, numPartitions)
 	d.qResultBuf = make([]float64, numPartitions)
 	d.betaSchedule = nn.NewBetaSchedule(0.4, 1.0, DefaultDQNReplayBufSize/d.batchSize)
 	d.normalizer = nn.NewRunningNormalizer(d.stateSize)
@@ -305,7 +296,7 @@ func NewDQNBalancer(numPartitions int, opts ...DQNOption) *DQNBalancer {
 }
 
 func (d *DQNBalancer) initGoMLX() {
-	d.backend = xlaPool.New()
+	d.backend = nn.SharedBackend()
 	d.ctx = context.New()
 	d.ctx.SetParams(map[string]any{
 		optimizers.ParamOptimizer:       "adam",
@@ -314,7 +305,6 @@ func (d *DQNBalancer) initGoMLX() {
 		optimizers.ParamAdamWeightDecay: DefaultDQNWeightDecay,
 	})
 
-	// Compute noise dimensions before Phase 1 so dummy inputs are sized correctly.
 	d.noiseValueIn = d.hiddenSize / 4
 	d.noiseValueOut = dqnNumQuantiles
 	d.noiseAdvIn = d.hiddenSize / 4
@@ -325,10 +315,6 @@ func (d *DQNBalancer) initGoMLX() {
 	d.noiseBufs.advIn = make([]float64, d.noiseAdvIn)
 	d.noiseBufs.advOut = make([]float64, d.noiseAdvOut)
 
-	// Phase 1: create ALL variables using the same ExternalNoise graph that
-	// Phase 2 will Reuse(). This guarantees identical variable scopes and
-	// avoids the "variable failed to initialize" panic caused by NoisyLinear's
-	// ctx.RandomNormal creating RNG state variables absent from ExternalNoise.
 	dummyNoise := make([]float64, max(d.noiseValueIn, d.noiseValueOut, d.noiseAdvIn, d.noiseAdvOut))
 	initExec := context.MustNewExec(d.backend, d.ctx,
 		func(ctx *context.Context, state, evi, evo, eai, eao *Node) *Node {
@@ -343,9 +329,6 @@ func (d *DQNBalancer) initGoMLX() {
 	)
 	initExec.Finalize()
 
-	// Phase 2: inference exec uses a CLONED context so policyLoop can run
-	// lock-free while trainLoop modifies d.ctx. Weights are periodically
-	// synced from d.ctx → inferCtx every 25 training steps via memcpy.
 	d.inferCtx = d.cloneContext(d.ctx)
 	d.inferVarMap = make(map[string]*context.Variable)
 	d.inferCtx.EnumerateVariables(func(v *context.Variable) {
@@ -359,8 +342,6 @@ func (d *DQNBalancer) initGoMLX() {
 
 	d.targetNet = nn.NewTargetNetwork(d.ctx)
 
-	// Phase 3: training execs use full NoisyLinear (with noise via ctx.RandomNormal).
-	// All of these run sequentially in the trainLoop goroutine.
 	d.bestActionsExec = context.MustNewExec(d.backend, d.ctx.Reuse(),
 		func(ctx *context.Context, states *Node) *Node {
 			q := d.qNetworkBatch(ctx, states)
@@ -410,8 +391,6 @@ func (d *DQNBalancer) warmupStaticShapes() {
 	d.bestActionsExec.MustExec1(batchT)
 }
 
-// syncInferWeights copies trained weights from d.ctx into d.inferCtx in-place.
-// No Exec recompilation needed — shapes are identical, only tensor data changes.
 func (d *DQNBalancer) syncInferWeights() {
 	d.ctx.EnumerateVariables(func(mainVar *context.Variable) {
 		if !mainVar.Trainable {
@@ -449,9 +428,6 @@ func (d *DQNBalancer) cloneContext(src *context.Context) *context.Context {
 	return dst
 }
 
-// qNetworkBatch returns Q-values of shape [batch, numPartitions].
-// Internally uses QR-DQN: outputs [batch, K*numQuantiles] then averages
-// over quantiles to get mean Q-values.
 func (d *DQNBalancer) qNetworkBatch(ctx *context.Context, x *Node) *Node {
 	h := layers.Dense(ctx.In("feature1"), x, true, d.hiddenSize)
 	h = layers.LayerNormalization(ctx.In("ln1"), h, -1).Done()
@@ -470,16 +446,13 @@ func (d *DQNBalancer) qNetworkBatch(ctx *context.Context, x *Node) *Node {
 	aStream = activations.Relu(aStream)
 	a := nn.NoisyLinear(ctx.In("adv_out"), aStream, d.numPartitions*dqnNumQuantiles, nn.DefaultNoisySigmaInit)
 
-	// Reshape to [batch, K, Q] for dueling aggregation
 	batchSize := x.Shape().Dimensions[0]
 	aReshaped := Reshape(a, batchSize, d.numPartitions, dqnNumQuantiles)
 	vReshaped := Reshape(v, batchSize, 1, dqnNumQuantiles)
 
-	aMean := ReduceMean(aReshaped, 1) // [batch, 1, Q]
+	aMean := ReduceMean(aReshaped, 1)
 	aMean = ExpandDims(aMean, 1)
-	quantiles := Add(vReshaped, Sub(aReshaped, aMean)) // [batch, K, Q]
-
-	// Mean over quantiles → scalar Q-values [batch, K]
+	quantiles := Add(vReshaped, Sub(aReshaped, aMean))
 	return ReduceMean(quantiles, -1)
 }
 
@@ -546,7 +519,7 @@ func (d *DQNBalancer) forward(state []float64) []float64 {
 }
 
 func (d *DQNBalancer) shouldRecordExperience() bool {
-	return d.cachedProbs.Load() != nil
+	return d.cachedQ.Load() != nil
 }
 
 func (d *DQNBalancer) ensureInflight(n int) *[]atomic.Int64 {
@@ -563,35 +536,71 @@ func (d *DQNBalancer) ensureInflight(n int) *[]atomic.Int64 {
 }
 
 func (d *DQNBalancer) SelectPartition(topic string, key []byte, numPartitions int) int {
-	inf := d.ensureInflight(numPartitions)
+	depth := d.ensureLiveDepth(numPartitions)
+	q := d.cachedQ.Load()
 
-	probs := d.cachedProbs.Load()
-	if probs == nil || len(*probs) < numPartitions {
-		idx := d.fallbackP2C.SelectPartition(topic, key, numPartitions)
-		if (*inf)[idx].Add(1) == 1 {
-			d.nonEmptyInflight.Or(1 << uint(idx))
-		}
-		return idx
+	conf := 0.0
+	if steps := d.trainingSteps.Load(); steps > 0 {
+		conf = math.Min(1.0, float64(steps)/dqnBiasWarmup)
 	}
 
-	var idx int
-	if d.deterministic {
-		idx = int(d.cachedArgmax.Load())
-		if idx >= numPartitions {
-			idx = 0
-		}
-	} else {
-		idx = sampleCDF((*probs)[:numPartitions])
+	i, j := d.pick2(numPartitions)
+
+	si := float64((*depth)[i].n.Load())
+	sj := float64((*depth)[j].n.Load())
+
+	if q != nil && len(*q) >= numPartitions && conf > 0 {
+		qi := clip64((*q)[i], -dqnBiasClip, dqnBiasClip)
+		qj := clip64((*q)[j], -dqnBiasClip, dqnBiasClip)
+		si -= dqnBiasScale * conf * qi
+		sj -= dqnBiasScale * conf * qj
 	}
 
-	if (*inf)[idx].Add(1) == 1 {
-		d.nonEmptyInflight.Or(1 << uint(idx))
+	best := i
+	if sj < si {
+		best = j
 	}
-	return idx
+
+	(*depth)[best].n.Add(1)
+	return best
+}
+
+func (d *DQNBalancer) ensureLiveDepth(n int) *[]paddedInt64 {
+	dp := d.liveDepth.Load()
+	if dp != nil && len(*dp) >= n {
+		return dp
+	}
+	arr := make([]paddedInt64, n)
+	d.liveDepth.Store(&arr)
+	return &arr
+}
+
+func (d *DQNBalancer) pick2(n int) (int, int) {
+	i := rand.IntN(n)
+	j := rand.IntN(n - 1)
+	if j >= i {
+		j++
+	}
+	return i, j
+}
+
+func clip64(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func (d *DQNBalancer) OnMetrics(m broker.Metrics) {
-	d.fallbackP2C.OnMetrics(m)
+	if len(m.QueueDepth) > 0 {
+		dp := d.ensureLiveDepth(len(m.QueueDepth))
+		for i, depth := range m.QueueDepth {
+			(*dp)[i].n.Store(int64(depth))
+		}
+	}
 
 	snap := &stateSnapshot{
 		msgRate:     m.MsgRate,
@@ -650,10 +659,6 @@ func (d *DQNBalancer) DroppedExperience() int64 {
 	return d.droppedExperience.Load()
 }
 
-func (d *DQNBalancer) Temperature() float64 {
-	return currentEntropyTarget(d.experiencesSeen.Load())
-}
-
 func (d *DQNBalancer) TrainingSteps() int64 {
 	return d.trainingSteps.Load()
 }
@@ -664,15 +669,10 @@ func (d *DQNBalancer) ExperiencesSeen() int64 {
 
 func (d *DQNBalancer) OnPublishComplete(partition int) {
 	if ptr := d.inflight.Load(); ptr != nil && partition < len(*ptr) {
-		if (*ptr)[partition].Add(-1) == 0 {
-			d.nonEmptyInflight.And(^(1 << uint(partition)))
-		}
+		(*ptr)[partition].Add(-1)
 	}
 }
 
-// WaitReady blocks until XLA JIT compilation finishes (or ctx is cancelled).
-// SelectPartition falls back to P2C while XLA is initializing.
-// Returns an error if XLA initialization panicked.
 func (d *DQNBalancer) WaitReady(ctx stdctx.Context) error {
 	select {
 	case <-d.xlaReady:
@@ -685,7 +685,6 @@ func (d *DQNBalancer) WaitReady(ctx stdctx.Context) error {
 	}
 }
 
-// XLAFailed reports whether XLA initialization has failed.
 func (d *DQNBalancer) XLAFailed() bool {
 	return d.xlaFailed.Load()
 }
@@ -756,9 +755,6 @@ func (d *DQNBalancer) trainLoop(ctx stdctx.Context) {
 	}
 }
 
-// ExportReplayBuffer safely snapshots the replay buffer by delegating the read
-// to the trainLoop goroutine, which is the sole writer. This avoids a data race
-// between ToBuffer (caller goroutine) and Push (trainLoop goroutine).
 func (d *DQNBalancer) ExportReplayBuffer(ctx stdctx.Context) []nn.Transition {
 	respCh := make(chan []nn.Transition, 1)
 	select {
@@ -799,54 +795,13 @@ func (d *DQNBalancer) policyLoop(ctx stdctx.Context) {
 		case <-ticker.C:
 			d.buildStateInto(d.policyStateBuf)
 
-			// Thompson sampling: K forward passes with different noise seeds.
-			var ensemble [dqnThompsonK][]float64
-			var meanQ []float64
-			for k := range dqnThompsonK {
-				qValues := d.forward(d.policyStateBuf)
-				ensemble[k] = make([]float64, d.numPartitions)
-				copy(ensemble[k], qValues[:d.numPartitions])
-				if meanQ == nil {
-					meanQ = make([]float64, d.numPartitions)
-				}
-				for i := range d.numPartitions {
-					meanQ[i] += ensemble[k][i]
-				}
-			}
-			for i := range meanQ {
-				meanQ[i] /= dqnThompsonK
-			}
-			d.cachedQ.Store(&meanQ)
-			d.cachedQEnsemble.Store(&ensemble)
-			d.cachedArgmax.Store(int32(argmax(meanQ)))
+			qValues := d.forward(d.policyStateBuf)
 
-			// Compute routing probabilities once per tick (not per-message).
-			adjustedQ := make([]float64, d.numPartitions)
-			copy(adjustedQ, meanQ)
-			if inf := d.inflight.Load(); inf != nil {
-				mask := d.nonEmptyInflight.Load()
-				if mask != 0 {
-					var totalInflight float64
-					for bits := mask; bits != 0; bits &= bits - 1 {
-						i := bits2.TrailingZeros64(bits)
-						totalInflight += float64((*inf)[i].Load())
-					}
-					if totalInflight > 0 {
-						for bits := mask; bits != 0; bits &= bits - 1 {
-							i := bits2.TrailingZeros64(bits)
-							adjustedQ[i] -= dqnInflightCouplingBeta * float64((*inf)[i].Load()) / totalInflight
-						}
-					}
-				}
-			}
-			if snap := d.atomicState.Load(); snap != nil && len(snap.loads) >= d.numPartitions {
-				for i := range adjustedQ {
-					adjustedQ[i] -= dqnLoadCouplingBeta * snap.loads[i]
-				}
-			}
-			entTarget := currentEntropyTarget(d.experiencesSeen.Load())
-			probs := softmaxWithEntropy(adjustedQ, entTarget)
-			d.cachedProbs.Store(&probs)
+			buf := d.policyBufIdx ^ 1
+			meanQ := d.policyQBuf[buf]
+			copy(meanQ, qValues[:d.numPartitions])
+			d.cachedQ.Store(&meanQ)
+			d.cachedArgmax.Store(int32(argmax(meanQ)))
 
 			stateCopy := make([]float64, len(d.policyStateBuf))
 			copy(stateCopy, d.policyStateBuf)
@@ -857,6 +812,7 @@ func (d *DQNBalancer) policyLoop(ctx stdctx.Context) {
 
 			d.prevSnap.Store(d.currSnap.Load())
 			d.currSnap.Store(snap)
+			d.policyBufIdx = buf
 
 			if newInterval := d.policyInterval(); newInterval != lastInterval {
 				ticker.Reset(newInterval)
@@ -924,14 +880,11 @@ func (d *DQNBalancer) buildStateInto(dst []float64) {
 	d.normalizer.Observe(dst)
 }
 
-// computeReward produces a direct shaped reward signal for the DQN.
-//
-// Two orthogonal signals:
-//
-//	balance  = -CV(loads) ∈ [-1, 0]   (coefficient of variation)
-//	utility  = log1p(throughput/scale) / log1p(max/scale) ∈ [0, 1]
-//
-// Combined via pressure-weighted interpolation. No EWMA, no per-action credit.
+const (
+	dqnTailWeight = 0.2
+	dqnLatNorm    = 10_000.0 // microseconds normalizer for latency penalty
+)
+
 func (d *DQNBalancer) computeReward(m broker.Metrics) float64 {
 	if len(m.PartitionLoads) == 0 {
 		return 0
@@ -953,11 +906,14 @@ func (d *DQNBalancer) computeReward(m broker.Metrics) float64 {
 	pressure := math.Min(meanLoad/dqnOverloadThreshold, 1.0)
 	balanceW := dqnBaseBalanceWeight + (dqnMaxBalanceWeight-dqnBaseBalanceWeight)*pressure
 
-	return balanceW*balance + (1-balanceW)*utility
+	tailPenalty := 0.0
+	if m.AvgLatency > 0 {
+		tailPenalty = math.Min(m.AvgLatency/dqnLatNorm, 1.0)
+	}
+
+	return balanceW*balance + (1-balanceW)*utility - dqnTailWeight*tailPenalty
 }
 
-// ResetForNewScenario resets accumulated statistics for a clean training signal.
-// Should be called before each new scenario warmup to prevent cross-scenario pollution.
 func (d *DQNBalancer) ResetForNewScenario() {
 	d.normalizer.Reset()
 	d.nStep.Reset()
@@ -1065,8 +1021,6 @@ func (d *DQNBalancer) trainStep() float64 {
 	d.targetNet.Step()
 	d.trainExecMu.Unlock()
 
-	// Sync inference weights every 25 training steps so policyLoop
-	// observes updated weights without any locking on the hot path.
 	if d.trainingSteps.Load()%25 == 0 {
 		d.syncInferWeights()
 	}

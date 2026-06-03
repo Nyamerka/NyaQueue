@@ -13,26 +13,15 @@ type TunableParam struct {
 
 func DefaultTunableParams() []TunableParam {
 	return []TunableParam{
-		{"SegmentMaxBytes", 1 << 20, 64 << 20, 1.0},
-		{"SegmentMaxCount", 10, 500, 1.0},
-		{"FlushIntervalMs", 100, 10000, 1.0},
-		{"BatchSize", 1, 1000, 1.0},
-		{"BatchMemoryBytes", 1024, 1 << 20, 0.9},
-		{"LingerMs", 0, 100, 1.0},
 		{"NumIOGoroutines", 1, 32, 1.0},
-		{"NumNetworkGoroutines", 1, 32, 1.0},
 		{"CompressionType", 0, 3, 0.3},
 		{"MaxMessageBytes", 1024, 10 << 20, 0.7},
+		{"FetchMaxWaitMs", 10, 5000, 0.6},
+		{"FetchMinBytes", 1, 1 << 20, 0.8},
+		{"MaxFetchBytes", 1024, 10 << 20, 0.8},
 	}
 }
 
-// CalibrateWeights runs Lasso regression on pilot run data to determine which
-// parameters actually affect throughput. Params with zero Lasso weight are
-// excluded from the TD3 action space, reducing dimensionality.
-//
-// configs: matrix of pilot configurations (each row = one run, len(row) == len(params))
-// throughputs: observed throughput for each pilot config
-// alpha: L1 regularisation strength (higher => more parameters zeroed out)
 func CalibrateWeights(params []TunableParam, configs [][]float64, throughputs []float64, alpha float64) []TunableParam {
 	if len(configs) == 0 || len(configs[0]) != len(params) {
 		return params

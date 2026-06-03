@@ -7,26 +7,24 @@ import (
 	"time"
 )
 
-// Scenario defines a load pattern for benchmarking.
 type Scenario struct {
-	Name          string
-	Duration      time.Duration
-	NumPartitions int // explicit partition count; 0 = use Producers
-	Producers     int
-	Consumers     int
-	MsgSize       int           // bytes per message
-	RatePerSec    int           // target messages/second per producer
-	BurstEvery    time.Duration // inject burst at this interval (0 = no bursts)
-	BurstFactor   int           // burst multiplier
-	SkewRatio     float64       // fraction of messages using a fixed hot key (0 = uniform)
-	Priorities    [10]float64   // probability distribution over priority levels
-	Seed          int64         // RNG seed for deterministic replay; default 42
-	BatchBytes    int           // target batch size in bytes (0 = default 16KB)
-	LingerMs      int           // batch linger in ms for rate-limited producers (0 = default 1)
+	Name             string
+	Duration         time.Duration
+	NumPartitions    int // explicit partition count; 0 = use Producers
+	Producers        int
+	Consumers        int
+	MsgSize          int           // bytes per message
+	RatePerSec       int           // target messages/second per producer
+	BurstEvery       time.Duration // inject burst at this interval (0 = no bursts)
+	BurstFactor      int           // burst multiplier
+	SkewRatio        float64       // fraction of messages using a fixed hot key (0 = uniform)
+	Priorities       [10]float64   // probability distribution over priority levels
+	Seed             int64         // RNG seed for deterministic replay; default 42
+	BatchBytes       int           // target batch size in bytes (0 = default 16KB)
+	LingerMs         int           // batch linger in ms for rate-limited producers (0 = default 1)
+	ConsumerSkewRate float64       // heterogeneous consumer speed: slowest consumer relative speed [0,1]; 0 = uniform
 }
 
-// Uniform generates steady, evenly distributed load at a rate both NyaQueue
-// and Kafka can sustain — suitable for apples-to-apples latency comparison.
 func Uniform() Scenario {
 	return Scenario{
 		Name:       "uniform",
@@ -34,14 +32,13 @@ func Uniform() Scenario {
 		Producers:  4,
 		Consumers:  4,
 		MsgSize:    256,
-		RatePerSec: 1200,
+		RatePerSec: 35000,
 		Priorities: uniformPriorities(),
 		Seed:       42,
 		LingerMs:   1,
 	}
 }
 
-// Skewed sends most traffic to a single partition (tests balancer effectiveness).
 func Skewed() Scenario {
 	return Scenario{
 		Name:       "skewed",
@@ -49,7 +46,7 @@ func Skewed() Scenario {
 		Producers:  4,
 		Consumers:  4,
 		MsgSize:    256,
-		RatePerSec: 1200,
+		RatePerSec: 35000,
 		SkewRatio:  0.8,
 		Priorities: uniformPriorities(),
 		Seed:       42,
@@ -57,7 +54,6 @@ func Skewed() Scenario {
 	}
 }
 
-// Bursty injects periodic traffic spikes (tests backpressure).
 func Bursty() Scenario {
 	return Scenario{
 		Name:        "bursty",
@@ -65,46 +61,45 @@ func Bursty() Scenario {
 		Producers:   4,
 		Consumers:   4,
 		MsgSize:     256,
-		RatePerSec:  1200,
+		RatePerSec:  30000,
 		BurstEvery:  10 * time.Second,
-		BurstFactor: 5,
+		BurstFactor: 3,
 		Priorities:  uniformPriorities(),
 		Seed:        42,
 		LingerMs:    1,
 	}
 }
 
-// GrowingLoad starts slow and ramps up (tests adaptive behaviour).
 func GrowingLoad() Scenario {
 	return Scenario{
-		Name:       "growing",
-		Duration:   60 * time.Second,
-		Producers:  4,
-		Consumers:  4,
-		MsgSize:    256,
-		RatePerSec: 600,
-		Priorities: uniformPriorities(),
-		Seed:       42,
-		LingerMs:   1,
+		Name:             "growing",
+		Duration:         60 * time.Second,
+		Producers:        4,
+		Consumers:        4,
+		MsgSize:          256,
+		RatePerSec:       20000,
+		Priorities:       uniformPriorities(),
+		Seed:             42,
+		LingerMs:         1,
+		ConsumerSkewRate: 0.4,
 	}
 }
 
-// MixedPriority sends messages with a skewed priority distribution.
 func MixedPriority() Scenario {
 	return Scenario{
-		Name:       "mixed_priority",
-		Duration:   30 * time.Second,
-		Producers:  4,
-		Consumers:  4,
-		MsgSize:    256,
-		RatePerSec: 1200,
-		Priorities: [10]float64{0.30, 0.25, 0.15, 0.10, 0.08, 0.05, 0.03, 0.02, 0.01, 0.01},
-		Seed:       42,
-		LingerMs:   1,
+		Name:             "mixed_priority",
+		Duration:         30 * time.Second,
+		Producers:        4,
+		Consumers:        4,
+		MsgSize:          256,
+		RatePerSec:       35000,
+		Priorities:       [10]float64{0.30, 0.25, 0.15, 0.10, 0.08, 0.05, 0.03, 0.02, 0.01, 0.01},
+		Seed:             42,
+		LingerMs:         1,
+		ConsumerSkewRate: 0.3,
 	}
 }
 
-// Overload sends at maximum throughput with no rate limiting.
 func Overload() Scenario {
 	return Scenario{
 		Name:       "overload",
@@ -118,9 +113,6 @@ func Overload() Scenario {
 	}
 }
 
-// OverloadK32 sends at maximum throughput across 32 partitions with a skewed
-// priority distribution. Tests DQN scalability advantage at higher k — with 32
-// partitions DQN can exploit differential partition loads for significant gains.
 func OverloadK32() Scenario {
 	return Scenario{
 		Name:          "overload_k32",
@@ -135,9 +127,6 @@ func OverloadK32() Scenario {
 	}
 }
 
-// OverloadK16 sends at maximum throughput across 16 partitions with a skewed
-// priority distribution. At saturation queue depths diverge per partition,
-// giving the DQN balancer a meaningful signal to act on.
 func OverloadK16() Scenario {
 	return Scenario{
 		Name:          "overload_k16",

@@ -248,14 +248,13 @@ func (s *HTTPConfigWiringSuite) TestHTTPServerUsesTimeouts() {
 	require.NotNil(s.T(), srv.server)
 }
 
-func (s *HTTPConfigWiringSuite) TestHTTPMaxQueuedRequests() {
+func (s *HTTPConfigWiringSuite) TestHTTPMaxConnsConfigured() {
 	cfg := broker.DefaultConfig()
-	cfg.MaxQueuedRequests = 2
+	cfg.MaxConnections = 64
 	_, srv, _, cleanup := s.newWithConfig(cfg)
 	defer cleanup()
 
-	require.NotNil(s.T(), srv.reqSem)
-	require.Equal(s.T(), 2, cap(srv.reqSem))
+	require.Equal(s.T(), 64, srv.maxConns)
 }
 
 func (s *HTTPTransportSuite) TestSetBalancerRPCHTTP() {

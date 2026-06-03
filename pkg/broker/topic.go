@@ -13,7 +13,7 @@ type Topic struct {
 	closed     atomic.Bool
 }
 
-func NewTopic(name, dataDir string, cfg TopicConfig, syncPolicy SyncPolicy) (*Topic, error) {
+func NewTopic(name, dataDir string, cfg TopicConfig, syncPolicy SyncPolicy, segMaxBytes ...int) (*Topic, error) {
 	if cfg.NumPartitions <= 0 {
 		cfg.NumPartitions = 4
 	}
@@ -25,7 +25,7 @@ func NewTopic(name, dataDir string, cfg TopicConfig, syncPolicy SyncPolicy) (*To
 	}
 
 	for i := 0; i < cfg.NumPartitions; i++ {
-		p, err := NewPartition(i, name, dataDir, cfg.ScheduleMode, syncPolicy, cfg.NumPartitions)
+		p, err := NewPartition(i, name, dataDir, cfg.ScheduleMode, syncPolicy, cfg.NumPartitions, segMaxBytes...)
 		if err != nil {
 			t.Close()
 			return nil, oops.Wrapf(err, "create partition %d for topic %q", i, name)

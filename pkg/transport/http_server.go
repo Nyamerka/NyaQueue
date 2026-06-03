@@ -5,35 +5,40 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	pb "github.com/Nyamerka/NyaQueue/pkg/proto"
 	"github.com/samber/oops"
-	"golang.org/x/net/http2"
 	"golang.org/x/net/netutil"
+	"google.golang.org/protobuf/proto"
 )
+
+var bufPool = sync.Pool{New: func() any { b := make([]byte, 0, 4096); return &b }}
 
 type HTTPServer struct {
 	broker   *broker.Broker
 	server   *http.Server
 	listener net.Listener
-	reqSem   chan struct{}
+	maxConns int
 }
 
 func NewHTTPServer(b *broker.Broker) *HTTPServer {
 	cfg := b.Config()
 
-	var sem chan struct{}
-	if cfg.MaxQueuedRequests > 0 {
-		sem = make(chan struct{}, cfg.MaxQueuedRequests)
+	maxConns := cfg.MaxConnections
+	if maxConns <= 0 {
+		maxConns = 1024
 	}
 
-	s := &HTTPServer{broker: b, reqSem: sem}
+	s := &HTTPServer{broker: b, maxConns: maxConns}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /topics", s.handleCreateTopic)
@@ -63,17 +68,6 @@ func NewHTTPServer(b *broker.Broker) *HTTPServer {
 	}
 
 	var handler http.Handler = mux
-	if sem != nil {
-		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-				mux.ServeHTTP(w, r)
-			default:
-				http.Error(w, `{"error":"server overloaded"}`, http.StatusServiceUnavailable)
-			}
-		})
-	}
 
 	s.server = &http.Server{
 		Handler:           handler,
@@ -82,8 +76,10 @@ func NewHTTPServer(b *broker.Broker) *HTTPServer {
 		WriteTimeout:      writeTimeout,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
+		Protocols:         new(http.Protocols),
 	}
-	http2.ConfigureServer(s.server, &http2.Server{})
+	s.server.Protocols.SetHTTP1(true)
+	s.server.Protocols.SetUnencryptedHTTP2(true)
 	return s
 }
 
@@ -97,10 +93,7 @@ func (s *HTTPServer) Start(addr string) error {
 		return oops.Wrapf(err, "http listen %s", addr)
 	}
 
-	maxConn := s.broker.Config().MaxConnections
-	if maxConn > 0 {
-		ln = netutil.LimitListener(ln, maxConn)
-	}
+	ln = netutil.LimitListener(ln, s.maxConns)
 
 	s.listener = ln
 	go s.server.Serve(ln)
@@ -184,6 +177,11 @@ func (s *HTTPServer) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("no topics loaded"))
 		return
 	}
+	if !s.broker.IsBalancerReady() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("balancer not ready"))
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ready"))
 }
@@ -193,26 +191,91 @@ func (s *HTTPServer) handleProduce(w http.ResponseWriter, r *http.Request) {
 	cfg := s.broker.Config()
 	r.Body = http.MaxBytesReader(w, r.Body, int64(cfg.MaxMessageBytes))
 
-	var req HTTPProduceRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeHTTPError(w, http.StatusBadRequest, err)
-		return
-	}
+	ct := r.Header.Get("Content-Type")
+	usePB := ct == "application/x-protobuf" || ct == "application/protobuf"
 
-	msgs := make([]*broker.Message, len(req.Records))
-	now := time.Now().UnixNano()
-	for i, rec := range req.Records {
-		msgs[i] = &broker.Message{
-			Header: broker.MessageHeader{
-				Priority:  uint8(rec.Priority),
-				Timestamp: now,
-			},
-			Key:   rec.Key,
-			Value: rec.Value,
+	var msgs []*broker.Message
+	if usePB {
+		bufPtr := bufPool.Get().(*[]byte)
+		buf := (*bufPtr)[:0]
+		var err error
+		buf, err = io.ReadAll(io.LimitReader(r.Body, int64(cfg.MaxMessageBytes)))
+		if err != nil {
+			*bufPtr = buf
+			bufPool.Put(bufPtr)
+			writeHTTPError(w, http.StatusBadRequest, err)
+			return
+		}
+
+		var pbReq pb.ProduceRequest
+		if err := proto.Unmarshal(buf, &pbReq); err != nil {
+			*bufPtr = buf
+			bufPool.Put(bufPtr)
+			writeHTTPError(w, http.StatusBadRequest, err)
+			return
+		}
+		*bufPtr = buf
+		bufPool.Put(bufPtr)
+
+		now := time.Now().UnixNano()
+		msgs = make([]*broker.Message, len(pbReq.Messages))
+		for i, m := range pbReq.Messages {
+			msgs[i] = &broker.Message{
+				Header: broker.MessageHeader{
+					Priority:  uint8(m.Priority),
+					Timestamp: now,
+				},
+				Key:   m.Key,
+				Value: m.Value,
+			}
+		}
+	} else {
+		var req HTTPProduceRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err)
+			return
+		}
+		now := time.Now().UnixNano()
+		msgs = make([]*broker.Message, len(req.Records))
+		for i, rec := range req.Records {
+			msgs[i] = &broker.Message{
+				Header: broker.MessageHeader{
+					Priority:  uint8(rec.Priority),
+					Timestamp: now,
+				},
+				Key:   rec.Key,
+				Value: rec.Value,
+			}
 		}
 	}
 
 	batchResults := s.broker.PublishBatch(r.Context(), topic, msgs)
+
+	if usePB {
+		pbResp := &pb.ProduceResponse{
+			Results: make([]*pb.ProduceResult, len(batchResults)),
+		}
+		for i, br := range batchResults {
+			if br.Err != nil {
+				writeHTTPError(w, http.StatusInternalServerError, br.Err)
+				return
+			}
+			pbResp.Results[i] = &pb.ProduceResult{
+				Partition: int32(br.Partition),
+				Offset:    int64(br.Offset),
+			}
+		}
+		data, err := proto.Marshal(pbResp)
+		if err != nil {
+			writeHTTPError(w, http.StatusInternalServerError, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+		return
+	}
+
 	results := make([]HTTPProduceResult, len(batchResults))
 	for i, br := range batchResults {
 		if br.Err != nil {
@@ -224,7 +287,6 @@ func (s *HTTPServer) handleProduce(w http.ResponseWriter, r *http.Request) {
 			Offset:    int64(br.Offset),
 		}
 	}
-
 	writeJSON(w, http.StatusOK, HTTPProduceResponse{Results: results})
 }
 

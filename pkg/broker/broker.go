@@ -26,43 +26,30 @@ type Balancer interface {
 	OnMetrics(m Metrics)
 }
 
-// InflightTracker is optionally implemented by balancers that track
-// in-flight publishes per partition (e.g. P2C, DQN).
 type InflightTracker interface {
 	OnPublishComplete(partition int)
 }
 
-// BaseThroughputSetter is optionally implemented by balancers that support
-// reactive watchdog fallback based on throughput degradation.
 type BaseThroughputSetter interface {
 	SetBaseThroughput(t float64)
 }
 
-// ScenarioResetter is optionally implemented by balancers that accumulate
-// statistics across scenarios and need a clean slate before each new one.
 type ScenarioResetter interface {
 	ResetForNewScenario()
 }
 
-// BalancerTyper is optionally implemented by balancers to identify their type
-// for warm-restart (reusing weights across scenarios).
 type BalancerTyper interface {
 	BalancerType() string
 }
 
-// PartitionCounter is optionally implemented by partition-aware balancers.
 type PartitionCounter interface {
 	NumPartitions() int
 }
 
-// ExperienceCounter is optionally implemented by DQN-based balancers to report
-// the total number of experiences (n-step transitions) emitted so far.
 type ExperienceCounter interface {
 	ExperiencesSeen() int64
 }
 
-// ReadinessWaiter is optionally implemented by balancers that perform
-// asynchronous initialization (e.g. XLA JIT compilation).
 type ReadinessWaiter interface {
 	WaitReady(ctx context.Context) error
 }
@@ -72,9 +59,6 @@ type Scheduler interface {
 	Enqueue(msg *Message, walOffset int64)
 }
 
-// configSnapshot is an immutable snapshot published via a single atomic.Pointer.
-// All fields are consistent with each other: Publish/PublishBatch read exactly
-// one snapshot and operate on it without racing with ApplyConfig.
 type configSnapshot struct {
 	cfg   Config
 	codec Codec
@@ -158,10 +142,6 @@ func (b *Broker) SetBalancer(bal Balancer) {
 	}
 }
 
-// ReplaceBalancerSameAlgorithm checks if the new balancer is the same type and
-// compatible with the old one. If so, it resets the old balancer for a new
-// scenario (keeping learned weights) and returns true. Otherwise, it performs
-// a full replacement via SetBalancer and returns false.
 func (b *Broker) ReplaceBalancerSameAlgorithm(newBal Balancer) bool {
 	old := b.runtime.Load()
 	if old == nil || old.balancer == nil {
@@ -203,7 +183,6 @@ func (b *Broker) ResetBalancerForScenario() {
 	}
 }
 
-// Balancer returns the currently installed balancer.
 func (b *Broker) Balancer() Balancer {
 	snap := b.runtime.Load()
 	if snap != nil {
@@ -212,8 +191,6 @@ func (b *Broker) Balancer() Balancer {
 	return nil
 }
 
-// WaitBalancerReady blocks until the current balancer finishes async init.
-// Returns immediately if the balancer does not implement ReadinessWaiter.
 func (b *Broker) WaitBalancerReady(ctx context.Context) error {
 	snap := b.runtime.Load()
 	if snap != nil && snap.balancer != nil {
@@ -222,6 +199,20 @@ func (b *Broker) WaitBalancerReady(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (b *Broker) IsBalancerReady() bool {
+	snap := b.runtime.Load()
+	if snap == nil || snap.balancer == nil {
+		return true
+	}
+	w, ok := snap.balancer.(ReadinessWaiter)
+	if !ok {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	return w.WaitReady(ctx) == nil
 }
 
 func (b *Broker) BalancerExperiencesSeen() int64 {
@@ -269,7 +260,7 @@ func (b *Broker) SetBackpressure(bp *BackpressureController) {
 
 func (b *Broker) CreateTopic(name string, cfg TopicConfig) error {
 	snap := b.snap.Load()
-	t, err := NewTopic(name, b.dataDir, cfg, snap.cfg.SyncPolicy)
+	t, err := NewTopic(name, b.dataDir, cfg, snap.cfg.SyncPolicy, snap.cfg.SegmentMaxBytes)
 	if err != nil {
 		return oops.Wrapf(err, "create topic %q", name)
 	}
@@ -319,7 +310,6 @@ func (b *Broker) DeleteTopic(name string) error {
 		return oops.Wrapf(err, "close topic %q", name)
 	}
 
-	// Clean up partition-level state to prevent memory leaks in long-lived brokers.
 	for _, pid := range partIDs {
 		b.predictor.RemovePartition(pid)
 		b.metrics.RemovePartition(pid)
@@ -457,6 +447,8 @@ func (b *Broker) PublishBatch(ctx context.Context, topicName string, msgs []*Mes
 	codec := snap.codec
 	useBatchCompression := cfg.CompressionType != CompressionNone
 
+	tracker, _ := bal.(InflightTracker)
+
 	now := time.Now().UnixNano()
 	for i, msg := range msgs {
 		if cfg.MaxMessageBytes > 0 && len(msg.Key)+len(msg.Value) > cfg.MaxMessageBytes {
@@ -470,7 +462,7 @@ func (b *Broker) PublishBatch(ctx context.Context, topicName string, msgs []*Mes
 		results[i].Partition = partIdx
 
 		if bp != nil && bp.Check(partIdx) == BPClosed {
-			if tracker, ok := bal.(InflightTracker); ok {
+			if tracker != nil {
 				tracker.OnPublishComplete(partIdx)
 			}
 			results[i].Err = ErrThrottled
@@ -522,8 +514,8 @@ func (b *Broker) PublishBatch(ctx context.Context, topicName string, msgs []*Mes
 				results[item.idx].Offset = offsets[j]
 			}
 		}
-		for range batch {
-			if tracker, ok := bal.(InflightTracker); ok {
+		if tracker != nil {
+			for range batch {
 				tracker.OnPublishComplete(partIdx)
 			}
 		}
@@ -571,9 +563,6 @@ func (b *Broker) Consume(ctx context.Context, topicName, group string, partIdx i
 	return b.ConsumeFrom(ctx, topicName, group, partIdx, consumerOffset)
 }
 
-// ConsumeFrom reads a message starting from the given offset. Used by the
-// transport layer's batch-consume loop which tracks offsets locally and commits
-// once at the end of the batch, rather than after every message.
 func (b *Broker) ConsumeFrom(ctx context.Context, topicName, group string, partIdx int, offset uint64) (*Message, uint64, error) {
 	t, exists := b.topics.Load(topicName)
 	sched, _ := b.schedulers.Load(topicName)
@@ -609,7 +598,6 @@ func (b *Broker) ConsumeBatch(ctx context.Context, topicName, group string, part
 	var msgs []*Message
 	var lastOffset uint64
 
-	// Load offset once; advance locally in the loop.
 	var currentOffset uint64
 	if b.offsetStore != nil {
 		off, err := b.offsetStore.Load(group, topicName, partIdx)
@@ -646,7 +634,6 @@ func (b *Broker) ConsumeBatch(ctx context.Context, topicName, group string, part
 	return msgs, lastOffset, nil
 }
 
-// LoadOffset returns the committed offset for the given consumer group.
 func (b *Broker) LoadOffset(group, topicName string, partIdx int) (uint64, error) {
 	if b.offsetStore == nil {
 		return 1, nil
@@ -684,7 +671,6 @@ func (b *Broker) ApplyConfig(cfg Config) error {
 
 	old := b.snap.Load()
 
-	// Idempotent: if config is structurally equal, skip all re-initialization.
 	if old.cfg == cfg {
 		return nil
 	}
@@ -818,6 +804,17 @@ func (b *Broker) metricsLoop(ctx context.Context) {
 					setter.SetBaseThroughput(baseTP)
 				}
 			}
+
+			b.topics.Range(func(_ string, t *Topic) bool {
+				if t.Config().AntiStarvationTTL > 0 {
+					for _, p := range t.Partitions() {
+						if pi := p.PriorityIndex(); pi != nil {
+							pi.PromoteStale(t.Config().AntiStarvationTTL)
+						}
+					}
+				}
+				return true
+			})
 		case <-ctx.Done():
 			return
 		}
@@ -859,7 +856,6 @@ func (b *Broker) retentionLoop(ctx context.Context) {
 						}
 					}
 
-					// Commit-floor fallback: only when no time/size policy is set.
 					if cfg.RetentionMaxAge == 0 && cfg.RetentionMaxBytes == 0 && b.offsetStore != nil {
 						floor, err := b.offsetStore.CommitFloor(t.Name(), p.ID())
 						if err == nil && floor > 1 {

@@ -10,15 +10,21 @@ services:
       - "8080:8080"
     environment:
       GOGC: "200"
-      GOMEMLIMIT: "3500MiB"
+      GOMEMLIMIT: "3000MiB"
       GOMAXPROCS: "3"
       GOMLX_BACKEND: "xla:cpu"
       PJRT_PLUGIN_LIBRARY_PATH: "/opt/xla/lib/go-xla"
       OMP_NUM_THREADS: "1"
+      XLA_FLAGS: "--xla_cpu_multi_thread_eigen=false"
     volumes:
       - nyaqueue-data:/data
     cpus: "3.0"
     mem_limit: "4g"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
     sysctls:
       net.ipv4.tcp_tw_reuse: 1
       net.ipv4.tcp_fin_timeout: 30
@@ -82,7 +88,7 @@ services:
       - "--storage.tsdb.retention.time=24h"
     depends_on:
       - broker-exporter
-    cpus: "0.2"
+    cpus: "0.3"
     mem_limit: "256m"
 
   grafana:
@@ -116,14 +122,19 @@ services:
       KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
       KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
       KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
-      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
       KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
       KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_CFG_NUM_NETWORK_THREADS: "4"
+      KAFKA_CFG_NUM_IO_THREADS: "8"
+      KAFKA_CFG_SOCKET_SEND_BUFFER_BYTES: "1048576"
+      KAFKA_CFG_SOCKET_RECEIVE_BUFFER_BYTES: "1048576"
+      KAFKA_CFG_MESSAGE_MAX_BYTES: "16777216"
     volumes:
       - kafka-data:/bitnami/kafka
-    cpus: "2.0"
-    mem_limit: "2g"
+    cpus: "1.0"
+    mem_limit: "1536m"
 
   experiment:
     profiles: ["experiment"]
@@ -134,10 +145,11 @@ services:
     user: "${UID:-1000}:${GID:-1000}"
     environment:
       GOGC: "200"
-      GOMEMLIMIT: "3500MiB"
+      GOMEMLIMIT: "3000MiB"
       GOMLX_BACKEND: "xla:cpu"
       PJRT_PLUGIN_LIBRARY_PATH: "/opt/xla/lib/go-xla"
       OMP_NUM_THREADS: "1"
+      XLA_FLAGS: "--xla_cpu_multi_thread_eigen=false"
     command:
       - "--experiment.mode=inprocess,grpc,http,kafka"
       - "--experiment.scenarios=all"
@@ -148,8 +160,10 @@ services:
       - "--experiment.duration=30s"
       - "--experiment.output=/results"
     depends_on:
-      - broker
-      - kafka
+      broker:
+        condition: service_healthy
+      kafka:
+        condition: service_started
     volumes:
       - ./results:/results
     tmpfs:

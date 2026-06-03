@@ -16,19 +16,10 @@ import (
 
 var offsetsPrefix = []byte("off/")
 
-// OffsetStore tracks consumer offsets with session TTL support. Hot-path reads
-// and writes go through an in-memory cache (xsync.MapOf — cache-line hash
-// table, lock-free reads). A background goroutine periodically flushes dirty
-// entries to BadgerDB via WriteBatch for durability.
-//
-// Trade-off: when dumpInterval > 0, offsets committed between the last
-// successful flush and a crash are lost. On restart consumers will re-receive
-// messages from the last persisted offset (at-least-once semantics). This is a
-// deliberate compromise to keep fsync off the hot path; set dumpInterval to 0
-// (or use SyncEveryWrite) for stronger guarantees at the cost of throughput.
 type OffsetStore struct {
 	db         *badger.DB
 	cache      *xsync.MapOf[string, int64]
+	dirty      *xsync.MapOf[string, struct{}]
 	lastCommit *xsync.MapOf[string, time.Time]
 
 	dumpInterval time.Duration
@@ -48,10 +39,6 @@ func badgerOpts(dir string) badger.Options {
 		WithValueLogFileSize(16 << 20)
 }
 
-// NewOffsetStore opens the offset database backed by BadgerDB. When
-// dumpInterval > 0 the store runs a background goroutine that flushes the
-// in-memory cache to BadgerDB at that cadence via WriteBatch, removing the
-// fsync-per-commit overhead from the hot path.
 func NewOffsetStore(dataDir string, dumpInterval ...time.Duration) (*OffsetStore, error) {
 	dir := filepath.Join(dataDir, "offsets.badger")
 	db, err := badger.Open(badgerOpts(dir))
@@ -62,6 +49,7 @@ func NewOffsetStore(dataDir string, dumpInterval ...time.Duration) (*OffsetStore
 	s := &OffsetStore{
 		db:         db,
 		cache:      xsync.NewMapOf[string, int64](),
+		dirty:      xsync.NewMapOf[string, struct{}](),
 		lastCommit: xsync.NewMapOf[string, time.Time](),
 		stopCh:     make(chan struct{}),
 		stopped:    make(chan struct{}),
@@ -104,15 +92,13 @@ func (s *OffsetStore) bucketKey(topic string, partition int, group string) strin
 	return fmt.Sprintf("%s/%d/%s", topic, partition, group)
 }
 
-// Commit stores the offset in the in-memory cache. The value is persisted to
-// BadgerDB by the background dump goroutine (or synchronously when no dump
-// interval is configured).
 func (s *OffsetStore) Commit(group, topic string, partition int, offset int64) error {
 	key := s.bucketKey(topic, partition, group)
 	s.cache.Store(key, offset)
 	s.lastCommit.Store(key, time.Now())
 
 	if s.dumpInterval > 0 {
+		s.dirty.Store(key, struct{}{})
 		return nil
 	}
 
@@ -127,8 +113,6 @@ func (s *OffsetStore) Load(group, topic string, partition int) (int64, error) {
 	return 0, oops.Errorf("offset not found for %s/%d/%s", topic, partition, group)
 }
 
-// CommitFloor returns the minimum committed offset across all consumer groups
-// for a given topic/partition. Used for WAL truncation and PriorityIndex rebuild.
 func (s *OffsetStore) CommitFloor(topic string, partition int) (int64, error) {
 	prefix := fmt.Sprintf("%s/%d/", topic, partition)
 	minOffset := int64(math.MaxInt64)
@@ -161,6 +145,7 @@ func (s *OffsetStore) DeleteTopic(topic string) {
 	})
 	for _, k := range keys {
 		s.cache.Delete(k)
+		s.dirty.Delete(k)
 	}
 
 	wb := s.db.NewWriteBatch()
@@ -197,31 +182,38 @@ func (s *OffsetStore) dumpLoop() {
 }
 
 func (s *OffsetStore) dump() {
-	wb := s.db.NewWriteBatch()
-	count := 0
-
-	s.cache.Range(func(key string, offset int64) bool {
-		val := make([]byte, 8)
-		binary.BigEndian.PutUint64(val, uint64(offset))
-		if err := wb.Set(badgerKey(key), val); err != nil {
-			log.Printf("offset store: WriteBatch.Set failed for key %q: %v", key, err)
-		}
-		count++
+	var keys []string
+	s.dirty.Range(func(key string, _ struct{}) bool {
+		keys = append(keys, key)
 		return true
 	})
-
-	if count == 0 {
-		wb.Cancel()
+	if len(keys) == 0 {
 		return
 	}
 
+	wb := s.db.NewWriteBatch()
+	for _, k := range keys {
+		v, ok := s.cache.Load(k)
+		if !ok {
+			continue
+		}
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(v))
+		if err := wb.Set(badgerKey(k), buf[:]); err != nil {
+			log.Printf("offset store: WriteBatch.Set failed for key %q: %v", k, err)
+		}
+	}
+
 	if err := wb.Flush(); err != nil {
-		log.Printf("offset store: flush to BadgerDB failed (%d entries): %v", count, err)
+		log.Printf("offset store: flush to BadgerDB failed (%d entries): %v", len(keys), err)
+		return
+	}
+
+	for _, k := range keys {
+		s.dirty.Delete(k)
 	}
 }
 
-// ExpireSessions removes consumer group offsets that haven't been committed
-// within the given timeout, implementing ConsumerSessionTimeoutMs.
 func (s *OffsetStore) ExpireSessions(timeout time.Duration) {
 	cutoff := time.Now().Add(-timeout)
 	var expired []string

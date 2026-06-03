@@ -51,8 +51,8 @@ func (s *DQNSuite) TestOnMetricsTrains() {
 	defer dqn.Stop()
 
 	require.Eventually(s.T(), func() bool {
-		return dqn.cachedProbs.Load() != nil
-	}, 5*time.Second, 10*time.Millisecond, "wait for policyLoop to produce cachedProbs")
+		return dqn.cachedQ.Load() != nil
+	}, 5*time.Second, 10*time.Millisecond, "wait for policyLoop to produce cachedQ")
 
 	dqn.OnMetrics(broker.Metrics{
 		BusinessMetrics: broker.BusinessMetrics{Throughput: 5000, MsgRate: 5000},
@@ -135,8 +135,8 @@ func (s *DQNSuite) TestTrainStepWithEnoughData() {
 	defer dqn.Stop()
 
 	require.Eventually(s.T(), func() bool {
-		return dqn.cachedProbs.Load() != nil
-	}, 5*time.Second, 10*time.Millisecond, "wait for policyLoop to produce cachedProbs")
+		return dqn.cachedQ.Load() != nil
+	}, 5*time.Second, 10*time.Millisecond, "wait for policyLoop to produce cachedQ")
 
 	dqn.OnMetrics(broker.Metrics{
 		BusinessMetrics: broker.BusinessMetrics{Throughput: 3000, MsgRate: 3000},
@@ -251,7 +251,7 @@ func (s *DQNSuite) TestDQNBalancer_RewardStateless() {
 		"reward should be stateless — same inputs produce same output regardless of history")
 }
 
-func (s *DQNSuite) TestDQNBalancer_InflightInState() {
+func (s *DQNSuite) TestDQNBalancer_LiveDepthInState() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
@@ -259,37 +259,42 @@ func (s *DQNSuite) TestDQNBalancer_InflightInState() {
 		dqn.SelectPartition("t", nil, 4)
 	}
 
-	ptr := dqn.inflight.Load()
-	require.NotNil(s.T(), ptr, "inflight slice should be initialized after SelectPartition")
+	ptr := dqn.liveDepth.Load()
+	require.NotNil(s.T(), ptr, "liveDepth slice should be initialized after SelectPartition")
 
-	var totalInflight int64
+	var totalDepth int64
 	for i := 0; i < dqn.numPartitions && i < len(*ptr); i++ {
-		totalInflight += (*ptr)[i].Load()
+		totalDepth += (*ptr)[i].n.Load()
 	}
-	require.Greater(s.T(), totalInflight, int64(0),
-		"inflight should be reflected in state vector after SelectPartition calls")
+	require.Greater(s.T(), totalDepth, int64(0),
+		"liveDepth should be incremented after SelectPartition calls")
 }
 
-func (s *DQNSuite) TestBoltzmannRoutingPrefersBest() {
+func (s *DQNSuite) TestResidualP2CPrefersBestQ() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
 	qVals := []float64{0.1, 0.2, 10.0, 0.3}
-	dqn.experiencesSeen.Store(dqnBoltzmannAnnealingExp + 1)
-	entTarget := currentEntropyTarget(dqnBoltzmannAnnealingExp + 1)
-	probs := softmaxWithEntropy(qVals, entTarget)
-	dqn.cachedProbs.Store(&probs)
-	dqn.cachedArgmax.Store(2)
+	dqn.cachedQ.Store(&qVals)
+	dqn.trainingSteps.Store(dqnBiasWarmup + 1)
+
+	ld := dqn.ensureLiveDepth(4)
+	(*ld)[0].n.Store(0)
+	(*ld)[1].n.Store(0)
+	(*ld)[2].n.Store(0)
+	(*ld)[3].n.Store(0)
 
 	counts := map[int]int{}
-	for i := 0; i < 1000; i++ {
+	const N = 4000
+	for i := 0; i < N; i++ {
 		p := dqn.SelectPartition("t", nil, 4)
 		counts[p]++
 		dqn.OnPublishComplete(p)
+		(*ld)[p].n.Store(0)
 	}
 
-	require.Greater(s.T(), counts[2], 500,
-		"entropy-calibrated routing should prefer partition 2 (best Q)")
+	require.Greater(s.T(), counts[2], N/4,
+		"partition 2 (highest Q) should be selected more than average via P2C bias")
 }
 
 func (s *DQNSuite) TestNoFallbackUnderOverload() {
@@ -304,9 +309,9 @@ func (s *DQNSuite) TestNoFallbackUnderOverload() {
 		dqn.OnMetrics(overloadMetrics)
 	}
 
-	// Wait for policyLoop to compute cachedProbs.
+	// Wait for policyLoop to compute cachedQ.
 	require.Eventually(s.T(), func() bool {
-		return dqn.cachedProbs.Load() != nil
+		return dqn.cachedQ.Load() != nil
 	}, 5*time.Second, 10*time.Millisecond)
 
 	require.NotPanics(s.T(), func() {
@@ -322,7 +327,7 @@ func (s *DQNSuite) TestDQNBootstrapNoDeadlock() {
 	defer dqn.Stop()
 
 	require.Eventually(s.T(), func() bool {
-		return dqn.cachedProbs.Load() != nil
+		return dqn.cachedQ.Load() != nil
 	}, 5*time.Second, 10*time.Millisecond, "wait for policyLoop")
 
 	for i := 0; i < 100; i++ {
@@ -364,7 +369,7 @@ func (s *DQNSuite) TestDQNConvergenceWithoutFallback() {
 	defer dqn.Stop()
 
 	require.Eventually(s.T(), func() bool {
-		return dqn.cachedProbs.Load() != nil
+		return dqn.cachedQ.Load() != nil
 	}, 5*time.Second, 10*time.Millisecond, "wait for policyLoop")
 
 	for i := 0; i < 30; i++ {
@@ -428,7 +433,7 @@ func (s *DQNSuite) TestRawStateInReplay() {
 	dqn := NewDQNBalancer(4, WithDQNMinReplay(2), WithDQNBatchSize(2), WithDQNTrainEvery(1))
 
 	require.Eventually(s.T(), func() bool {
-		return dqn.cachedProbs.Load() != nil
+		return dqn.cachedQ.Load() != nil
 	}, 5*time.Second, 10*time.Millisecond, "wait for policyLoop")
 
 	dqn.OnMetrics(broker.Metrics{
@@ -571,7 +576,7 @@ func (s *DQNSuite) TestDQNExplorationUnderTrained() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
-	// Before the first policyLoop tick, cachedProbs is nil and
+	// Before the first policyLoop tick, cachedQ is nil and
 	// SelectPartition uses the P2C fallback which provides exploration.
 	counts := make(map[int]int)
 	const trials = 1000
@@ -586,9 +591,9 @@ func (s *DQNSuite) TestDQNExplorationUnderTrained() {
 
 	// After policyLoop ticks, probabilities are cached.
 	require.Eventually(s.T(), func() bool {
-		return dqn.cachedProbs.Load() != nil
+		return dqn.cachedQ.Load() != nil
 	}, 5*time.Second, 10*time.Millisecond,
-		"policyLoop should have set cachedProbs")
+		"policyLoop should have set cachedQ")
 }
 
 func (s *DQNSuite) TestImbalancedLoadsPenaliseReward() {
@@ -616,7 +621,7 @@ func (s *DQNSuite) TestExpChannelBlockingSend() {
 	dqn.expCh <- nn.Transition{}
 
 	probs := []float64{0.25, 0.25, 0.25, 0.25}
-	dqn.cachedProbs.Store(&probs)
+	dqn.cachedQ.Store(&probs)
 	dqn.prevSnap.Store(&policySnap{state: make([]float64, dqn.stateSize), action: 0})
 	dqn.currSnap.Store(&policySnap{state: make([]float64, dqn.stateSize), action: 1})
 
@@ -638,7 +643,7 @@ func (s *DQNSuite) TestExperienceCountTracking() {
 	require.Equal(s.T(), int64(0), dqn.ExperiencesSeen())
 
 	require.Eventually(s.T(), func() bool {
-		return dqn.cachedProbs.Load() != nil
+		return dqn.cachedQ.Load() != nil
 	}, 5*time.Second, 10*time.Millisecond, "wait for policyLoop")
 
 	dqn.OnMetrics(broker.Metrics{
@@ -736,7 +741,7 @@ func (s *DQNSuite) TestExpChannelTimeoutNotSilent() {
 	dqn.expCh <- nn.Transition{}
 
 	probs := []float64{0.25, 0.25, 0.25, 0.25}
-	dqn.cachedProbs.Store(&probs)
+	dqn.cachedQ.Store(&probs)
 	dqn.prevSnap.Store(&policySnap{state: make([]float64, dqn.stateSize), action: 0})
 	dqn.currSnap.Store(&policySnap{state: make([]float64, dqn.stateSize), action: 1})
 
@@ -801,7 +806,7 @@ func (s *DQNSuite) TestBoltzmannRoutingSpread() {
 	for i := range uniform {
 		uniform[i] = 1.0 / 8.0
 	}
-	dqn.cachedProbs.Store(&uniform)
+	dqn.cachedQ.Store(&uniform)
 
 	counts := make([]int, 8)
 	const N = 80000
@@ -823,23 +828,17 @@ func (s *DQNSuite) TestBoltzmannRoutingSpread() {
 		"with uniform probs, entropy should be near log2(K)=%.2f, got %.2f", maxEntropy, entropy)
 }
 
-func (s *DQNSuite) TestBoltzmannRoutingInflightCorrection() {
+func (s *DQNSuite) TestResidualP2CAvoidsDeepQueues() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
-	dqn.experiencesSeen.Store(dqnBoltzmannAnnealingExp + 1)
+	dqn.experiencesSeen.Store(dqnBiasWarmup + 1)
 
-	inflight := dqn.ensureInflight(4)
-	(*inflight)[0].Store(1_000_000)
-	(*inflight)[1].Store(0)
-	(*inflight)[2].Store(0)
-	(*inflight)[3].Store(0)
-	dqn.nonEmptyInflight.Store(1 << 0)
-
-	// policyLoop computes probabilities with inflight correction every tick.
-	require.Eventually(s.T(), func() bool {
-		return dqn.cachedProbs.Load() != nil
-	}, 2*time.Second, 10*time.Millisecond)
+	ld := dqn.ensureLiveDepth(4)
+	(*ld)[0].n.Store(1_000_000)
+	(*ld)[1].n.Store(0)
+	(*ld)[2].n.Store(0)
+	(*ld)[3].n.Store(0)
 
 	counts := make([]int, 4)
 	const N = 5000
@@ -850,47 +849,7 @@ func (s *DQNSuite) TestBoltzmannRoutingInflightCorrection() {
 
 	ratio := float64(counts[0]) / float64(N)
 	require.Less(s.T(), ratio, 0.10,
-		"partition 0 with 1M inflight should be selected <10%% of time, got %.2f%%", ratio*100)
-}
-
-func (s *DQNSuite) TestEntropyTargetAnnealing() {
-	earlyTarget := currentEntropyTarget(0)
-	lateTarget := currentEntropyTarget(20000)
-
-	require.InDelta(s.T(), dqnBoltzmannEntropyStart, earlyTarget, 1e-6,
-		"entropy target at start should equal EntropyStart")
-	require.InDelta(s.T(), dqnBoltzmannEntropyEnd, lateTarget, 1e-6,
-		"entropy target after 20000 experiences should equal EntropyEnd")
-	require.Greater(s.T(), earlyTarget, lateTarget,
-		"early target should be higher (more exploration) than late target")
-}
-
-func (s *DQNSuite) TestEntropyTargetCalibration() {
-	q := []float64{10.0, 0.0, 0.0, 0.0}
-
-	tau085 := solveForEntropy(q, 0.85)
-	ent085 := normalizedEntropy(q, tau085)
-	require.InDelta(s.T(), 0.85, ent085, 0.02,
-		"entropy for target=0.85 should be ~0.85, got %.4f", ent085)
-
-	tau030 := solveForEntropy(q, 0.30)
-	ent030 := normalizedEntropy(q, tau030)
-	require.InDelta(s.T(), 0.30, ent030, 0.02,
-		"entropy for target=0.30 should be ~0.30, got %.4f", ent030)
-}
-
-func (s *DQNSuite) TestEntropyCalibrationScaleInvariance() {
-	qSmall := []float64{1.0, 0.0, 0.0, 0.0}
-	qLarge := []float64{100.0, 0.0, 0.0, 0.0}
-
-	tau1 := solveForEntropy(qSmall, 0.5)
-	tau2 := solveForEntropy(qLarge, 0.5)
-
-	ent1 := normalizedEntropy(qSmall, tau1)
-	ent2 := normalizedEntropy(qLarge, tau2)
-
-	require.InDelta(s.T(), ent1, ent2, 0.01,
-		"entropy should be scale-invariant: small=%.4f, large=%.4f", ent1, ent2)
+		"partition 0 with 1M queue depth should be selected <10%% of time, got %.2f%%", ratio*100)
 }
 
 func (s *DQNSuite) TestDQNNoStateMutexNoPopArtMutex() {
@@ -919,7 +878,7 @@ func (s *DQNSuite) TestDQNConcurrentInferenceAndTrain() {
 	defer dqn.Stop()
 
 	uniform := []float64{0.25, 0.25, 0.25, 0.25}
-	dqn.cachedProbs.Store(&uniform)
+	dqn.cachedQ.Store(&uniform)
 
 	var wg sync.WaitGroup
 	var panics atomic.Int64
@@ -997,7 +956,7 @@ func (s *DQNSuite) TestSelectPartitionZeroAlloc() {
 	defer dqn.Stop()
 
 	probs := []float64{0.25, 0.25, 0.25, 0.25}
-	dqn.cachedProbs.Store(&probs)
+	dqn.cachedQ.Store(&probs)
 	dqn.ensureInflight(4)
 
 	allocs := testing.AllocsPerRun(1000, func() {
@@ -1009,25 +968,18 @@ func (s *DQNSuite) TestSelectPartitionZeroAlloc() {
 		"SelectPartition should be 0 allocs/call, got %.1f", allocs)
 }
 
-func (s *DQNSuite) TestCachedProbsUpdatedByPolicy() {
+func (s *DQNSuite) TestCachedQUpdatedByPolicy() {
 	dqn := NewDQNBalancer(4)
 	defer dqn.Stop()
 
 	require.Eventually(s.T(), func() bool {
-		return dqn.cachedProbs.Load() != nil
+		return dqn.cachedQ.Load() != nil
 	}, 3*time.Second, 10*time.Millisecond,
-		"policyLoop should compute and store cachedProbs")
+		"policyLoop should compute and store cachedQ")
 
-	probs := dqn.cachedProbs.Load()
-	require.NotNil(s.T(), probs)
-	require.Len(s.T(), *probs, dqn.numPartitions)
-
-	var sum float64
-	for _, p := range *probs {
-		require.GreaterOrEqual(s.T(), p, 0.0, "probabilities must be non-negative")
-		sum += p
-	}
-	require.InDelta(s.T(), 1.0, sum, 1e-6, "probabilities must sum to 1.0")
+	q := dqn.cachedQ.Load()
+	require.NotNil(s.T(), q)
+	require.Len(s.T(), *q, dqn.numPartitions)
 }
 
 func (s *DQNSuite) TestAsyncXLAInitDoesNotBlock() {

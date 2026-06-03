@@ -15,9 +15,6 @@ type PendingEntry struct {
 	ArrivedAt time.Time
 }
 
-// entryRing is a circular buffer of PendingEntry with optional fixed capacity.
-// When cap > 0, the buffer never grows beyond cap; pushBack evicts the oldest
-// entry once full. When cap == 0, the buffer grows dynamically.
 type entryRing struct {
 	buf  []PendingEntry
 	head int
@@ -73,7 +70,6 @@ func (r *entryRing) peekFront() (PendingEntry, bool) {
 	return r.buf[r.head], true
 }
 
-// linearize returns a contiguous copy of all entries, oldest first.
 func (r *entryRing) linearize() []PendingEntry {
 	out := make([]PendingEntry, r.size)
 	for i := range r.size {
@@ -82,8 +78,6 @@ func (r *entryRing) linearize() []PendingEntry {
 	return out
 }
 
-// resetFrom replaces ring contents. Entries exceeding cap are silently truncated
-// (keeping the newest).
 func (r *entryRing) resetFrom(entries []PendingEntry) {
 	if r.cap > 0 && len(entries) > r.cap {
 		entries = entries[len(entries)-r.cap:]
@@ -93,7 +87,6 @@ func (r *entryRing) resetFrom(entries []PendingEntry) {
 		r.buf = make([]PendingEntry, need)
 	}
 	copy(r.buf, entries)
-	// Zero out trailing slots so stale pointers don't prevent GC.
 	for i := need; i < len(r.buf); i++ {
 		r.buf[i] = PendingEntry{}
 	}
@@ -133,9 +126,6 @@ func NewPriorityIndex(opts ...PriorityIndexOption) *PriorityIndex {
 	return pi
 }
 
-// Add inserts an entry into the priority level. Returns true if the entry was
-// added to a free slot, false if the level was at capacity and the oldest entry
-// was evicted to make room.
 func (pi *PriorityIndex) Add(priority int, offset int64, arrivedAt time.Time) bool {
 	if priority < 0 {
 		priority = 0
@@ -183,17 +173,14 @@ func (pi *PriorityIndex) PopWithThreshold(threshold int) (PendingEntry, bool) {
 		return PendingEntry{}, false
 	}
 
-	// Fast path: check levels at or above threshold (preferred).
 	aboveMask := mask & (^uint64(0) << uint(threshold))
 	if aboveMask != 0 {
 		top := bits.Len64(aboveMask) - 1
 		if entry, ok := pi.popFromLevel(top); ok {
 			return entry, true
 		}
-		// Rare: bitmask was stale. Fall through to full scan.
 	}
 
-	// Below-threshold fallback: pop from the highest occupied level below threshold.
 	belowMask := mask & ((1 << uint(threshold)) - 1)
 	if belowMask != 0 {
 		top := bits.Len64(belowMask) - 1
@@ -233,6 +220,52 @@ func (pi *PriorityIndex) LevelDistribution() [MaxPriority]int {
 		dist[i] = int(pi.levels[i].count.Load())
 	}
 	return dist
+}
+
+type DeficitState struct {
+	Weight          [MaxPriority]float64
+	deficit         [MaxPriority]float64
+	tick            int64
+	topReserveEvery int64
+}
+
+func NewDeficitState(topReserveEvery int64) *DeficitState {
+	ds := &DeficitState{topReserveEvery: topReserveEvery}
+	for i := range ds.Weight {
+		ds.Weight[i] = 1.0 / float64(MaxPriority)
+	}
+	return ds
+}
+
+func (pi *PriorityIndex) PopWithBudget(ds *DeficitState) (PendingEntry, bool) {
+	mask := pi.nonEmpty.Load()
+	if mask == 0 {
+		return PendingEntry{}, false
+	}
+
+	ds.tick++
+
+	if ds.topReserveEvery > 0 && ds.tick%ds.topReserveEvery == 0 {
+		top := bits.Len64(mask) - 1
+		if e, ok := pi.popFromLevel(top); ok {
+			return e, true
+		}
+	}
+
+	for p := MaxPriority - 1; p >= 0; p-- {
+		if mask&(1<<uint(p)) == 0 {
+			continue
+		}
+		ds.deficit[p] += ds.Weight[p]
+		if ds.deficit[p] >= 1.0 {
+			if e, ok := pi.popFromLevel(p); ok {
+				ds.deficit[p] -= 1.0
+				return e, true
+			}
+		}
+	}
+
+	return pi.PopHighest()
 }
 
 func (pi *PriorityIndex) PromoteStale(ttl time.Duration) {

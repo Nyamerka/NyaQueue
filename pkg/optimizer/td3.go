@@ -14,8 +14,6 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/layers"
 	"github.com/gomlx/gomlx/pkg/ml/layers/activations"
 	"github.com/gomlx/gomlx/pkg/ml/train/optimizers"
-
-	_ "github.com/gomlx/gomlx/backends/default"
 )
 
 const (
@@ -30,14 +28,6 @@ const (
 	td3ExploreNoiseInit  = 0.1
 )
 
-// TD3 implements Twin Delayed Deep Deterministic Policy Gradient (Fujimoto 2018).
-//
-// Key improvements over DDPG:
-//   - Twin critics with min(Q1, Q2) to suppress overestimation.
-//   - Clipped Gaussian noise on target actions for smoothing.
-//   - Delayed actor updates (every td3PolicyDelay critic steps).
-//   - Gaussian exploration noise instead of OU (no temporal correlation needed
-//     for broker parameter tuning).
 type TD3 struct {
 	stateSize  int
 	actionSize int
@@ -101,7 +91,7 @@ func NewTD3(stateSize, actionSize int, lr float64, batchSize int) *TD3 {
 		targetQBuf:    make([]float64, batchSize),
 	}
 
-	d.backend = backends.MustNew()
+	d.backend = nn.SharedBackend()
 	d.mainCtx = context.New()
 	d.mainCtx.SetParams(map[string]any{
 		optimizers.ParamOptimizer:       "adam",
@@ -309,7 +299,6 @@ func (d *TD3) Train(batchSize int) {
 	statesT := tensors.FromFlatDataAndDimensions(d.statesBuf[:bs*d.stateSize], bs, d.stateSize)
 	nextStatesT := tensors.FromFlatDataAndDimensions(d.nextStatesBuf[:bs*d.stateSize], bs, d.stateSize)
 
-	// Target policy smoothing: a' = clip(actor_target(s') + clip(noise, -c, c), -1, 1)
 	nextActionsT := d.targetActorFwdExec.MustExec1(nextStatesT)
 	nextActions := tensorToFloat64(nextActionsT)
 	for i := range nextActions {
@@ -319,7 +308,6 @@ func (d *TD3) Train(batchSize int) {
 	}
 	smoothedNextActionsT := tensors.FromFlatDataAndDimensions(nextActions, bs, d.actionSize)
 
-	// Twin critics: use min(Q1_target, Q2_target)
 	nextQ1T := d.targetCritic1Exec.MustExec1(nextStatesT, smoothedNextActionsT)
 	nextQ2T := d.targetCritic2Exec.MustExec1(nextStatesT, smoothedNextActionsT)
 
@@ -333,13 +321,11 @@ func (d *TD3) Train(batchSize int) {
 	actionsT := tensors.FromFlatDataAndDimensions(d.actionsBuf[:bs*d.actionSize], bs, d.actionSize)
 	targetQT := tensors.FromFlatDataAndDimensions(d.targetQBuf[:bs], bs)
 
-	// Train both critics
 	d.critic1TrainExec.MustExec(statesT, actionsT, targetQT)
 	d.critic2TrainExec.MustExec(statesT, actionsT, targetQT)
 
 	d.criticStep++
 
-	// Delayed policy update: actor + target soft-update every td3PolicyDelay critic steps
 	if d.criticStep%td3PolicyDelay == 0 {
 		d.freezeCritic()
 		d.actorTrainExec.MustExec(statesT)
@@ -348,7 +334,6 @@ func (d *TD3) Train(batchSize int) {
 	}
 }
 
-// softUpdate blends main→target weights: tgt = (1-tau)*tgt + tau*src.
 func (d *TD3) softUpdate() {
 	for _, p := range d.varPairs {
 		srcVal := p.src.MustValue()
@@ -388,8 +373,6 @@ func (d *TD3) ensureBuffers(bs int) {
 	}
 }
 
-// freezeCritic marks all critic variables as non-trainable so that
-// the actor's UpdateGraph does not shift critic weights.
 func (d *TD3) freezeCritic() {
 	d.mainCtx.EnumerateVariables(func(v *context.Variable) {
 		scope := v.Scope()
@@ -516,6 +499,30 @@ func tensorToFloat64(t *tensors.Tensor) []float64 {
 		return []float64{float64(v)}
 	default:
 		return nil
+	}
+}
+
+func (d *TD3) Finalize() {
+	if d.actorFwdExec != nil {
+		d.actorFwdExec.Finalize()
+	}
+	if d.targetActorFwdExec != nil {
+		d.targetActorFwdExec.Finalize()
+	}
+	if d.targetCritic1Exec != nil {
+		d.targetCritic1Exec.Finalize()
+	}
+	if d.targetCritic2Exec != nil {
+		d.targetCritic2Exec.Finalize()
+	}
+	if d.critic1TrainExec != nil {
+		d.critic1TrainExec.Finalize()
+	}
+	if d.critic2TrainExec != nil {
+		d.critic2TrainExec.Finalize()
+	}
+	if d.actorTrainExec != nil {
+		d.actorTrainExec.Finalize()
 	}
 }
 

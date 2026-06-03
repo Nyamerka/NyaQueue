@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"math"
+	"net/http"
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v3"
@@ -22,7 +23,6 @@ var ErrNoMessage = errors.New("no message available")
 
 const grpcMaxFetchBytes = 1 << 20
 
-// Mode selects how the experiment communicates with the broker.
 type Mode int
 
 const (
@@ -47,7 +47,6 @@ func (m Mode) String() string {
 	}
 }
 
-// Harness abstracts the target system (NyaQueue in-process, NyaQueue gRPC, NyaQueue HTTP, or Kafka).
 type Harness struct {
 	mode         Mode
 	app          *app.BrokerApp
@@ -65,14 +64,10 @@ type Harness struct {
 	partitionCounts *xsync.MapOf[int, *xsync.Counter]
 }
 
-// SetOnReconnect registers a callback invoked after the harness
-// successfully reconnects to a broker (e.g. after OOM restart).
-// Typical usage: pass collector.Reset to discard stale latency samples.
 func (h *Harness) SetOnReconnect(fn func()) {
 	h.onReconnect = fn
 }
 
-// HarnessConfig describes how to create a harness.
 type HarnessConfig struct {
 	Mode           Mode
 	BrokerConfig   broker.Config
@@ -195,8 +190,6 @@ func (h *Harness) IsExternal() bool {
 	return h.external || h.mode == ModeKafka
 }
 
-// For in-process and local gRPC/HTTP modes, directly sets via the broker API.
-// For external modes, calls the admin RPC to switch the balancer.
 func (h *Harness) SwitchBalancer(alg AlgorithmConfig, k int) error {
 	if brk := h.Broker(); brk != nil {
 		brk.SetBalancer(alg.NewBalancer(k))
@@ -247,8 +240,6 @@ func algNameToHTTP(name string) string {
 	}
 }
 
-// BalancerExperiencesSeen returns experience count across all modes.
-// For external modes, queries the broker via the HTTP admin endpoint.
 func (h *Harness) BalancerExperiencesSeen(ctx context.Context) (int64, error) {
 	if brk := h.Broker(); brk != nil {
 		return brk.BalancerExperiencesSeen(), nil
@@ -268,29 +259,59 @@ func (h *Harness) BalancerExperiencesSeen(ctx context.Context) (int64, error) {
 	return -1, nil
 }
 
-// WaitExternalBalancerReady polls the external broker until the DQN balancer
-// reports XLA readiness (experiences_seen >= 0) or the context expires.
 func (h *Harness) WaitExternalBalancerReady(ctx context.Context) error {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
+
+	readyzOK := false
 	for {
 		select {
 		case <-ticker.C:
+			if !readyzOK {
+				if err := h.probeReadyz(ctx); err != nil {
+					continue
+				}
+				readyzOK = true
+			}
 			seen, err := h.BalancerExperiencesSeen(ctx)
 			if err != nil {
 				continue
 			}
-			if seen >= 0 {
+			if seen > 0 {
 				return nil
 			}
-			return oops.Errorf("balancer stats returned %d (XLA may have failed)", seen)
+			if seen < 0 {
+				return oops.Errorf("balancer stats returned %d (XLA may have failed)", seen)
+			}
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
 }
 
-// Broker returns the in-process broker (nil for Kafka mode).
+func (h *Harness) probeReadyz(ctx context.Context) error {
+	addr := h.httpBrokerAddr
+	if addr == "" {
+		addr = h.brokerAddr
+	}
+	if addr == "" {
+		return oops.Errorf("no broker address for readyz probe")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/readyz", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return oops.Errorf("readyz returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (h *Harness) Broker() *broker.Broker {
 	if h.app != nil {
 		return h.app.Broker()
@@ -332,7 +353,6 @@ func (h *Harness) CreateTopic(ctx context.Context, topic string, cfg broker.Topi
 	return oops.Errorf("unsupported mode")
 }
 
-// DeleteTopic removes a topic. Used between runs to ensure each experiment starts with a clean topic state.
 func (h *Harness) DeleteTopic(ctx context.Context, topic string) error {
 	switch h.mode {
 	case ModeInProcess:
@@ -357,7 +377,6 @@ func (h *Harness) DeleteTopic(ctx context.Context, topic string) error {
 	return oops.Errorf("unsupported mode")
 }
 
-// Publish sends a message. For Kafka mode, priority is ignored.
 func (h *Harness) Publish(ctx context.Context, topic string, key, value []byte, priority uint8) error {
 	switch h.mode {
 	case ModeInProcess:
@@ -559,7 +578,6 @@ func (h *Harness) ConsumeBatch(ctx context.Context, topic, group string, partiti
 	return nil, oops.Errorf("unsupported mode")
 }
 
-// MetricsSnapshot holds partition loads and pre-computed load stddev from the broker.
 type MetricsSnapshot struct {
 	PartitionLoads []float64
 	QueueDepth     []int
@@ -567,7 +585,6 @@ type MetricsSnapshot struct {
 	HasStdDev      bool
 }
 
-// GetMetricsSnapshot retrieves partition loads and load stddev from the broker.
 func (h *Harness) GetMetricsSnapshot(ctx context.Context) (*MetricsSnapshot, error) {
 	switch h.mode {
 	case ModeInProcess:
@@ -588,16 +605,14 @@ func (h *Harness) GetMetricsSnapshot(ctx context.Context) (*MetricsSnapshot, err
 		}
 		snap := &MetricsSnapshot{
 			PartitionLoads: resp.PartitionLoads,
+			LoadStdDev:     resp.LoadStddev,
+			HasStdDev:      resp.LoadStddev > 0,
 		}
 		if len(resp.QueueDepth) > 0 {
 			snap.QueueDepth = make([]int, len(resp.QueueDepth))
 			for i, d := range resp.QueueDepth {
 				snap.QueueDepth[i] = int(d)
 			}
-		}
-		if sd, ok := h.publishStdDev(); ok {
-			snap.LoadStdDev = sd
-			snap.HasStdDev = true
 		}
 		return snap, nil
 	case ModeHTTP:
@@ -607,10 +622,8 @@ func (h *Harness) GetMetricsSnapshot(ctx context.Context) (*MetricsSnapshot, err
 		}
 		snap := &MetricsSnapshot{
 			PartitionLoads: resp.PartitionLoads,
-		}
-		if sd, ok := h.publishStdDev(); ok {
-			snap.LoadStdDev = sd
-			snap.HasStdDev = true
+			LoadStdDev:     resp.LoadStdDev,
+			HasStdDev:      resp.LoadStdDev > 0,
 		}
 		return snap, nil
 	case ModeKafka:
@@ -619,7 +632,6 @@ func (h *Harness) GetMetricsSnapshot(ctx context.Context) (*MetricsSnapshot, err
 	return &MetricsSnapshot{}, nil
 }
 
-// GetPartitionLoads retrieves partition loads from the broker regardless of mode.
 func (h *Harness) GetPartitionLoads(ctx context.Context) ([]float64, error) {
 	snap, err := h.GetMetricsSnapshot(ctx)
 	if err != nil {
@@ -677,7 +689,6 @@ func (h *Harness) recordPartition(partition int) {
 	cnt.Add(1)
 }
 
-// publishStdDev computes stddev of the publish-side per-partition distribution.
 func (h *Harness) publishStdDev() (float64, bool) {
 	var counts []float64
 	h.partitionCounts.Range(func(_ int, cnt *xsync.Counter) bool {

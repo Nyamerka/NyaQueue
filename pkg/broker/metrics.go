@@ -11,7 +11,6 @@ import (
 	"gonum.org/v1/gonum/stat"
 )
 
-// BusinessMetrics holds raw counters-derived metrics.
 type BusinessMetrics struct {
 	Throughput    float64
 	ConsumeRate   float64
@@ -21,7 +20,6 @@ type BusinessMetrics struct {
 	AvgMsgSize    float64
 }
 
-// DerivedMetrics holds pre-computed analytical metrics.
 type DerivedMetrics struct {
 	PartitionLoads []float64
 	PredictedLoads []float64
@@ -29,7 +27,6 @@ type DerivedMetrics struct {
 	LoadStdDev     float64
 }
 
-// ObservabilityMetrics holds counters from internal subsystems (backpressure, balancer).
 type ObservabilityMetrics struct {
 	BackpressureClosedCount int64 `json:"bp_closed_count"`
 	BackpressureWarnCount   int64 `json:"bp_warn_count"`
@@ -38,12 +35,16 @@ type ObservabilityMetrics struct {
 	BalancerEvictions       int64 `json:"balancer_evictions,omitempty"`
 }
 
-// Metrics is the unified snapshot exposed to balancers, transport, and experiments.
 type Metrics struct {
 	BusinessMetrics
 	DerivedMetrics
 	ObservabilityMetrics
 	Timestamp time.Time
+}
+
+type partCounters struct {
+	produces []atomic.Int64
+	consumes []atomic.Int64
 }
 
 type MetricsCollector struct {
@@ -56,11 +57,10 @@ type MetricsCollector struct {
 
 	avgFlushLatencyNs atomic.Int64
 
+	counters atomic.Pointer[partCounters]
+
 	mu          xsync.RBMutex
 	lastCollect time.Time
-
-	partProduces []atomic.Int64
-	partConsumes []atomic.Int64
 
 	prevPartProduces []int64
 	prevPartConsumes []int64
@@ -94,61 +94,73 @@ func NewMetricsCollector(b *Broker) *MetricsCollector {
 		lastCollect: time.Now(),
 	}
 	mc.lastSnap.Store(&Metrics{})
+	initial := &partCounters{
+		produces: make([]atomic.Int64, 16),
+		consumes: make([]atomic.Int64, 16),
+	}
+	mc.counters.Store(initial)
 	return mc
 }
 
-func (mc *MetricsCollector) RecordProduce(topic string, partition int) {
+func (mc *MetricsCollector) getCounters(minPartitions int) *partCounters {
+	for {
+		pc := mc.counters.Load()
+		if len(pc.produces) > minPartitions {
+			return pc
+		}
+		newSize := max(len(pc.produces)*2, minPartitions+1)
+		grown := &partCounters{
+			produces: make([]atomic.Int64, newSize),
+			consumes: make([]atomic.Int64, newSize),
+		}
+		for i := range pc.produces {
+			grown.produces[i].Store(pc.produces[i].Load())
+			grown.consumes[i].Store(pc.consumes[i].Load())
+		}
+		if mc.counters.CompareAndSwap(pc, grown) {
+			return grown
+		}
+	}
+}
+
+func (mc *MetricsCollector) RecordProduce(_ string, partition int) {
 	mc.produceCount.Add(1)
-	mc.mu.Lock()
-	mc.ensurePartCountersLocked(partition + 1)
-	mc.partProduces[partition].Add(1)
-	mc.mu.Unlock()
-	mc.RecordProduceLabeled(topic, partition)
+	pc := mc.getCounters(partition)
+	pc.produces[partition].Add(1)
 }
 
 func (mc *MetricsCollector) RecordProduceWithSize(_ string, partition int, msgBytes int) {
 	mc.produceCount.Add(1)
 	mc.produceBytes.Add(int64(msgBytes))
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	mc.ensurePartCountersLocked(partition + 1)
-	mc.partProduces[partition].Add(1)
+	pc := mc.getCounters(partition)
+	pc.produces[partition].Add(1)
 }
 
 func (mc *MetricsCollector) RecordProduceBatch(_ string, partition int, n int) {
 	mc.produceCount.Add(int64(n))
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	mc.ensurePartCountersLocked(partition + 1)
-	mc.partProduces[partition].Add(int64(n))
+	pc := mc.getCounters(partition)
+	pc.produces[partition].Add(int64(n))
 }
 
-func (mc *MetricsCollector) RecordConsume(topic string, partition int, group string) {
+func (mc *MetricsCollector) RecordConsume(_ string, partition int, _ string) {
 	mc.consumeCount.Add(1)
+	pc := mc.getCounters(partition)
+	pc.consumes[partition].Add(1)
+}
+
+func (mc *MetricsCollector) savePrevCounters() {
+	pc := mc.counters.Load()
+	n := len(pc.produces)
 	mc.mu.Lock()
-	mc.ensurePartCountersLocked(partition + 1)
-	mc.partConsumes[partition].Add(1)
-	mc.mu.Unlock()
-	mc.RecordConsumeLabeled(topic, partition, group)
-}
-
-func (mc *MetricsCollector) ensurePartCountersLocked(minLen int) {
-	for len(mc.partProduces) < minLen {
-		mc.partProduces = append(mc.partProduces, atomic.Int64{})
-		mc.partConsumes = append(mc.partConsumes, atomic.Int64{})
-	}
-}
-
-func (mc *MetricsCollector) savePrevCountersLocked() {
-	n := len(mc.partProduces)
 	if len(mc.prevPartProduces) < n {
 		mc.prevPartProduces = make([]int64, n)
 		mc.prevPartConsumes = make([]int64, n)
 	}
 	for i := 0; i < n; i++ {
-		mc.prevPartProduces[i] = mc.partProduces[i].Load()
-		mc.prevPartConsumes[i] = mc.partConsumes[i].Load()
+		mc.prevPartProduces[i] = pc.produces[i].Load()
+		mc.prevPartConsumes[i] = pc.consumes[i].Load()
 	}
+	mc.mu.Unlock()
 }
 
 func (mc *MetricsCollector) Collect() Metrics {
@@ -159,6 +171,9 @@ func (mc *MetricsCollector) Collect() Metrics {
 		elapsed = 0.001
 	}
 	mc.lastCollect = now
+
+	prevProdSnap := append([]int64(nil), mc.prevPartProduces...)
+	prevConsSnap := append([]int64(nil), mc.prevPartConsumes...)
 	mc.mu.Unlock()
 
 	produced := mc.produceCount.Swap(0)
@@ -174,23 +189,22 @@ func (mc *MetricsCollector) Collect() Metrics {
 
 	var loads []float64
 	var depths []int
+	pc := mc.counters.Load()
 	for _, t := range topics {
 		for _, p := range t.Partitions() {
 			pID := p.ID()
 
-			mc.mu.Lock()
 			var produces, consumes int64
-			if pID < len(mc.partProduces) {
-				produces = mc.partProduces[pID].Load()
-				consumes = mc.partConsumes[pID].Load()
+			if pID < len(pc.produces) {
+				produces = pc.produces[pID].Load()
+				consumes = pc.consumes[pID].Load()
 			}
 
 			var prevProd, prevCons int64
-			if pID < len(mc.prevPartProduces) {
-				prevProd = mc.prevPartProduces[pID]
-				prevCons = mc.prevPartConsumes[pID]
+			if pID < len(prevProdSnap) {
+				prevProd = prevProdSnap[pID]
+				prevCons = prevConsSnap[pID]
 			}
-			mc.mu.Unlock()
 
 			pending := produces - consumes
 			if pending < 0 {
@@ -212,9 +226,7 @@ func (mc *MetricsCollector) Collect() Metrics {
 		}
 	}
 
-	mc.mu.Lock()
-	mc.savePrevCountersLocked()
-	mc.mu.Unlock()
+	mc.savePrevCounters()
 
 	deliveryRatio := 1.0
 	if produced > 0 {
@@ -309,8 +321,6 @@ func (mc *MetricsCollector) RetentionDeletedSegments() int64 {
 	return mc.retentionDeletedSegments.Load()
 }
 
-// RegisterPrometheus registers labeled Prometheus metrics with the given registry.
-// Safe to call once; subsequent calls are no-ops.
 func (mc *MetricsCollector) RegisterPrometheus(reg prometheus.Registerer) {
 	if mc.promRegistered {
 		return
@@ -411,15 +421,23 @@ func (mc *MetricsCollector) updatePrometheus(snap Metrics) {
 		return true
 	})
 
+	pc := mc.counters.Load()
 	partIdx := 0
 	for _, t := range promTopics {
 		for _, p := range t.Partitions() {
-			pStr := strconv.Itoa(p.ID())
+			pID := p.ID()
+			pStr := strconv.Itoa(pID)
 			if partIdx < len(snap.PartitionLoads) {
 				mc.promLoad.WithLabelValues(t.Name(), pStr).Set(snap.PartitionLoads[partIdx])
 			}
 			if partIdx < len(snap.QueueDepth) {
 				mc.promDepth.WithLabelValues(t.Name(), pStr).Set(float64(snap.QueueDepth[partIdx]))
+			}
+			if mc.promProduce != nil && pID < len(pc.produces) {
+				mc.promProduce.WithLabelValues(t.Name(), pStr).Add(float64(pc.produces[pID].Load()))
+			}
+			if mc.promConsume != nil && pID < len(pc.consumes) {
+				mc.promConsume.WithLabelValues(t.Name(), pStr, "").Add(float64(pc.consumes[pID].Load()))
 			}
 			partIdx++
 		}
@@ -431,11 +449,12 @@ func (mc *MetricsCollector) updatePrometheus(snap Metrics) {
 }
 
 func (mc *MetricsCollector) RemovePartition(partID int) {
-	mc.mu.Lock()
-	if partID < len(mc.partProduces) {
-		mc.partProduces[partID].Store(0)
-		mc.partConsumes[partID].Store(0)
+	pc := mc.counters.Load()
+	if partID < len(pc.produces) {
+		pc.produces[partID].Store(0)
+		pc.consumes[partID].Store(0)
 	}
+	mc.mu.Lock()
 	if partID < len(mc.prevPartProduces) {
 		mc.prevPartProduces[partID] = 0
 		mc.prevPartConsumes[partID] = 0

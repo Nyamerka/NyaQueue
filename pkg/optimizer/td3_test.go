@@ -346,56 +346,18 @@ func (s *TD3Suite) TestConcurrentActAndTrain() {
 	wg.Wait()
 }
 
-func (s *TD3Suite) TestOptimizer_EmergencyRollback() {
-	opt := &Optimizer{
-		minApplyInterval: DefaultMinApplyInterval,
-	}
+func (s *TD3Suite) TestOptimizer_ResidualActionBounded() {
+	b := setupMinimalBroker(s.T())
+	defer b.Stop()
 
-	healthy := &broker.Metrics{
-		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.9, MsgRate: 100},
-	}
-	opt.checkEmergencyRollback(healthy)
-	require.Equal(s.T(), 0, opt.lowDeliveryTicksInARow)
-	require.Equal(s.T(), 0, opt.cooldownTicksLeft)
+	params := []TunableParam{{Name: "NumIOGoroutines", Min: 1, Max: 32, Weight: 1.0}}
+	opt := NewOptimizer(b, params, DefaultOptimizerConfig())
 
-	bad := &broker.Metrics{
-		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.3, MsgRate: 100},
-	}
-
-	// Need DefaultEmergencyRollbackN (5) consecutive bad ticks to trigger rollback.
-	for i := 1; i < DefaultEmergencyRollbackN; i++ {
-		opt.checkEmergencyRollback(bad)
-		require.Equal(s.T(), i, opt.lowDeliveryTicksInARow)
-		require.Equal(s.T(), 0, opt.cooldownTicksLeft, "should not trigger before N bad ticks")
-	}
-
-	opt.checkEmergencyRollback(bad)
-	require.Equal(s.T(), DefaultEmergencyRollbackCooldown, opt.cooldownTicksLeft,
-		"N consecutive bad ticks should trigger cooldown")
-	require.Equal(s.T(), 0, opt.lowDeliveryTicksInARow, "counter resets after triggering")
-
-	opt.checkEmergencyRollback(bad)
-	require.Equal(s.T(), DefaultEmergencyRollbackCooldown, opt.cooldownTicksLeft,
-		"during cooldown, no further checks should run")
-}
-
-func (s *TD3Suite) TestOptimizer_EmergencyRollback_Recovery() {
-	opt := &Optimizer{
-		minApplyInterval: DefaultMinApplyInterval,
-	}
-
-	bad := &broker.Metrics{
-		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.3, MsgRate: 100},
-	}
-	opt.checkEmergencyRollback(bad)
-	require.Equal(s.T(), 1, opt.lowDeliveryTicksInARow)
-
-	healthy := &broker.Metrics{
-		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.9, MsgRate: 100},
-	}
-	opt.checkEmergencyRollback(healthy)
-	require.Equal(s.T(), 0, opt.lowDeliveryTicksInARow, "good tick should reset counter")
-	require.Equal(s.T(), 0, opt.cooldownTicksLeft)
+	opt.applyAction([]float64{10.0})
+	require.LessOrEqual(s.T(), opt.currentVals[0], 0.95,
+		"action should be clipped to safe range")
+	require.GreaterOrEqual(s.T(), opt.currentVals[0], 0.05,
+		"action should be clipped to safe range")
 }
 
 func flattenTensorValue(v interface{}) []float64 {
@@ -413,114 +375,48 @@ func flattenTensorValue(v interface{}) []float64 {
 	}
 }
 
-func (s *TD3Suite) TestTD3NoRollbackDuringWarmup() {
-	opt := &Optimizer{
-		warmup:           DefaultOptimizerWarmupTicks,
-		minApplyInterval: DefaultMinApplyInterval,
-	}
+func (s *TD3Suite) TestOptimizer_SafeByConstruction() {
+	b := setupMinimalBroker(s.T())
+	defer b.Stop()
 
-	bad := &broker.Metrics{
-		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.0, MsgRate: 200},
-	}
-
-	for i := 0; i < DefaultOptimizerWarmupTicks; i++ {
-		opt.ticks++
-		if opt.ticks > opt.warmup {
-			opt.checkEmergencyRollback(bad)
-		}
-	}
-
-	require.Equal(s.T(), 0, opt.cooldownTicksLeft,
-		"no rollback should trigger during warmup period")
-	require.Equal(s.T(), 0, opt.lowDeliveryTicksInARow,
-		"lowDeliveryTicksInARow should stay 0 during warmup")
-}
-
-func (s *TD3Suite) TestTD3RollbackAfterWarmup() {
-	opt := &Optimizer{
-		warmup:           DefaultOptimizerWarmupTicks,
-		minApplyInterval: DefaultMinApplyInterval,
-	}
-	opt.ticks = DefaultOptimizerWarmupTicks
-
-	bad := &broker.Metrics{
-		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.0, MsgRate: 200},
-	}
-
-	// Need DefaultEmergencyRollbackN consecutive bad ticks after warmup to trigger.
-	for i := 1; i < DefaultEmergencyRollbackN; i++ {
-		opt.ticks++
-		if opt.ticks > opt.warmup {
-			opt.checkEmergencyRollback(bad)
-		}
-		require.Equal(s.T(), i, opt.lowDeliveryTicksInARow)
-		require.Equal(s.T(), 0, opt.cooldownTicksLeft)
-	}
-
-	opt.ticks++
-	if opt.ticks > opt.warmup {
-		opt.checkEmergencyRollback(bad)
-	}
-	require.Equal(s.T(), DefaultEmergencyRollbackCooldown, opt.cooldownTicksLeft,
-		"N consecutive bad ticks after warmup should trigger rollback")
-}
-
-func (s *TD3Suite) TestEmergencyRollbackIgnoresLowMsgRate() {
-	opt := &Optimizer{
-		minApplyInterval: DefaultMinApplyInterval,
-	}
-	opt.ticks = 100
-	opt.warmup = 0
-
-	lowRate := &broker.Metrics{
-		BusinessMetrics: broker.BusinessMetrics{DeliveryRatio: 0.0, MsgRate: 50},
-	}
-
-	opt.checkEmergencyRollback(lowRate)
-	opt.checkEmergencyRollback(lowRate)
-	require.Equal(s.T(), 0, opt.cooldownTicksLeft,
-		"rollback should not trigger when MsgRate < DefaultEmergencyMinMsgRate")
-}
-
-func (s *TD3Suite) TestTD3RewardNormalization() {
-	opt := &Optimizer{}
+	params := []TunableParam{{Name: "NumIOGoroutines", Min: 1, Max: 32, Weight: 1.0}}
+	opt := NewOptimizer(b, params, DefaultOptimizerConfig())
 
 	for i := 0; i < 100; i++ {
-		tp := 30000 + float64(i)*500
-		m := &broker.Metrics{
-			BusinessMetrics: broker.BusinessMetrics{
-				Throughput:    tp,
-				MsgRate:       tp,
-				DeliveryRatio: 0.99,
-				AvgLatency:    float64(i) * 0.5,
-			},
-			DerivedMetrics: broker.DerivedMetrics{
-				QueueDepth: []int{i * 10, i * 5},
-			},
-		}
-		opt.computeReward(m)
+		opt.applyAction([]float64{float64(i-50) / 10.0})
+		require.GreaterOrEqual(s.T(), opt.currentVals[0], 0.05)
+		require.LessOrEqual(s.T(), opt.currentVals[0], 0.95)
 	}
+}
 
-	require.Greater(s.T(), opt.rewardCount, int64(50))
+func (s *TD3Suite) TestTD3RewardBounded() {
+	opt := &Optimizer{}
 
-	sigma := math.Sqrt(opt.rewardM2/float64(opt.rewardCount-1)) + 1e-8
-	require.Greater(s.T(), sigma, 0.001,
-		"reward sigma should be positive after varied observations")
-
-	m := &broker.Metrics{
+	highTP := &broker.Metrics{
 		BusinessMetrics: broker.BusinessMetrics{
-			Throughput:    50000,
-			MsgRate:       50000,
+			Throughput:    100000,
+			MsgRate:       100000,
 			DeliveryRatio: 0.99,
-			AvgLatency:    25,
-		},
-		DerivedMetrics: broker.DerivedMetrics{
-			QueueDepth: []int{500, 250},
+			AvgLatency:    1,
 		},
 	}
-	normalized := opt.computeReward(m)
-	require.Less(s.T(), math.Abs(normalized), 10.0,
-		"normalized reward should be bounded near zero")
+	r1 := opt.computeReward(highTP)
+	require.GreaterOrEqual(s.T(), r1, -1.0)
+	require.LessOrEqual(s.T(), r1, 1.0)
+
+	lowTP := &broker.Metrics{
+		BusinessMetrics: broker.BusinessMetrics{
+			Throughput:    100,
+			MsgRate:       100,
+			DeliveryRatio: 0.99,
+			AvgLatency:    500,
+		},
+	}
+	r2 := opt.computeReward(lowTP)
+	require.GreaterOrEqual(s.T(), r2, -1.0)
+	require.LessOrEqual(s.T(), r2, 1.0)
+	require.Less(s.T(), r2, r1,
+		"low throughput + high latency should give lower reward than high throughput + low latency")
 }
 
 func (s *TD3Suite) TestTD3StateNormalized() {

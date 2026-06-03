@@ -17,8 +17,11 @@ const (
 	walRedirectMagic byte = 0xFF
 )
 
-func walOptions(sp SyncPolicy) *wal.Options {
+func walOptions(sp SyncPolicy, segMaxBytes int) *wal.Options {
 	opts := *wal.DefaultOptions
+	if segMaxBytes > 0 {
+		opts.SegmentSize = segMaxBytes
+	}
 	switch sp {
 	case SyncNone, SyncInterval:
 		opts.NoSync = true
@@ -42,9 +45,13 @@ func (p *Partition) SetBatchCodec(c Codec) {
 	p.batchCodec = c
 }
 
-func NewPartition(id int, topicName, dataDir string, mode ScheduleMode, syncPolicy SyncPolicy, numPartitions int) (*Partition, error) {
+func NewPartition(id int, topicName, dataDir string, mode ScheduleMode, syncPolicy SyncPolicy, numPartitions int, segMaxBytes ...int) (*Partition, error) {
 	dir := filepath.Join(dataDir, topicName, fmt.Sprintf("partition-%d", id))
-	log, err := wal.Open(dir, walOptions(syncPolicy))
+	var smb int
+	if len(segMaxBytes) > 0 {
+		smb = segMaxBytes[0]
+	}
+	log, err := wal.Open(dir, walOptions(syncPolicy, smb))
 	if err != nil {
 		return nil, oops.Wrapf(err, "open WAL partition %d", id)
 	}
@@ -76,22 +83,36 @@ func NewPartition(id int, topicName, dataDir string, mode ScheduleMode, syncPoli
 
 func (p *Partition) ID() int { return p.id }
 
-// Append writes a single message to the WAL and returns its offset.
 func (p *Partition) Append(msg *Message) (uint64, error) {
-	offsets, err := p.AppendBatch([]*Message{msg})
+	msg.Header.AppendTime = time.Now().UnixNano()
+	buf := msg.MarshalPooled()
+
+	p.mu.Lock()
+	offset := p.nextOffset
+	start := time.Now()
+	err := p.log.Write(offset, buf)
+	p.lastFlushNs.Store(int64(time.Since(start)))
+	p.nextOffset++
+	pi := p.priorityIndex
+	p.mu.Unlock()
+
+	ReleaseMarshalBuf(buf)
+
 	if err != nil {
-		return 0, oops.Wrapf(err, "append to partition %d", p.id)
+		return 0, oops.Wrapf(err, "WAL write partition %d", p.id)
 	}
-	return offsets[0], nil
+
+	if pi != nil {
+		pi.Add(int(msg.Header.Priority), int64(offset), time.Now())
+	}
+
+	return offset, nil
 }
 
 func (p *Partition) LastFlushLatency() time.Duration {
 	return time.Duration(p.lastFlushNs.Load())
 }
 
-// AppendBatch writes a slice of messages to the WAL in a single WriteBatch
-// call, removing per-message fsync overhead. Returns the offsets assigned to
-// each message.
 func (p *Partition) AppendBatch(msgs []*Message) ([]uint64, error) {
 	if len(msgs) == 0 {
 		return nil, nil
@@ -139,9 +160,6 @@ func (p *Partition) AppendBatch(msgs []*Message) ([]uint64, error) {
 	return offsets, nil
 }
 
-// AppendBatchCompressed serializes all messages, compresses as a single blob,
-// and stores in WAL. The first offset gets the full compressed batch; subsequent
-// offsets get small redirect records pointing back to the batch leader.
 func (p *Partition) AppendBatchCompressed(msgs []*Message, codec Codec) ([]uint64, error) {
 	if len(msgs) == 0 {
 		return nil, nil
@@ -256,11 +274,6 @@ func (p *Partition) readFromBatch(batchOffset uint64, index int) (*Message, erro
 	return p.readFromBatchData(data, index)
 }
 
-// readFromBatchData extracts a message from a batch WAL record.
-// The data format: [0xBA][count:4][compressed payload...]
-// The compressed payload, when decompressed, is: [len0:4][msg0...][len1:4][msg1...]...
-// NOTE: The decompression codec is not stored in the record; the broker must
-// call SetBatchCodec before using batch-compressed partitions.
 func (p *Partition) readFromBatchData(data []byte, index int) (*Message, error) {
 	if len(data) < 5 || data[0] != walBatchMagic {
 		return nil, oops.Errorf("not a batch record")
@@ -319,7 +332,6 @@ func (p *Partition) PriorityIndex() *PriorityIndex {
 	return p.priorityIndex
 }
 
-// QueueDepth returns the number of undelivered messages (used by metrics).
 func (p *Partition) QueueDepth() int {
 	if p.priorityIndex != nil {
 		return p.priorityIndex.Len()
@@ -327,8 +339,6 @@ func (p *Partition) QueueDepth() int {
 	return 0
 }
 
-// Rebuild walks the WAL from startOffset to HighWaterMark and re-populates the PriorityIndex.
-// Used at startup for partitions with priority scheduling.
 func (p *Partition) Rebuild(startOffset uint64, isCommitted func(offset uint64) bool) error {
 	if p.priorityIndex == nil {
 		return nil
@@ -370,9 +380,6 @@ func (p *Partition) TruncateFront(offset uint64) error {
 	return p.log.TruncateFront(offset)
 }
 
-// TruncateBefore removes WAL segments whose entries are all older than cutoff.
-// Scans from firstIndex forward until finding an entry newer than cutoff,
-// then truncates everything before that offset.
 func (p *Partition) TruncateBefore(cutoff time.Time) (deletedSegments int, deletedBytes int64, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -410,8 +417,6 @@ func (p *Partition) TruncateBefore(cutoff time.Time) (deletedSegments int, delet
 	return deletedSegments, deletedBytes, nil
 }
 
-// TruncateOldestUntilSize removes oldest WAL entries until the total remaining
-// is at most maxBytes. Returns the number of entries and bytes removed.
 func (p *Partition) TruncateOldestUntilSize(maxBytes int64) (deletedEntries int, deletedBytes int64, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

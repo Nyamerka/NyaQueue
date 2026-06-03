@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/samber/oops"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/Nyamerka/NyaQueue/pkg/broker"
+	pb "github.com/Nyamerka/NyaQueue/pkg/proto"
 )
 
 type HTTPClient struct {
@@ -28,7 +30,10 @@ func NewHTTPClient(addr string) *HTTPClient {
 		MaxIdleConnsPerHost: 256,
 		IdleConnTimeout:     90 * time.Second,
 		MaxConnsPerHost:     0,
+		Protocols:           new(http.Protocols),
 	}
+	transport.Protocols.SetHTTP1(true)
+	transport.Protocols.SetUnencryptedHTTP2(true)
 	return &HTTPClient{
 		base: "http://" + addr,
 		client: &http.Client{
@@ -88,9 +93,21 @@ func (c *HTTPClient) Produce(ctx context.Context, topic string, key, value []byt
 }
 
 func (c *HTTPClient) ProduceBatch(ctx context.Context, topic string, records []HTTPProduceRecord) ([]HTTPProduceResult, error) {
-	body, err := json.Marshal(HTTPProduceRequest{Records: records})
+	pbReq := &pb.ProduceRequest{
+		Topic:    topic,
+		Messages: make([]*pb.ProduceMessage, len(records)),
+	}
+	for i, r := range records {
+		pbReq.Messages[i] = &pb.ProduceMessage{
+			Key:      r.Key,
+			Value:    r.Value,
+			Priority: r.Priority,
+		}
+	}
+
+	body, err := proto.Marshal(pbReq)
 	if err != nil {
-		return nil, oops.Wrapf(err, "marshal")
+		return nil, oops.Wrapf(err, "marshal protobuf")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -99,7 +116,7 @@ func (c *HTTPClient) ProduceBatch(ctx context.Context, topic string, records []H
 	if err != nil {
 		return nil, oops.Wrapf(err, "new request")
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", "application/x-protobuf")
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -111,11 +128,24 @@ func (c *HTTPClient) ProduceBatch(ctx context.Context, topic string, records []H
 		return nil, readHTTPError(resp)
 	}
 
-	var result HTTPProduceResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, oops.Wrapf(err, "decode response")
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, oops.Wrapf(err, "read response")
 	}
-	return result.Results, nil
+
+	var pbResp pb.ProduceResponse
+	if err := proto.Unmarshal(respBody, &pbResp); err != nil {
+		return nil, oops.Wrapf(err, "unmarshal protobuf response")
+	}
+
+	results := make([]HTTPProduceResult, len(pbResp.Results))
+	for i, r := range pbResp.Results {
+		results[i] = HTTPProduceResult{
+			Partition: int(r.Partition),
+			Offset:    r.Offset,
+		}
+	}
+	return results, nil
 }
 
 func (c *HTTPClient) Consume(ctx context.Context, topic, group string, partition int32, maxBytes int32) ([]HTTPMessageEnvelope, error) {

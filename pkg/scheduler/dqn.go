@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,8 +23,6 @@ import (
 	"github.com/gomlx/gomlx/pkg/ml/train/optimizers"
 	"github.com/samber/oops"
 	"golang.org/x/sync/errgroup"
-
-	_ "github.com/gomlx/gomlx/backends/default"
 )
 
 type schedPolicySnap struct {
@@ -61,10 +60,13 @@ type DQNScheduler struct {
 	eg     *errgroup.Group
 	cancel stdctx.CancelFunc
 
-	lastPI atomic.Pointer[broker.PriorityIndex]
+	lastPI       atomic.Pointer[broker.PriorityIndex]
+	deficitMu    sync.Mutex
+	deficitState *broker.DeficitState
 
 	cachedThreshold      atomic.Int32
 	cachedThresholdProbs atomic.Pointer[[]float64]
+	cachedWeights        atomic.Pointer[[broker.MaxPriority]float64]
 
 	prevSnap atomic.Pointer[schedPolicySnap]
 	currSnap atomic.Pointer[schedPolicySnap]
@@ -116,6 +118,7 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 		trainEvery:   DefaultDQNSchedTrainEvery,
 		replayBuffer: nn.NewPrioritizedReplayBuffer(DefaultDQNSchedReplayBufSize, 0.6),
 		expCh:        make(chan nn.Transition, DefaultDQNSchedExpChSize),
+		deficitState: broker.NewDeficitState(4),
 	}
 
 	for _, opt := range opts {
@@ -154,7 +157,7 @@ func NewDQNScheduler(opts ...DQNSchedOption) *DQNScheduler {
 }
 
 func (d *DQNScheduler) initGoMLX() {
-	d.backend = backends.MustNew()
+	d.backend = nn.SharedBackend()
 	d.ctx = context.New()
 	d.ctx.SetParams(map[string]any{
 		optimizers.ParamOptimizer:       "adam",
@@ -294,12 +297,12 @@ func (d *DQNScheduler) Next(partition *broker.Partition, consumerOffset uint64) 
 
 	d.lastPI.Store(pi)
 
-	threshold := int(d.cachedThreshold.Load())
-	if probs := d.cachedThresholdProbs.Load(); probs != nil && len(*probs) > 0 {
-		threshold = sampleCDFSched(*probs)
+	d.deficitMu.Lock()
+	if w := d.cachedWeights.Load(); w != nil {
+		d.deficitState.Weight = *w
 	}
-
-	entry, ok := pi.PopWithThreshold(threshold)
+	entry, ok := pi.PopWithBudget(d.deficitState)
+	d.deficitMu.Unlock()
 	if !ok {
 		return nil, consumerOffset, broker.ErrNoMessages
 	}
@@ -448,6 +451,24 @@ func (d *DQNScheduler) policyLoop(ctx stdctx.Context) {
 			tau := currentTemperatureSched(d.experiencesSeen.Load())
 			probs := softmaxFromQSched(q, tau)
 			d.cachedThresholdProbs.Store(&probs)
+
+			var weights [broker.MaxPriority]float64
+			n := min(len(probs), broker.MaxPriority)
+			var wSum float64
+			for i := 0; i < n; i++ {
+				weights[i] = probs[i]
+				wSum += probs[i]
+			}
+			if wSum > 0 {
+				for i := range weights {
+					weights[i] /= wSum
+				}
+			} else {
+				for i := range weights {
+					weights[i] = 1.0 / float64(broker.MaxPriority)
+				}
+			}
+			d.cachedWeights.Store(&weights)
 
 			snap := &schedPolicySnap{
 				state:     state,
@@ -677,18 +698,6 @@ func softmaxFromQSched(q []float64, tau float64) []float64 {
 		}
 	}
 	return probs
-}
-
-func sampleCDFSched(probs []float64) int {
-	r := rand.Float64()
-	var cumulative float64
-	for i, p := range probs {
-		cumulative += p
-		if r < cumulative {
-			return i
-		}
-	}
-	return len(probs) - 1
 }
 
 func tensorToFloat64Sched(t *tensors.Tensor) []float64 {

@@ -42,7 +42,6 @@ func expTopicName(scenario, alg string, mode Mode) string {
 	return fmt.Sprintf("exp-%s-%s-%s", scenario, alg, mode)
 }
 
-// Runner orchestrates experiment runs across scenarios and algorithms.
 type Runner struct {
 	Scenarios      []benchmarks.Scenario
 	Algorithms     []AlgorithmConfig
@@ -61,7 +60,6 @@ type Runner struct {
 	dqnWarmupCache *xsync.MapOf[string, []nn.Transition]
 }
 
-// RunAll executes every (scenario, algorithm, mode) combination and returns results.
 func (r *Runner) RunAll(ctx context.Context) ([]ExperimentResult, error) {
 	if r.dqnWarmupCache == nil {
 		r.dqnWarmupCache = xsync.NewMapOf[string, []nn.Transition]()
@@ -543,8 +541,12 @@ func runScenario(
 	consumerPool := pond.NewPool(numPartitions)
 	for p := 0; p < numPartitions; p++ {
 		partition := p
+		var processingDelay time.Duration
+		if sc.ConsumerSkewRate > 0 && p == 0 {
+			processingDelay = time.Duration(float64(time.Millisecond) / sc.ConsumerSkewRate)
+		}
 		consumerPool.Submit(func() {
-			runConsumer(consumeCtx, h, partition, collector, topic, maxLatency)
+			runConsumer(consumeCtx, h, partition, collector, topic, maxLatency, processingDelay)
 		})
 	}
 
@@ -671,9 +673,6 @@ func runRateLimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scena
 	}
 }
 
-// runUnlimitedProducer batches messages by bytes for maximum throughput.
-// Flushes when accumulated bytes reach the target (default 16KB, matching
-// Kafka's batch.size). This gives realistic WAL and compression ratios.
 func runUnlimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenario, msgSize int, c *MetricsCollector, topic string) {
 	seed := sc.Seed
 	if seed == 0 {
@@ -734,7 +733,11 @@ func runUnlimitedProducer(ctx context.Context, h *Harness, sc benchmarks.Scenari
 	}
 }
 
-func runConsumer(ctx context.Context, h *Harness, partition int, c *MetricsCollector, topic string, maxLatency time.Duration) {
+func runConsumer(ctx context.Context, h *Harness, partition int, c *MetricsCollector, topic string, maxLatency time.Duration, processingDelay ...time.Duration) {
+	var delay time.Duration
+	if len(processingDelay) > 0 {
+		delay = processingDelay[0]
+	}
 	for {
 		if ctx.Err() != nil {
 			return
@@ -766,6 +769,14 @@ func runConsumer(ctx context.Context, h *Harness, partition int, c *MetricsColle
 			c.RecordConsumeWithPriority(msg.Priority, latency)
 			if msg.ProduceTime > 0 {
 				c.RecordConsumeMultiStage(enqueueTime, msg.ProduceTime, msg.AppendTime)
+			}
+		}
+
+		if delay > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
 			}
 		}
 	}
@@ -824,10 +835,6 @@ func topicConfigFor(sc benchmarks.Scenario) broker.TopicConfig {
 	return cfg
 }
 
-// generateKey returns a message key respecting the scenario's SkewRatio.
-// With SkewRatio > 0, that fraction of messages get a fixed hot key (all-zeros)
-// which consistent-hashing balancers (PSA) will route to the same partition,
-// creating a realistic key-skew workload.
 func generateKey(buf []byte, skewRatio float64) []byte {
 	key := make([]byte, 8)
 	if skewRatio > 0 && rand.Float64() < skewRatio {
@@ -848,8 +855,6 @@ func generateKeySeeded(buf []byte, skewRatio float64, rng *rand.Rand) []byte {
 	return key
 }
 
-// groupAlgorithmsByMatch reorders algorithms so entries whose Name contains
-// match are grouped at the end, preserving relative order within each group.
 func groupAlgorithmsByMatch(algs []AlgorithmConfig, match string) []AlgorithmConfig {
 	sorted := make([]AlgorithmConfig, 0, len(algs))
 	var matched []AlgorithmConfig
@@ -895,8 +900,6 @@ func isRetryableError(err error) bool {
 	return false
 }
 
-// drainQueues waits until all partition queues are empty or timeout expires.
-// This prevents leftover messages from one run polluting the next run's P99.
 func drainQueues(ctx context.Context, h *Harness, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
